@@ -1,0 +1,29 @@
+# node / editor
+node_modules
+.npm
+.parcel-cache
+dist
+build
+.DS_Store
+.env
+.env.*.local
+*.log
+
+# frontend
+/frontend/node_modules
+/frontend/dist
+/frontend/.vite
+/frontend/.eslintcache
+
+# backend
+/backend/node_modules
+/backend/dist
+
+# editor / cursor
+.vscode
+.idea
+.cursor
+
+# debug
+*.tsbuildinfo
+
