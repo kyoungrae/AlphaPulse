@@ -18,7 +18,8 @@
     "express": "^5.2.1",
     "openai": "^6.34.0",
     "rss-parser": "^3.13.0",
-    "yahoo-finance2": "^3.14.0"
+    "yahoo-finance2": "^3.14.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

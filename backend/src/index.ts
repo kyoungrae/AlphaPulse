@@ -10,6 +10,7 @@ dotenv.config()
 
 const app = express()
 const port = process.env.PORT || 4000
+const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
 const openaiApiKey = process.env.OPENAI_API_KEY
 const openai = openaiApiKey
   ? new OpenAI({
@@ -29,7 +30,7 @@ const rssParser = new Parser()
 
 app.get('/', (_req: Request, res: Response) => {
   res.json({
-    name: 'AlphaPulse backend',
+    name: 'AlphaPulse 백엔드',
     endpoints: ['/api/stock/:ticker', '/api/news', '/health'],
   })
 })
@@ -37,7 +38,7 @@ app.get('/', (_req: Request, res: Response) => {
 app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
   const ticker = req.params.ticker?.toUpperCase()
   if (!ticker) {
-    return res.status(400).json({ error: 'ticker is required' })
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
   }
 
   try {
@@ -60,7 +61,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
     res.json(result)
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Failed to fetch stock data' })
+    res.status(500).json({ error: '주가 데이터를 가져오지 못했습니다.' })
   }
 })
 
@@ -74,9 +75,9 @@ app.get('/api/news', async (_req: Request, res: Response) => {
       feed.items
         ?.slice(0, 10)
         .map((item) => ({
-          title: item.title ?? 'Untitled',
+          title: item.title ?? '제목 없음',
           link: item.link,
-          source: item.source?.title ?? 'Google News',
+          source: item.source?.title ?? '구글 뉴스',
         }))
         .filter((i) => i.title) ?? []
 
@@ -103,7 +104,7 @@ ${items.map((i, idx) => `${idx + 1}. ${i.title}`).join('\n')}`
             const found = map.get(item.title)
             return found
               ? { ...item, sentiment: { label: found.label, score: found.score } }
-              : { ...item, sentiment: { label: 'Neutral', score: 0 } }
+              : { ...item, sentiment: { label: '중립', score: 0 } }
           })
           return res.json(enriched)
         }
@@ -115,7 +116,7 @@ ${items.map((i, idx) => `${idx + 1}. ${i.title}`).join('\n')}`
     res.json(items)
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Failed to fetch news feed' })
+    res.status(500).json({ error: '뉴스 데이터를 가져오지 못했습니다.' })
   }
 })
 
@@ -125,6 +126,33 @@ app.get('/health', (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
   })
+})
+
+app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
+  const ticker = req.params.ticker?.toUpperCase()
+  if (!ticker) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+
+  const url = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      const body = await response.text()
+      return res
+        .status(response.status)
+        .json({ error: '예측 서버 응답 오류', detail: body })
+    }
+    const json = await response.json()
+    return res.json(json)
+  } catch (err) {
+    console.error('Predict proxy failed', err)
+    return res.status(502).json({
+      error: '예측 서버에 연결할 수 없습니다.',
+      detail: 'FastAPI 서버가 http://localhost:8001 에서 실행 중인지 확인하세요.',
+    })
+  }
 })
 
 app.listen(port, () => {

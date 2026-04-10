@@ -7,9 +7,9 @@ const StockPrediction = lazy(() => import('./pages/StockPrediction'))
 
 function Sidebar() {
   const links = [
-    { to: '/dashboard', label: 'Dashboard' },
-    { to: '/macro', label: 'Global Macro' },
-    { to: '/stocks', label: 'Stock Prediction' },
+    { to: '/dashboard', label: '대시보드' },
+    { to: '/macro', label: '글로벌 매크로' },
+    { to: '/stocks', label: '종목 예측' },
   ]
 
   return (
@@ -18,7 +18,7 @@ function Sidebar() {
         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-blue-300">
           AlphaPulse
         </p>
-        <h1 className="text-lg font-bold text-white">Predictive Desk</h1>
+        <h1 className="text-lg font-bold text-white">예측 대시보드</h1>
       </div>
       <nav className="space-y-2">
         {links.map((item) => (
@@ -42,7 +42,7 @@ function App() {
       <Sidebar />
       <main className="flex-1 bg-gradient-to-b from-slate-950 via-slate-930 to-slate-900">
         <div className="mx-auto max-w-6xl px-6 py-8">
-          <Suspense fallback={<div className="text-slate-400">Loading...</div>}>
+          <Suspense fallback={<div className="text-slate-400">불러오는 중...</div>}>
             <Routes>
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/macro" element={<GlobalMacro />} />

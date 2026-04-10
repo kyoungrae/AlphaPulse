@@ -23,6 +23,20 @@ type NewsItem = {
   }
 }
 
+type PredictResponse = {
+  ticker: string
+  probability_up: number
+  direction: string
+  last_date: string
+  last_close: number
+}
+
+function directionToKorean(direction: string) {
+  if (direction === 'Up') return '상승'
+  if (direction === 'Down') return '하락'
+  return direction
+}
+
 function useFetch<T>(url: string) {
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
@@ -34,10 +48,17 @@ function useFetch<T>(url: string) {
     fetch(url)
       .then(async (res) => {
         if (!res.ok) {
-          throw new Error(`Request failed: ${res.status}`)
+          const body = await res.text()
+          throw new Error(`요청 실패: ${res.status} ${body}`)
         }
-        const json = (await res.json()) as T
-        if (mounted) setData(json)
+        const ctype = res.headers.get('content-type') ?? ''
+        if (ctype.includes('application/json')) {
+          const json = (await res.json()) as T
+          if (mounted) setData(json)
+        } else {
+          const text = await res.text()
+          throw new Error(`JSON이 아닌 응답입니다: ${text.slice(0, 200)}`)
+        }
       })
       .catch((err: Error) => {
         if (mounted) setError(err.message)
@@ -65,6 +86,11 @@ export default function Dashboard() {
     loading: newsLoading,
     error: newsError,
   } = useFetch<NewsItem[]>('/api/news')
+  const {
+    data: predict,
+    loading: predictLoading,
+    error: predictError,
+  } = useFetch<PredictResponse>('/api/predict/AAPL')
 
   const chartData = useMemo(() => {
     return (
@@ -78,23 +104,72 @@ export default function Dashboard() {
   return (
     <div className="space-y-6">
       <div>
-        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-blue-300">Dashboard</p>
-        <h2 className="text-2xl font-bold text-white">AAPL price & latest news</h2>
+        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-blue-300">대시보드</p>
+        <h2 className="text-2xl font-bold text-white">AAPL 주가 및 최신 뉴스</h2>
         <p className="text-sm text-slate-400">
           백엔드 `/api/stock/AAPL`과 `/api/news` 응답을 시각화합니다.
         </p>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-[0.2em] text-blue-300">AI 예측</p>
+              <h3 className="text-lg font-semibold text-white">/api/predict/AAPL</h3>
+            </div>
+            {predictLoading && (
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-600 border-t-transparent" />
+            )}
+            {predictError && <span className="text-xs text-rose-400">오류</span>}
+          </div>
+          {predictLoading ? (
+            <div className="mt-4 h-24 rounded-xl bg-slate-800/60 animate-pulse" />
+          ) : predict ? (
+            <div className="mt-4 space-y-2">
+              <div className="flex items-center justify-between text-sm text-slate-300">
+                <span>최신 날짜</span>
+                <span>{predict.last_date}</span>
+              </div>
+              <div className="flex items-center justify-between text-sm text-slate-300">
+                <span>최신 종가</span>
+                <span>${predict.last_close}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-200">예상 방향</span>
+                <span
+                  className={`rounded-full px-3 py-1 text-sm font-semibold ${
+                    predict.direction === 'Up' ? 'bg-emerald-900/60 text-emerald-300' : 'bg-rose-900/60 text-rose-300'
+                  }`}
+                >
+                  {directionToKorean(predict.direction)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-200">상승 확률</span>
+                <span
+                  className={`text-lg font-bold ${
+                    predict.probability_up >= 0.5 ? 'text-emerald-400' : 'text-rose-400'
+                  }`}
+                >
+                  {(predict.probability_up * 100).toFixed(1)}%
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="mt-4 text-sm text-slate-400">예측 데이터가 없습니다.</div>
+          )}
+        </div>
+
         <div className="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-white">AAPL 1M Close</h3>
-            {stockLoading && <span className="text-xs text-slate-400">Loading...</span>}
-            {stockError && <span className="text-xs text-rose-400">Error: {stockError}</span>}
+            <h3 className="text-lg font-semibold text-white">AAPL 최근 1개월 종가</h3>
+            {stockLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
+            {stockError && <span className="text-xs text-rose-400">오류: {stockError}</span>}
           </div>
           <div className="h-72">
             {stockLoading ? (
-              <div className="flex h-full items-center justify-center text-slate-500">Loading...</div>
+              <div className="flex h-full items-center justify-center text-slate-500">불러오는 중...</div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={chartData}>
@@ -130,15 +205,15 @@ export default function Dashboard() {
 
         <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-white">Latest News</h3>
-            {newsLoading && <span className="text-xs text-slate-400">Loading...</span>}
-            {newsError && <span className="text-xs text-rose-400">Error: {newsError}</span>}
+            <h3 className="text-lg font-semibold text-white">최신 뉴스</h3>
+            {newsLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
+            {newsError && <span className="text-xs text-rose-400">오류: {newsError}</span>}
           </div>
           <div className="mt-3 space-y-3">
             {newsLoading ? (
               <div className="flex items-center gap-2 text-slate-500">
                 <span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-600 border-t-transparent" />
-                Loading news...
+                뉴스 불러오는 중...
               </div>
             ) : (
               news?.map((item) => (
@@ -148,13 +223,13 @@ export default function Dashboard() {
                 >
                   <p className="text-sm font-semibold text-white">{item.title}</p>
                   <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
-                    <span>{item.source ?? 'Google News'}</span>
+                    <span>{item.source ?? '구글 뉴스'}</span>
                     {item.sentiment ? (
                       <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[11px] uppercase tracking-wide text-slate-200">
                         {item.sentiment.label} ({item.sentiment.score})
                       </span>
                     ) : (
-                      <span className="text-slate-600">sentiment pending</span>
+                      <span className="text-slate-600">감성 분석 대기 중</span>
                     )}
                   </div>
                 </div>
