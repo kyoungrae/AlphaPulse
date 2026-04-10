@@ -2,7 +2,7 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import express, { Request, Response } from 'express'
 import Parser from 'rss-parser'
-import yahooFinance from 'yahoo-finance2'
+import YahooFinance from 'yahoo-finance2'
 import { z } from 'zod'
 import OpenAI from 'openai'
 
@@ -11,6 +11,7 @@ dotenv.config()
 const app = express()
 const port = process.env.PORT || 4000
 const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
+const yahooFinance = new YahooFinance()
 const openaiApiKey = process.env.OPENAI_API_KEY
 const openai = openaiApiKey
   ? new OpenAI({

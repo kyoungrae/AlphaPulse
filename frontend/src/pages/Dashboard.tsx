@@ -107,7 +107,7 @@ export default function Dashboard() {
         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-blue-300">대시보드</p>
         <h2 className="text-2xl font-bold text-white">AAPL 주가 및 최신 뉴스</h2>
         <p className="text-sm text-slate-400">
-          백엔드 `/api/stock/AAPL`과 `/api/news` 응답을 시각화합니다.
+          {/* 백엔드 `/api/stock/AAPL`과 `/api/news` 응답을 시각화합니다. */}
         </p>
       </div>
 
@@ -116,7 +116,7 @@ export default function Dashboard() {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-xs uppercase tracking-[0.2em] text-blue-300">AI 예측</p>
-              <h3 className="text-lg font-semibold text-white">/api/predict/AAPL</h3>
+              {/* <h3 className="text-lg font-semibold text-white">/api/predict/AAPL</h3> */}
             </div>
             {predictLoading && (
               <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-600 border-t-transparent" />
