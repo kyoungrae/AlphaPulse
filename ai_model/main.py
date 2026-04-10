@@ -11,13 +11,16 @@ Run (port 8000):
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit, cross_validate
 from sklearn.preprocessing import StandardScaler
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
@@ -44,8 +47,20 @@ FEATURE_COLS: List[str] = [
   "bb_bbl",
 ]
 
-MODEL: Optional[RandomForestClassifier] = None
-SCALER: Optional[StandardScaler] = None
+MODEL_TTL_HOURS = 24
+PRELOAD_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "JPM", "XOM", "UNH"]
+
+
+@dataclass
+class ModelBundle:
+  model: RandomForestClassifier
+  scaler: StandardScaler
+  trained_at: datetime
+  cv_accuracy: float
+  cv_precision: float
+
+
+MODEL_CACHE: Dict[str, ModelBundle] = {}
 
 
 def load_price_data(ticker: str, period_years: int = 5) -> pd.DataFrame:
@@ -93,7 +108,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
   return df
 
 
-def train_model(ticker: str = "AAPL") -> tuple[RandomForestClassifier, StandardScaler]:
+def train_model(ticker: str = "AAPL") -> ModelBundle:
   df = load_price_data(ticker)
   df_feat = add_features(df)
 
@@ -110,8 +125,52 @@ def train_model(ticker: str = "AAPL") -> tuple[RandomForestClassifier, StandardS
     n_jobs=-1,
   )
   model.fit(X_scaled, y)
-  logger.info("Model trained on %s samples for %s", len(X), ticker)
-  return model, scaler
+
+  tscv = TimeSeriesSplit(n_splits=5)
+  cv_model = RandomForestClassifier(
+    n_estimators=300,
+    max_depth=8,
+    random_state=42,
+    n_jobs=-1,
+  )
+  cv_scores = cross_validate(
+    cv_model,
+    X_scaled,
+    y,
+    cv=tscv,
+    scoring=("accuracy", "precision"),
+    n_jobs=-1,
+    error_score="raise",
+  )
+  cv_accuracy = float(cv_scores["test_accuracy"].mean())
+  cv_precision = float(cv_scores["test_precision"].mean())
+
+  logger.info(
+    "Model trained for %s (samples=%s, cv_acc=%.4f, cv_prec=%.4f)",
+    ticker,
+    len(X),
+    cv_accuracy,
+    cv_precision,
+  )
+  return ModelBundle(
+    model=model,
+    scaler=scaler,
+    trained_at=datetime.now(),
+    cv_accuracy=cv_accuracy,
+    cv_precision=cv_precision,
+  )
+
+
+def get_model_bundle(ticker: str) -> ModelBundle:
+  cached = MODEL_CACHE.get(ticker)
+  if cached:
+    age = datetime.now() - cached.trained_at
+    if age < timedelta(hours=MODEL_TTL_HOURS):
+      return cached
+
+  bundle = train_model(ticker)
+  MODEL_CACHE[ticker] = bundle
+  return bundle
 
 
 class FeatureImportanceItem(BaseModel):
@@ -125,21 +184,30 @@ class PredictResponse(BaseModel):
   direction: str
   last_date: str
   last_close: float
+  cv_accuracy: float
+  cv_precision: float
+  model_trained_at: str
   top_feature_importance: List[FeatureImportanceItem]
+  reason_summary: str
 
 
 @app.on_event("startup")
 def _startup():
-  global MODEL, SCALER
-  MODEL, SCALER = train_model("AAPL")
-  logger.info("Startup training complete.")
+  for ticker in PRELOAD_TICKERS:
+    try:
+      MODEL_CACHE[ticker] = train_model(ticker)
+    except Exception as err:
+      logger.warning("Preload failed for %s: %s", ticker, err)
+  logger.info("Startup preload complete. cached=%s", len(MODEL_CACHE))
 
 
 @app.get("/predict/{ticker}", response_model=PredictResponse)
 def predict(ticker: str):
   ticker = ticker.upper()
-  if MODEL is None or SCALER is None:
-    raise HTTPException(status_code=503, detail="모델이 아직 준비되지 않았습니다.")
+  try:
+    bundle = get_model_bundle(ticker)
+  except Exception as err:
+    raise HTTPException(status_code=500, detail=f"모델 학습/로드 실패: {err}") from err
 
   # Use recent data to generate the latest feature row
   df = load_price_data(ticker, period_years=2)
@@ -149,18 +217,23 @@ def predict(ticker: str):
 
   latest = df_feat.iloc[-1]
   features = latest[FEATURE_COLS].to_frame().T
-  features_scaled = SCALER.transform(features)
+  features_scaled = bundle.scaler.transform(features)
 
-  proba = MODEL.predict_proba(features_scaled)[0][1]
+  proba = bundle.model.predict_proba(features_scaled)[0][1]
   direction = "Up" if proba >= 0.5 else "Down"
-  top_idx = MODEL.feature_importances_.argsort()[::-1][:3]
+  top_idx = bundle.model.feature_importances_.argsort()[::-1][:3]
   top_feature_importance = [
     FeatureImportanceItem(
       feature=FEATURE_COLS[i],
-      importance=round(float(MODEL.feature_importances_[i]), 4),
+      importance=round(float(bundle.model.feature_importances_[i]), 4),
     )
     for i in top_idx
   ]
+  reason_summary = (
+    f"이번 예측은 {top_feature_importance[0].feature}, "
+    f"{top_feature_importance[1].feature}, {top_feature_importance[2].feature} "
+    "지표 영향이 상대적으로 크게 반영되었습니다."
+  )
 
   return PredictResponse(
     ticker=ticker,
@@ -168,7 +241,11 @@ def predict(ticker: str):
     direction=direction,
     last_date=str(latest.name.date()),
     last_close=round(float(latest["Close"]), 2),
+    cv_accuracy=round(bundle.cv_accuracy, 4),
+    cv_precision=round(bundle.cv_precision, 4),
+    model_trained_at=bundle.trained_at.isoformat(timespec="seconds"),
     top_feature_importance=top_feature_importance,
+    reason_summary=reason_summary,
   )
 
 

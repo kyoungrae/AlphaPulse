@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  Area,
-  AreaChart,
+  Line,
+  LineChart,
   CartesianGrid,
   ResponsiveContainer,
   Tooltip,
@@ -29,6 +29,11 @@ type PredictResponse = {
   direction: string
   last_date: string
   last_close: number
+  cv_accuracy: number
+  cv_precision: number
+  model_trained_at: string
+  reason_summary: string
+  top_feature_importance: { feature: string; importance: number }[]
 }
 
 function directionToKorean(direction: string) {
@@ -93,12 +98,29 @@ export default function Dashboard() {
   } = useFetch<PredictResponse>('/api/predict/AAPL')
 
   const chartData = useMemo(() => {
-    return (
-      stock?.map((pt) => ({
-        date: new Date(pt.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-        close: pt.close,
-      })) ?? []
-    )
+    if (!stock || stock.length === 0) return []
+
+    const closes = stock.map((s) => s.close)
+    const result = stock.map((pt, idx) => {
+      const date = new Date(pt.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      const close = pt.close
+      let sma20: number | null = null
+      let bbUpper: number | null = null
+      let bbLower: number | null = null
+
+      if (idx >= 19) {
+        const window = closes.slice(idx - 19, idx + 1)
+        const mean = window.reduce((a, b) => a + b, 0) / window.length
+        const variance = window.reduce((a, b) => a + (b - mean) ** 2, 0) / window.length
+        const std = Math.sqrt(variance)
+        sma20 = mean
+        bbUpper = mean + 2 * std
+        bbLower = mean - 2 * std
+      }
+
+      return { date, close, sma20, bbUpper, bbLower }
+    })
+    return result
   }, [stock])
 
   return (
@@ -155,6 +177,22 @@ export default function Dashboard() {
                   {(predict.probability_up * 100).toFixed(1)}%
                 </span>
               </div>
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+                <p className="mb-1 font-semibold text-slate-200">모델 검증 지표</p>
+                <p>시계열 교차검증 정확도: {(predict.cv_accuracy * 100).toFixed(1)}%</p>
+                <p>시계열 교차검증 정밀도: {(predict.cv_precision * 100).toFixed(1)}%</p>
+                <p className="mt-1 text-slate-400">모델 학습 시각: {predict.model_trained_at}</p>
+              </div>
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+                <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>
+                {predict.top_feature_importance?.map((item) => (
+                  <div key={item.feature} className="flex items-center justify-between">
+                    <span>{item.feature}</span>
+                    <span>{(item.importance * 100).toFixed(1)}%</span>
+                  </div>
+                ))}
+                <p className="mt-2 text-slate-400">{predict.reason_summary}</p>
+              </div>
             </div>
           ) : (
             <div className="mt-4 text-sm text-slate-400">예측 데이터가 없습니다.</div>
@@ -163,7 +201,7 @@ export default function Dashboard() {
 
         <div className="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-white">AAPL 최근 1개월 종가</h3>
+            <h3 className="text-lg font-semibold text-white">AAPL 최근 1개월 종가 + 지표</h3>
             {stockLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
             {stockError && <span className="text-xs text-rose-400">오류: {stockError}</span>}
           </div>
@@ -172,13 +210,7 @@ export default function Dashboard() {
               <div className="flex h-full items-center justify-center text-slate-500">불러오는 중...</div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chartData}>
-                  <defs>
-                    <linearGradient id="closeGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#38bdf8" stopOpacity={0.5} />
-                      <stop offset="95%" stopColor="#38bdf8" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
+                <LineChart data={chartData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
                   <XAxis dataKey="date" tick={{ fill: '#cbd5f5', fontSize: 12 }} />
                   <YAxis tick={{ fill: '#cbd5f5', fontSize: 12 }} />
@@ -189,15 +221,17 @@ export default function Dashboard() {
                       color: '#e5e7eb',
                     }}
                   />
-                  <Area
+                  <Line
                     type="monotone"
                     dataKey="close"
                     stroke="#38bdf8"
                     strokeWidth={2}
-                    fillOpacity={1}
-                    fill="url(#closeGradient)"
+                    dot={false}
                   />
-                </AreaChart>
+                  <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.5} dot={false} />
+                  <Line type="monotone" dataKey="bbUpper" stroke="#a78bfa" strokeWidth={1.2} dot={false} />
+                  <Line type="monotone" dataKey="bbLower" stroke="#a78bfa" strokeWidth={1.2} dot={false} />
+                </LineChart>
               </ResponsiveContainer>
             )}
           </div>
