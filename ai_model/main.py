@@ -18,8 +18,10 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
+from ta.volatility import BollingerBands
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +39,13 @@ FEATURE_COLS: List[str] = [
   "macd",
   "macd_signal",
   "macd_hist",
+  "bb_bbm",
+  "bb_bbh",
+  "bb_bbl",
 ]
 
 MODEL: Optional[RandomForestClassifier] = None
+SCALER: Optional[StandardScaler] = None
 
 
 def load_price_data(ticker: str, period_years: int = 5) -> pd.DataFrame:
@@ -75,18 +81,27 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
   df["macd_signal"] = macd.macd_signal()
   df["macd_hist"] = macd.macd_diff()
 
+  # Bollinger Bands (20, 2)
+  bb = BollingerBands(close=close, window=20, window_dev=2)
+  df["bb_bbm"] = bb.bollinger_mavg()
+  df["bb_bbh"] = bb.bollinger_hband()
+  df["bb_bbl"] = bb.bollinger_lband()
+
   df["target"] = (close.shift(-1) > close).astype(int)
 
   df = df.dropna()
   return df
 
 
-def train_model(ticker: str = "AAPL") -> RandomForestClassifier:
+def train_model(ticker: str = "AAPL") -> tuple[RandomForestClassifier, StandardScaler]:
   df = load_price_data(ticker)
   df_feat = add_features(df)
 
   X = df_feat[FEATURE_COLS]
   y = df_feat["target"]
+
+  scaler = StandardScaler()
+  X_scaled = scaler.fit_transform(X)
 
   model = RandomForestClassifier(
     n_estimators=300,
@@ -94,9 +109,14 @@ def train_model(ticker: str = "AAPL") -> RandomForestClassifier:
     random_state=42,
     n_jobs=-1,
   )
-  model.fit(X, y)
+  model.fit(X_scaled, y)
   logger.info("Model trained on %s samples for %s", len(X), ticker)
-  return model
+  return model, scaler
+
+
+class FeatureImportanceItem(BaseModel):
+  feature: str
+  importance: float
 
 
 class PredictResponse(BaseModel):
@@ -105,19 +125,20 @@ class PredictResponse(BaseModel):
   direction: str
   last_date: str
   last_close: float
+  top_feature_importance: List[FeatureImportanceItem]
 
 
 @app.on_event("startup")
 def _startup():
-  global MODEL
-  MODEL = train_model("AAPL")
+  global MODEL, SCALER
+  MODEL, SCALER = train_model("AAPL")
   logger.info("Startup training complete.")
 
 
 @app.get("/predict/{ticker}", response_model=PredictResponse)
 def predict(ticker: str):
   ticker = ticker.upper()
-  if MODEL is None:
+  if MODEL is None or SCALER is None:
     raise HTTPException(status_code=503, detail="모델이 아직 준비되지 않았습니다.")
 
   # Use recent data to generate the latest feature row
@@ -128,9 +149,18 @@ def predict(ticker: str):
 
   latest = df_feat.iloc[-1]
   features = latest[FEATURE_COLS].to_frame().T
+  features_scaled = SCALER.transform(features)
 
-  proba = MODEL.predict_proba(features)[0][1]
+  proba = MODEL.predict_proba(features_scaled)[0][1]
   direction = "Up" if proba >= 0.5 else "Down"
+  top_idx = MODEL.feature_importances_.argsort()[::-1][:3]
+  top_feature_importance = [
+    FeatureImportanceItem(
+      feature=FEATURE_COLS[i],
+      importance=round(float(MODEL.feature_importances_[i]), 4),
+    )
+    for i in top_idx
+  ]
 
   return PredictResponse(
     ticker=ticker,
@@ -138,6 +168,7 @@ def predict(ticker: str):
     direction=direction,
     last_date=str(latest.name.date()),
     last_close=round(float(latest["Close"]), 2),
+    top_feature_importance=top_feature_importance,
   )
 
 
