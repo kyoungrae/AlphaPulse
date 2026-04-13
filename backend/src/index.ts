@@ -46,6 +46,7 @@ const CandleSchema = z.object({
   high: z.number(),
   low: z.number(),
   close: z.number(),
+  volume: z.number(),
 })
 
 const rssParser = new Parser()
@@ -1115,7 +1116,8 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
             q.date != null &&
             q.open != null &&
             q.high != null &&
-            q.low != null,
+            q.low != null &&
+            q.volume != null,
         )
         .map((q) =>
           CandleSchema.parse({
@@ -1124,6 +1126,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
             high: q.high!,
             low: q.low!,
             close: q.close!,
+            volume: q.volume!,
           }),
         )
         .map((q) => ({
@@ -1132,6 +1135,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
           high: q.high,
           low: q.low,
           close: q.close,
+          volume: q.volume,
         })) ?? []
 
     stockCache.set(stockCacheKey, { data: result, cachedAt: Date.now() })

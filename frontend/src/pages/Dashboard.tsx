@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   ComposedChart,
   Line,
+  ReferenceLine,
   CartesianGrid,
   ResponsiveContainer,
   Tooltip,
@@ -17,6 +18,7 @@ type CandlePoint = {
   high: number
   low: number
   close: number
+  volume?: number
 }
 
 type NewsItem = {
@@ -204,6 +206,10 @@ type ChartRow = {
   sma20: number | null
   bbUpper: number | null
   bbLower: number | null
+  volume: number
+  vbpSupport: number | null
+  vbpResistance: number | null
+  vbpNodeStrength: number | null
 }
 
 function CandlestickSeries({ data }: { data: ChartRow[] }) {
@@ -285,6 +291,20 @@ function StockChartTooltip({
             <span className="text-right tabular-nums text-[10px] leading-tight">
               {formatMoney(row.bbUpper, priceCurrency)} ~ {formatMoney(row.bbLower, priceCurrency)}
             </span>
+          </>
+        )}
+        {row.vbpSupport != null && row.vbpResistance != null && (
+          <>
+            <span className="text-slate-500">매물대 지지/저항</span>
+            <span className="text-right tabular-nums text-[10px] leading-tight">
+              {formatMoney(row.vbpSupport, priceCurrency)} / {formatMoney(row.vbpResistance, priceCurrency)}
+            </span>
+          </>
+        )}
+        {row.vbpNodeStrength != null && (
+          <>
+            <span className="text-slate-500">매물 밀집도</span>
+            <span className="text-right tabular-nums">{(row.vbpNodeStrength * 100).toFixed(1)}%</span>
           </>
         )}
       </div>
@@ -568,6 +588,9 @@ export default function Dashboard() {
       let sma20: number | null = null
       let bbUpper: number | null = null
       let bbLower: number | null = null
+      let vbpSupport: number | null = null
+      let vbpResistance: number | null = null
+      let vbpNodeStrength: number | null = null
 
       if (idx >= 19) {
         const window = closes.slice(idx - 19, idx + 1)
@@ -577,6 +600,49 @@ export default function Dashboard() {
         sma20 = mean
         bbUpper = mean + 2 * std
         bbLower = mean - 2 * std
+      }
+
+      {
+        const lookback = 180
+        const binCount = 24
+        const start = Math.max(0, idx - lookback + 1)
+        const windowPrices = stock.slice(start, idx + 1).map((item) => toDisplay(item.close))
+        const windowVolumes = stock.slice(start, idx + 1).map((item) => Number(item.volume ?? 0))
+        const pMin = Math.min(...windowPrices)
+        const pMax = Math.max(...windowPrices)
+        const current = toDisplay(pt.close)
+        if (!Number.isFinite(pMin) || !Number.isFinite(pMax)) {
+          vbpSupport = current
+          vbpResistance = current
+          vbpNodeStrength = 0
+        } else if (pMax <= pMin) {
+          vbpSupport = current
+          vbpResistance = current
+          vbpNodeStrength = 1
+        } else {
+          const step = (pMax - pMin) / binCount
+          const hist = Array.from({ length: binCount }, () => 0)
+          for (let j = 0; j < windowPrices.length; j += 1) {
+            const p = windowPrices[j]
+            const v = windowVolumes[j]
+            const hIdx = Math.min(binCount - 1, Math.max(0, Math.floor((p - pMin) / Math.max(step, 1e-9))))
+            hist[hIdx] += v
+          }
+          const currentIdx = Math.min(binCount - 1, Math.max(0, Math.floor((current - pMin) / Math.max(step, 1e-9))))
+          const supportIdx = Array.from({ length: currentIdx + 1 }, (_, j) => j).reduce(
+            (best, cur) => (hist[cur] > hist[best] ? cur : best),
+            0,
+          )
+          const resistanceIdx = Array.from({ length: binCount - currentIdx }, (_, j) => j + currentIdx).reduce(
+            (best, cur) => (hist[cur] > hist[best] ? cur : best),
+            currentIdx,
+          )
+          const toBinPrice = (hIdx: number) => pMin + step * (hIdx + 0.5)
+          vbpSupport = toBinPrice(supportIdx)
+          vbpResistance = toBinPrice(resistanceIdx)
+          const totalVol = hist.reduce((a, b) => a + b, 0)
+          vbpNodeStrength = totalVol > 0 ? hist[currentIdx] / totalVol : 0
+        }
       }
 
       return {
@@ -589,6 +655,10 @@ export default function Dashboard() {
         sma20: sma20 != null ? toDisplay(sma20) : null,
         bbUpper: bbUpper != null ? toDisplay(bbUpper) : null,
         bbLower: bbLower != null ? toDisplay(bbLower) : null,
+        volume: Number(pt.volume ?? 0),
+        vbpSupport,
+        vbpResistance,
+        vbpNodeStrength,
       }
     })
     return result
@@ -602,6 +672,12 @@ export default function Dashboard() {
     const max = Math.max(...highs)
     const pad = Math.max((max - min) * 0.03, Math.abs(max) * 0.001 || 0.01)
     return [min - pad, max + pad]
+  }, [chartData])
+
+  const vbpLevels = useMemo(() => {
+    if (!chartData.length) return { support: null as number | null, resistance: null as number | null }
+    const latest = chartData[chartData.length - 1]
+    return { support: latest.vbpSupport, resistance: latest.vbpResistance }
   }, [chartData])
 
   const latestHistory = history?.items?.[0] ?? null
@@ -1033,6 +1109,22 @@ export default function Dashboard() {
               )}
             </div>
           </div>
+          {(vbpLevels.support != null || vbpLevels.resistance != null) && (
+            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-300">
+              {vbpLevels.support != null && (
+                <MetricTooltip
+                  label={`매물대 지지: ${formatMoney(vbpLevels.support, priceCurrency)}`}
+                  tip="최근 가격-거래량 분포에서 거래가 많이 누적된 하단 구간입니다. 현재가가 이 값에 가까우면 지지 여부를 확인하세요."
+                />
+              )}
+              {vbpLevels.resistance != null && (
+                <MetricTooltip
+                  label={`매물대 저항: ${formatMoney(vbpLevels.resistance, priceCurrency)}`}
+                  tip="최근 가격-거래량 분포에서 거래가 많이 누적된 상단 구간입니다. 현재가가 이 값에 가까우면 매도 압력 가능성을 점검하세요."
+                />
+              )}
+            </div>
+          )}
           {stockError && (
             <p className="mt-2 text-xs text-rose-400">
               차트 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.
@@ -1072,6 +1164,24 @@ export default function Dashboard() {
                   <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.5} dot={false} connectNulls />
                   <Line type="monotone" dataKey="bbUpper" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />
                   <Line type="monotone" dataKey="bbLower" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />
+                  {vbpLevels.support != null && (
+                    <ReferenceLine
+                      y={vbpLevels.support}
+                      stroke="#22c55e"
+                      strokeDasharray="4 4"
+                      strokeOpacity={0.8}
+                      label={{ value: '매물대 지지', fill: '#86efac', fontSize: 10, position: 'left' }}
+                    />
+                  )}
+                  {vbpLevels.resistance != null && (
+                    <ReferenceLine
+                      y={vbpLevels.resistance}
+                      stroke="#f97316"
+                      strokeDasharray="4 4"
+                      strokeOpacity={0.8}
+                      label={{ value: '매물대 저항', fill: '#fdba74', fontSize: 10, position: 'left' }}
+                    />
+                  )}
                 </ComposedChart>
               </ResponsiveContainer>
             )}

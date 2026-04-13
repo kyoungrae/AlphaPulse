@@ -53,6 +53,9 @@ FEATURE_COLS: List[str] = [
   "news_sentiment_score",
   "news_volume",
   "event_keyword_count",
+  "vbp_support_gap",
+  "vbp_resistance_gap",
+  "vbp_node_strength",
 ]
 
 MODEL_TTL_HOURS = 24
@@ -166,6 +169,48 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df["news_sentiment_score"] = pd.to_numeric(merged["news_sentiment_score"], errors="coerce").fillna(0.0)
     df["news_volume"] = pd.to_numeric(merged["news_volume"], errors="coerce").fillna(0.0)
     df["event_keyword_count"] = pd.to_numeric(merged["event_keyword_count"], errors="coerce").fillna(0.0)
+
+  # Volume-by-price proxy features: approximate "물량대/평단대" 저항·지지 압력을 수치화
+  typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
+  vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
+  price_min = float(typical_price.min())
+  price_max = float(typical_price.max())
+  bin_count = 24
+  eps = 1e-9
+  if price_max - price_min < eps:
+    df["vbp_support_gap"] = 0.0
+    df["vbp_resistance_gap"] = 0.0
+    df["vbp_node_strength"] = 0.0
+  else:
+    step = (price_max - price_min) / bin_count
+    bins = [price_min + step * i for i in range(bin_count + 1)]
+    vbp_support_gap: List[float] = []
+    vbp_resistance_gap: List[float] = []
+    vbp_node_strength: List[float] = []
+    lookback = 120
+    for i in range(len(df)):
+      start = max(0, i - lookback + 1)
+      tp_window = typical_price.iloc[start : i + 1]
+      vol_window = vol.iloc[start : i + 1]
+      hist = [0.0] * bin_count
+      for px, vv in zip(tp_window, vol_window):
+        idx = int((float(px) - price_min) / max(step, eps))
+        idx = min(max(idx, 0), bin_count - 1)
+        hist[idx] += float(vv)
+      cur = float(df["Close"].iloc[i])
+      cur_idx = int((cur - price_min) / max(step, eps))
+      cur_idx = min(max(cur_idx, 0), bin_count - 1)
+      support_idx = max(range(0, cur_idx + 1), key=lambda k: hist[k]) if cur_idx >= 0 else cur_idx
+      resist_idx = max(range(cur_idx, bin_count), key=lambda k: hist[k]) if cur_idx < bin_count else cur_idx
+      support_price = (bins[support_idx] + bins[min(support_idx + 1, bin_count)]) / 2.0
+      resist_price = (bins[resist_idx] + bins[min(resist_idx + 1, bin_count)]) / 2.0
+      vbp_support_gap.append((cur - support_price) / max(cur, eps))
+      vbp_resistance_gap.append((resist_price - cur) / max(cur, eps))
+      total_hist = sum(hist)
+      vbp_node_strength.append((hist[cur_idx] / total_hist) if total_hist > 0 else 0.0)
+    df["vbp_support_gap"] = pd.Series(vbp_support_gap, index=df.index).fillna(0.0)
+    df["vbp_resistance_gap"] = pd.Series(vbp_resistance_gap, index=df.index).fillna(0.0)
+    df["vbp_node_strength"] = pd.Series(vbp_node_strength, index=df.index).fillna(0.0)
 
   df = df.dropna()
   return df
