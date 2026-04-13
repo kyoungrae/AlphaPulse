@@ -30,6 +30,17 @@ from sklearn.preprocessing import StandardScaler
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 from ta.volatility import BollingerBands
+try:
+  import torch
+  from transformers import AutoModelForSequenceClassification, AutoTokenizer
+except Exception:  # pragma: no cover - optional dependency
+  torch = None
+  AutoModelForSequenceClassification = None
+  AutoTokenizer = None
+try:
+  import shap
+except Exception:  # pragma: no cover - optional dependency
+  shap = None
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +70,8 @@ FEATURE_COLS: List[str] = [
   "oil_price",
   "usd_krw_exchange",
   "us10y_yield",
+  "vix_close",
+  "gold_price",
   "oil_return_5d",
   "usd_krw_return_5d",
   "us10y_delta_5d",
@@ -72,6 +85,8 @@ BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:4000").rstrip
 NEWS_FEATURE_TIMEOUT_SECONDS = float(os.getenv("NEWS_FEATURE_TIMEOUT_SECONDS", "8"))
 NEWS_FEATURES_ENABLED = os.getenv("NEWS_FEATURES_ENABLED", "true").lower() != "false"
 MACRO_CACHE_TTL_MINUTES = 60
+FINBERT_MODEL = os.getenv("FINBERT_MODEL", "ProsusAI/finbert")
+FINBERT_ENABLED = os.getenv("FINBERT_ENABLED", "true").lower() != "false"
 
 
 @dataclass
@@ -86,6 +101,7 @@ class ModelBundle:
 MODEL_CACHE: Dict[str, ModelBundle] = {}
 PRICE_CACHE: Dict[Tuple[str, int], Tuple[pd.DataFrame, datetime]] = {}
 MACRO_CACHE: Dict[int, Tuple[pd.DataFrame, datetime]] = {}
+FINBERT_PIPELINE: Dict[str, object] = {}
 
 
 def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.DataFrame:
@@ -150,6 +166,8 @@ def load_macro_feature_data(period_years: int = DATA_BASELINE_YEARS) -> pd.DataF
     "oil_price": "CL=F",
     "usd_krw_exchange": "KRW=X",
     "us10y_yield": "^TNX",
+    "vix_close": "^VIX",
+    "gold_price": "GC=F",
   }
   merged: Optional[pd.DataFrame] = None
   for col, ticker in symbols.items():
@@ -167,6 +185,8 @@ def load_macro_feature_data(period_years: int = DATA_BASELINE_YEARS) -> pd.DataF
         "oil_price",
         "usd_krw_exchange",
         "us10y_yield",
+        "vix_close",
+        "gold_price",
         "oil_return_5d",
         "usd_krw_return_5d",
         "us10y_delta_5d",
@@ -229,6 +249,8 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df["oil_price"] = 0.0
     df["usd_krw_exchange"] = 0.0
     df["us10y_yield"] = 0.0
+    df["vix_close"] = 0.0
+    df["gold_price"] = 0.0
     df["oil_return_5d"] = 0.0
     df["usd_krw_return_5d"] = 0.0
     df["us10y_delta_5d"] = 0.0
@@ -237,6 +259,8 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df["oil_price"] = pd.to_numeric(merged_macro["oil_price"], errors="coerce").ffill().fillna(0.0)
     df["usd_krw_exchange"] = pd.to_numeric(merged_macro["usd_krw_exchange"], errors="coerce").ffill().fillna(0.0)
     df["us10y_yield"] = pd.to_numeric(merged_macro["us10y_yield"], errors="coerce").ffill().fillna(0.0)
+    df["vix_close"] = pd.to_numeric(merged_macro["vix_close"], errors="coerce").ffill().fillna(0.0)
+    df["gold_price"] = pd.to_numeric(merged_macro["gold_price"], errors="coerce").ffill().fillna(0.0)
     df["oil_return_5d"] = pd.to_numeric(merged_macro["oil_return_5d"], errors="coerce").fillna(0.0)
     df["usd_krw_return_5d"] = pd.to_numeric(merged_macro["usd_krw_return_5d"], errors="coerce").fillna(0.0)
     df["us10y_delta_5d"] = pd.to_numeric(merged_macro["us10y_delta_5d"], errors="coerce").fillna(0.0)
@@ -371,6 +395,35 @@ class PredictResponse(BaseModel):
   data_years: int
 
 
+class SentimentAnalyzeRequest(BaseModel):
+  titles: List[str]
+
+
+class SentimentAnalyzeItem(BaseModel):
+  title: str
+  label: str
+  score: int
+
+
+class SentimentAnalyzeResponse(BaseModel):
+  data: List[SentimentAnalyzeItem]
+
+
+def get_finbert_pipeline():
+  if not FINBERT_ENABLED:
+    raise RuntimeError("FINBERT_ENABLED=false")
+  if torch is None or AutoTokenizer is None or AutoModelForSequenceClassification is None:
+    raise RuntimeError("transformers/torch 패키지가 설치되지 않았습니다.")
+  if "tokenizer" in FINBERT_PIPELINE and "model" in FINBERT_PIPELINE:
+    return FINBERT_PIPELINE["tokenizer"], FINBERT_PIPELINE["model"]
+  tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
+  model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
+  model.eval()
+  FINBERT_PIPELINE["tokenizer"] = tokenizer
+  FINBERT_PIPELINE["model"] = model
+  return tokenizer, model
+
+
 @app.on_event("startup")
 def _startup():
   for ticker in PRELOAD_TICKERS:
@@ -401,18 +454,47 @@ def predict(ticker: str):
 
   proba = bundle.model.predict_proba(features_scaled)[0][1]
   direction = "Up" if proba >= 0.5 else "Down"
-  top_idx = bundle.model.feature_importances_.argsort()[::-1][:3]
-  top_feature_importance = [
-    FeatureImportanceItem(
-      feature=FEATURE_COLS[i],
-      importance=round(float(bundle.model.feature_importances_[i]), 4),
-    )
-    for i in top_idx
-  ]
+
+  top_feature_importance: List[FeatureImportanceItem]
+  if shap is not None:
+    try:
+      explainer = shap.TreeExplainer(bundle.model)
+      shap_values = explainer.shap_values(features_scaled)
+      if isinstance(shap_values, list):
+        shap_vals_up = shap_values[1][0]
+      else:
+        # shap>=0.45 returns ndarray with class axis
+        arr = shap_values[0]
+        shap_vals_up = arr[:, 1] if getattr(arr, "ndim", 1) > 1 else arr
+      feature_shap_pairs = list(zip(FEATURE_COLS, [float(v) for v in shap_vals_up]))
+      feature_shap_pairs.sort(key=lambda x: abs(x[1]), reverse=True)
+      top_feature_importance = [
+        FeatureImportanceItem(feature=feat, importance=round(val, 4))
+        for feat, val in feature_shap_pairs[:3]
+      ]
+    except Exception as err:
+      logger.warning("SHAP 해석 실패. feature_importances_로 대체: %s", err)
+      top_idx = bundle.model.feature_importances_.argsort()[::-1][:3]
+      top_feature_importance = [
+        FeatureImportanceItem(
+          feature=FEATURE_COLS[i],
+          importance=round(float(bundle.model.feature_importances_[i]), 4),
+        )
+        for i in top_idx
+      ]
+  else:
+    top_idx = bundle.model.feature_importances_.argsort()[::-1][:3]
+    top_feature_importance = [
+      FeatureImportanceItem(
+        feature=FEATURE_COLS[i],
+        importance=round(float(bundle.model.feature_importances_[i]), 4),
+      )
+      for i in top_idx
+    ]
   reason_summary = (
-    f"이번 예측은 {top_feature_importance[0].feature}, "
+    f"이번 예측은 {top_feature_importance[0].feature}(기여도 {top_feature_importance[0].importance}), "
     f"{top_feature_importance[1].feature}, {top_feature_importance[2].feature} "
-    "지표 영향이 상대적으로 크게 반영되었습니다."
+    f"지표의 영향이 이번 결과({direction})를 결정하는 데 크게 작용했습니다."
   )
 
   return PredictResponse(
@@ -428,6 +510,40 @@ def predict(ticker: str):
     reason_summary=reason_summary,
     data_years=DATA_BASELINE_YEARS,
   )
+
+
+@app.post("/api/sentiment/analyze", response_model=SentimentAnalyzeResponse)
+def analyze_sentiment_batch(payload: SentimentAnalyzeRequest):
+  titles = [title.strip() for title in payload.titles if title and title.strip()]
+  if not titles:
+    return SentimentAnalyzeResponse(data=[])
+  try:
+    tokenizer, model = get_finbert_pipeline()
+    inputs = tokenizer(titles, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+      outputs = model(**inputs)
+      scores = torch.softmax(outputs.logits, dim=1)
+    labels = ["positive", "negative", "neutral"]  # FinBERT class order
+    results: List[SentimentAnalyzeItem] = []
+    for i, score_set in enumerate(scores):
+      label_idx = int(torch.argmax(score_set).item())
+      conf = float(score_set[label_idx].item())
+      final_score = 0
+      if label_idx == 0:
+        final_score = int(conf * 100)
+      elif label_idx == 1:
+        final_score = int(conf * -100)
+      results.append(
+        SentimentAnalyzeItem(
+          title=titles[i],
+          label=labels[label_idx],
+          score=final_score,
+        )
+      )
+    return SentimentAnalyzeResponse(data=results)
+  except Exception as err:
+    logger.error("FinBERT 분석 실패: %s", err)
+    raise HTTPException(status_code=500, detail="Internal NLP Error")
 
 
 @app.get("/health")

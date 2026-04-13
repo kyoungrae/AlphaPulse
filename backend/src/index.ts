@@ -2,7 +2,6 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import admin from 'firebase-admin'
 import express, { Request, Response } from 'express'
-import OpenAI from 'openai'
 import Parser from 'rss-parser'
 import YahooFinance from 'yahoo-finance2'
 import { z } from 'zod'
@@ -21,8 +20,6 @@ const app = express()
 const port = process.env.PORT || 4000
 const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
 const yahooFinance = new YahooFinance()
-const openaiApiKey = process.env.OPENAI_API_KEY
-const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null
 const firestoreEnabled = process.env.FIRESTORE_ENABLED !== 'false'
 const DAILY_JOB_INTERVAL_MS = 1000 * 60 * 15
 const DAILY_JOB_CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
@@ -365,30 +362,31 @@ async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map
     }
   }
 
-  if (!openai || uncachedTitles.length === 0) return result
-  const prompt = `You are a financial sentiment classifier for stock market impact.
-Respond with JSON object in this exact format:
-{"data":[{"title":"...","label":"Positive|Negative|Neutral","score":-100..100}]}
-For each title, return an object {title, label, score}.
-label is one of Positive, Negative, Neutral. score is integer -100..100.
-Titles:
-${uncachedTitles.map((title, idx) => `${idx + 1}. ${title}`).join('\n')}`
-
-  const completion = await openai.responses.create({
-    model: 'gpt-4.1-mini',
-    input: prompt,
-  })
-  const parsed = JSON.parse(completion.output_text ?? '{"data": []}') as {
-    data?: { title: string; label: string; score: number }[]
-  }
-  for (const d of parsed.data ?? []) {
-    const normalized: SentimentCacheValue = {
-      label: toKoreanSentimentLabel(d.label),
-      score: Number.isFinite(d.score) ? Math.max(-100, Math.min(100, Math.round(d.score))) : 0,
-      analyzedAt: now,
+  if (uncachedTitles.length === 0) return result
+  try {
+    const response = await fetch(`${predictBase.replace(/\/+$/, '')}/api/sentiment/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ titles: uncachedTitles }),
+    })
+    if (!response.ok) {
+      throw new Error(`FinBERT endpoint error: ${response.status}`)
     }
-    sentimentCache.set(d.title, normalized)
-    result.set(d.title, normalized)
+    const parsed = (await response.json()) as {
+      data?: { title: string; label: string; score: number }[]
+    }
+    for (const d of parsed.data ?? []) {
+      const normalized: SentimentCacheValue = {
+        label: toKoreanSentimentLabel(d.label),
+        score: Number.isFinite(d.score) ? Math.max(-100, Math.min(100, Math.round(d.score))) : 0,
+        analyzedAt: now,
+      }
+      sentimentCache.set(d.title, normalized)
+      result.set(d.title, normalized)
+    }
+  } catch (err) {
+    console.error('FinBERT 연동 실패, 점수 fallback 사용', err)
+    // fall through to caller fallback
   }
   return result
 }
@@ -1202,61 +1200,16 @@ app.get('/api/news', async (_req: Request, res: Response) => {
           source: item.source?.title ?? '구글 뉴스',
         }))
         .filter((i) => i.title) ?? []
-
-    // Optional sentiment enrichment when API key provided
-    if (openai) {
-      try {
-        const now = Date.now()
-        const cachedMap = new Map<string, SentimentCacheValue>()
-        const uncachedTitles: string[] = []
-
-        for (const item of items) {
-          const cached = sentimentCache.get(item.title)
-          if (cached && now - cached.analyzedAt < SENTIMENT_CACHE_TTL_MS) {
-            cachedMap.set(item.title, cached)
-          } else {
-            uncachedTitles.push(item.title)
-          }
-        }
-
-        if (uncachedTitles.length > 0) {
-        const prompt = `You are a financial sentiment classifier for stock market impact.
-Respond with JSON object in this exact format:
-{"data":[{"title":"...","label":"Positive|Negative|Neutral","score":-100..100}]}
-For each title, return an object {title, label, score}.
-label is one of Positive, Negative, Neutral. score is integer -100..100.
-Titles:
-${uncachedTitles.map((title, idx) => `${idx + 1}. ${title}`).join('\n')}`
-
-        const completion = await openai.responses.create({
-          model: 'gpt-4.1-mini',
-          input: prompt,
-        })
-        const parsed = JSON.parse(completion.output_text ?? '{"data": []}') as {
-          data?: { title: string; label: string; score: number }[]
-        }
-        for (const d of parsed.data ?? []) {
-          sentimentCache.set(d.title, {
-            label: toKoreanSentimentLabel(d.label),
-            score: d.score,
-            analyzedAt: now,
-          })
-          }
-        }
-
-        const enriched = items.map((item) => {
-          const found = cachedMap.get(item.title) ?? sentimentCache.get(item.title)
-          return found
-            ? { ...item, sentiment: { label: toKoreanSentimentLabel(found.label), score: found.score } }
-            : { ...item, sentiment: { label: '중립', score: 0 } }
-        })
-        return res.json(enriched)
-      } catch (err) {
-        console.error('OpenAI sentiment error, falling back without sentiment', err)
+    const sentimentMap = await enrichNewsSentiment(items)
+    const enriched = items.map((item) => {
+      const found = sentimentMap.get(item.title) ?? sentimentCache.get(item.title)
+      if (found) {
+        return { ...item, sentiment: { label: toKoreanSentimentLabel(found.label), score: found.score } }
       }
-    }
-
-    res.json(items)
+      const fallback = scoreSentimentFallback(item.title)
+      return { ...item, sentiment: { label: fallback.label, score: fallback.score } }
+    })
+    res.json(enriched)
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: '뉴스 데이터를 가져오지 못했습니다.' })
@@ -1553,15 +1506,20 @@ app.get('/api/backtest/summary/:ticker', async (req: Request, res: Response) => 
 
 app.get('/api/predictions/history/:ticker', async (req: Request, res: Response) => {
   const db = getFirestore()
-  if (!db) {
-    return res.status(503).json({
-      error: 'Firestore가 설정되지 않아 예측 이력을 조회할 수 없습니다.',
-      detail: firestoreDisabledReason ?? 'FIREBASE_SERVICE_ACCOUNT_JSON 또는 GOOGLE_CLOUD_PROJECT 설정을 확인하세요.',
-    })
-  }
   const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
   const limitRaw = Number(req.query.limit ?? 30)
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 90) : 30
+  if (!ticker) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  if (!db) {
+    return res.json({
+      ticker,
+      items: [],
+      warning: 'Firestore 미설정으로 예측 이력이 비어 있습니다.',
+      detail: firestoreDisabledReason ?? 'FIREBASE_SERVICE_ACCOUNT_JSON 또는 GOOGLE_CLOUD_PROJECT 설정을 확인하세요.',
+    })
+  }
   try {
     const snap = await db
       .collection('predictions')

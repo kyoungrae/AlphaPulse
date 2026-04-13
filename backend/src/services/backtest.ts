@@ -177,21 +177,27 @@ export function runBacktest(input: BacktestInput): BacktestResult {
     const probabilityUp = byDateProb.get(today.date) ?? 0.5
     const action = signalFor(input.strategy, probabilityUp, currentSide, holdBars)
     latestSignal = { date: today.date, action, probabilityUp }
+    const isExtremeVolatility = probabilityUp > 0.8 || probabilityUp < 0.2
+    const longPenalty = isExtremeVolatility ? 1.005 : 1.0
+    const shortPenalty = isExtremeVolatility ? 0.995 : 1.0
 
     if (action === 'buy' && currentSide === null) {
-      const entry = applyEntryPrice(next.open, input.cost)
+      const adjustedOpen = next.open * longPenalty
+      const entry = applyEntryPrice(adjustedOpen, input.cost)
       entryPrice = entry.effectivePrice
       entryDate = next.date
       currentSide = 'long'
       holdBars = 0
     } else if (action === 'short' && currentSide === null) {
-      const entry = applyEntryPrice(next.open, input.cost)
+      const adjustedOpen = next.open * shortPenalty
+      const entry = applyEntryPrice(adjustedOpen, input.cost)
       entryPrice = entry.effectivePrice
       entryDate = next.date
       currentSide = 'short'
       holdBars = 0
     } else if (action === 'sell' && currentSide === 'long') {
-      const exit = applyExitPrice(next.open, input.cost)
+      const adjustedOpen = next.open * shortPenalty
+      const exit = applyExitPrice(adjustedOpen, input.cost)
       const grossReturn = next.open / entryPrice - 1
       const netReturn = exit.effectivePrice / entryPrice - 1
       const pnl = capital * netReturn
@@ -211,7 +217,8 @@ export function runBacktest(input: BacktestInput): BacktestResult {
       currentSide = null
       holdBars = 0
     } else if (action === 'cover' && currentSide === 'short') {
-      const exit = applyExitPrice(next.open, input.cost)
+      const adjustedOpen = next.open * longPenalty
+      const exit = applyExitPrice(adjustedOpen, input.cost)
       const grossReturn = entryPrice / next.open - 1
       const netReturn = entryPrice / exit.effectivePrice - 1
       const pnl = capital * netReturn
