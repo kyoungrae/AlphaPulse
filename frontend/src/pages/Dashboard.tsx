@@ -131,6 +131,19 @@ type NewsFeatureResponse = {
 
 type StrategyMode = 'long_only' | 'long_short' | 'swing' | 'intraday'
 
+const FEATURE_INTERPRETER: Record<string, { label: string; logic: string }> = {
+  oil_price: { label: '유가', logic: '에너지 비용 및 인플레이션 압력' },
+  us10y_yield: { label: '미국채 10년물 금리', logic: '시장 할인율 및 자금 조달 비용' },
+  vix_close: { label: 'VIX(공포지수)', logic: '시장 변동성 및 투자 심리 위축' },
+  relative_momentum: { label: '시장 대비 상대 강도', logic: '지수 대비 종목의 자금 유입 세기' },
+  obv_trend: { label: '거래량 추세(OBV)', logic: '스마트 머니의 매집 및 이탈 신호' },
+  atr_pct: { label: '변동성 폭(ATR)', logic: '최근 가격 흔들림의 크기' },
+  rsi_14: { label: 'RSI(과매수/과매도)', logic: '단기 가격 과열 또는 침체 상태' },
+  macd_hist: { label: 'MACD 히스토그램', logic: '추세 반전 및 가속도' },
+  vbp_node_strength: { label: '매물 밀집도', logic: '현 가격대에서의 거래 집중도' },
+  usd_krw_exchange: { label: '원/달러 환율', logic: '외국인 수급 및 환차익/손실 영향' },
+}
+
 type BacktestMetrics = {
   totalReturn: number
   cagr: number
@@ -648,22 +661,30 @@ export default function Dashboard() {
     const prob = directionProb.toFixed(1)
     const action = backtest.latestSignal?.action ?? 'hold'
     const topFeature = predict.top_feature_importance?.[0]?.feature ?? '시장 지표'
+    const topFeatureLabel = FEATURE_INTERPRETER[topFeature]?.label ?? topFeature
+    const detailedAnalysis = (predict.top_feature_importance ?? []).slice(0, 3).map((item, idx) => {
+      const info = FEATURE_INTERPRETER[item.feature] ?? { label: item.feature, logic: '시장 변동 요인' }
+      const isPositiveImpact = item.importance > 0
+      const impactDir = isPositiveImpact ? '상승 요인' : '하락 요인'
+      const colorClass = isPositiveImpact ? 'text-emerald-400' : 'text-rose-400'
 
-    let actionText = ''
-    if (action === 'buy') actionText = '신규 진입(매수)을 적극적으로 고려할 수 있는 구간입니다.'
-    else if (action === 'short') actionText = '공매도 또는 인버스 대응이 통계적으로 유리한 구간입니다.'
-    else if (action === 'sell' || action === 'cover') {
-      actionText = '기존 포지션을 청산하고 수익 확정(또는 손절) 여부를 우선 점검하세요.'
-    } else {
-      actionText = '방향성이 더 명확해질 때까지 신규 진입을 줄이고 관망하는 편이 유리합니다.'
-    }
-
-    let levelText = ''
-    if (isUp && vbpLevels.resistance != null) {
-      levelText = `단기 익절 기준은 1차 저항선 ${formatMoney(vbpLevels.resistance, priceCurrency)} 부근이 유효합니다.`
-    } else if (!isUp && vbpLevels.support != null) {
-      levelText = `하락 시 1차 지지선 ${formatMoney(vbpLevels.support, priceCurrency)} 이탈 여부를 우선 확인하고, 이탈 시 손절 대응이 필요합니다.`
-    }
+      return (
+        <div key={`${item.feature}-${idx}`} className="flex flex-col gap-1 rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-bold text-slate-100">
+              {idx + 1}. {info.label}
+            </span>
+            <span className={`rounded-full bg-slate-800 px-2 py-0.5 text-[10px] ${colorClass}`}>
+              {impactDir} (기여도: {Math.abs(item.importance).toFixed(4)})
+            </span>
+          </div>
+          <p className="text-xs leading-relaxed text-slate-400">
+            {info.logic} 관점에서 현재 {isPositiveImpact ? '긍정적인' : '부정적인'} 신호가 감지되어 최종 예측을{' '}
+            <span className={colorClass}>{isPositiveImpact ? '상승' : '하락'}</span> 방향으로 당기고 있습니다.
+          </p>
+        </div>
+      )
+    })
 
     return (
       <div className="rounded-2xl border border-blue-800/50 bg-blue-900/10 p-5 shadow-lg backdrop-blur-sm">
@@ -672,25 +693,42 @@ export default function Dashboard() {
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
             <span className="relative inline-flex h-3 w-3 rounded-full bg-blue-500" />
           </span>
-          AI 퀀트 매니저 브리핑: {selectedDisplayName}
+          AI 퀀트 매니저 상세 분석 리포트
         </h3>
-        <ul className="mt-3 space-y-2 text-sm text-slate-200">
-          <li>
-            <strong className="text-white">오늘의 예측:</strong> 내일 종가는{' '}
-            <span className={isUp ? 'font-bold text-emerald-400' : 'font-bold text-rose-400'}>
-              {isUp ? '상승' : '하락'} (확률 {prob}%)
-            </span>{' '}
-            쪽이며, 최대 기여 요인은 <strong>[{topFeature}]</strong>입니다.
-          </li>
-          <li>
-            <strong className="text-white">투자 전략:</strong> {actionText}
-          </li>
-          {levelText && (
-            <li>
-              <strong className="text-white">리스크 관리:</strong> {levelText}
-            </li>
+        <p className="mt-2 text-sm text-slate-200">
+          AI 모델 기준 내일 <span className="font-semibold text-white">{selectedDisplayName}</span>은(는)
+          <span className={isUp ? ' font-bold text-emerald-400' : ' font-bold text-rose-400'}>
+            {isUp ? ' 상승' : ' 하락'} 확률 {prob}%
+          </span>
+          로 해석됩니다. 핵심 요인은 <strong>[{topFeatureLabel}]</strong>입니다.
+        </p>
+
+        <div className="mb-4 mt-3 grid gap-3 md:grid-cols-3">
+          {detailedAnalysis.length ? detailedAnalysis : <p className="text-xs text-slate-500">해석 가능한 요인이 없습니다.</p>}
+        </div>
+
+        <div className="border-t border-slate-800/50 pt-4 text-xs text-slate-300">
+          <strong className="text-blue-300">투자 의견:</strong>{' '}
+          {action === 'buy'
+            ? '상승 모멘텀 신호가 확인되어 분할 매수 전략이 유효해 보입니다.'
+            : action === 'short'
+              ? '매도 압력이 강한 구간으로 신규 매수보다는 보수적 대응이 유리합니다.'
+              : action === 'sell' || action === 'cover'
+                ? '기존 포지션은 청산 우선 전략으로 리스크를 줄이는 접근이 적절합니다.'
+                : '방향성이 엇갈리는 구간이므로 지지/저항 확인 후 관망 전략을 권장합니다.'}
+          {!isUp && vbpLevels.support != null && (
+            <span>
+              {' '}
+              하방 기준선은 {formatMoney(vbpLevels.support, priceCurrency)}이며 이탈 시 손절 기준으로 활용하세요.
+            </span>
           )}
-        </ul>
+          {isUp && vbpLevels.resistance != null && (
+            <span>
+              {' '}
+              상방 1차 목표는 {formatMoney(vbpLevels.resistance, priceCurrency)} 부근입니다.
+            </span>
+          )}
+        </div>
       </div>
     )
   }, [
@@ -1118,14 +1156,26 @@ export default function Dashboard() {
                 )}
             </div>
             <div className="min-w-0 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
-              <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>
+              <p className="mb-3 font-semibold text-slate-200">AI 심층 판단 근거 (SHAP 분석)</p>
               <SHAPContributionChart data={predict?.top_feature_importance ?? []} />
-              {predict?.top_feature_importance?.map((item) => (
-                <div key={item.feature} className="flex items-center justify-between gap-2">
-                  <span className="truncate">{item.feature}</span>
-                  <span className="shrink-0 tabular-nums">{item.importance.toFixed(4)}</span>
-                </div>
-              ))}
+              <div className="mt-4 space-y-3">
+                {predict?.top_feature_importance?.map((item) => (
+                  <div key={item.feature} className="border-l-2 border-slate-700 pl-3">
+                    <div className="flex items-center justify-between gap-2 text-[11px]">
+                      <span className="truncate font-medium text-blue-300">
+                        {FEATURE_INTERPRETER[item.feature]?.label ?? item.feature}
+                      </span>
+                      <span className={item.importance > 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                        {item.importance > 0 ? '상승 기여' : '하락 압박'}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[10px] leading-normal text-slate-500">
+                      {FEATURE_INTERPRETER[item.feature]?.logic ?? '시장 변동 요인'} 관점에서 모델 판단에 약{' '}
+                      {Math.abs(item.importance * 10).toFixed(1)}% 가중치로 반영되었습니다.
+                    </p>
+                  </div>
+                ))}
+              </div>
               <p className="mt-2 text-slate-400">{predict?.reason_summary ?? '예측 데이터가 없습니다.'}</p>
             </div>
           </div>

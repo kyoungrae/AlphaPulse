@@ -224,6 +224,8 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
   if isinstance(close, pd.DataFrame):
     close = close.iloc[:, 0]
   close = pd.to_numeric(close, errors="coerce")
+  high = pd.to_numeric(df["High"], errors="coerce")
+  low = pd.to_numeric(df["Low"], errors="coerce")
   vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
 
   df["sma_5"] = SMAIndicator(close, window=5).sma_indicator()
@@ -241,8 +243,13 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
   df["bb_bbh"] = bb.bollinger_hband()
   df["bb_bbl"] = bb.bollinger_lband()
 
-  atr_ind = AverageTrueRange(high=df["High"], low=df["Low"], close=close, window=14)
-  df["atr_pct"] = (atr_ind.average_true_range() / close).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+  # ta.volatility.AverageTrueRange requires enough rows (window=14). For short/empty
+  # series, fallback to 0 so the caller can handle insufficient-data cases gracefully.
+  if len(df) >= 14:
+    atr_ind = AverageTrueRange(high=high, low=low, close=close, window=14)
+    df["atr_pct"] = (atr_ind.average_true_range() / close).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+  else:
+    df["atr_pct"] = 0.0
 
   obv_ind = OnBalanceVolumeIndicator(close=close, volume=vol)
   obv_vals = obv_ind.on_balance_volume()
