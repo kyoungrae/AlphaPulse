@@ -89,6 +89,34 @@ type DirectionsResponse = {
   items: DirectionItem[]
 }
 
+type NewsFeatureDaily = {
+  date: string
+  news_sentiment_score: number
+  news_volume: number
+  event_keyword_count: number
+  positive_count: number
+  negative_count: number
+  neutral_count: number
+}
+
+type NewsFeatureResponse = {
+  ticker: string
+  market: 'us' | 'kr'
+  from: string
+  to: string
+  generatedAt: string
+  keywords: string[]
+  summary: {
+    news_sentiment_score: number
+    news_volume: number
+    event_keyword_count: number
+    positive_count: number
+    negative_count: number
+    neutral_count: number
+  }
+  daily: NewsFeatureDaily[]
+}
+
 type StrategyMode = 'long_only' | 'long_short' | 'swing' | 'intraday'
 
 type BacktestMetrics = {
@@ -463,6 +491,13 @@ export default function Dashboard() {
     error: backtestError,
   } = useFetch<BacktestResult>(
     `/api/backtest/${encodeURIComponent(selectedSymbol)}?market=${market}&strategy=${strategy}`,
+  )
+  const {
+    data: newsFeatures,
+    loading: newsFeaturesLoading,
+    error: newsFeaturesError,
+  } = useFetch<NewsFeatureResponse>(
+    `/api/features/news/${encodeURIComponent(selectedSymbol)}?market=${market}&limit=100`,
   )
   const { data: fxData } = useFetch<FxResponse>('/api/fx/usd-krw')
   const topSymbolsCsv = useMemo(
@@ -1101,6 +1136,72 @@ export default function Dashboard() {
               <p className="mt-2 text-slate-400">{predict?.reason_summary ?? '예측 데이터가 없습니다.'}</p>
             </div>
           </div>
+        </div>
+        <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold text-white">{selectedDisplayName} 뉴스 기반 피처 요약</h3>
+            {newsFeaturesLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
+            {newsFeaturesError && <span className="text-xs text-rose-400">오류: {newsFeaturesError}</span>}
+          </div>
+          {newsFeaturesLoading ? (
+            <div className="mt-3 h-20 animate-pulse rounded-xl bg-slate-800/60" />
+          ) : newsFeatures ? (
+            <>
+              <div className="mt-3 grid gap-3 lg:grid-cols-4">
+                <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-blue-300">기간 평균 감성</p>
+                  <p className="mt-2 text-lg font-semibold text-white">
+                    {(newsFeatures.summary.news_sentiment_score * 100).toFixed(1)}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">-100 ~ 100 (양수일수록 낙관)</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-blue-300">기사 수</p>
+                  <p className="mt-2 text-lg font-semibold text-white">{newsFeatures.summary.news_volume}</p>
+                  <p className="mt-1 text-[11px] text-slate-500">{newsFeatures.from} ~ {newsFeatures.to}</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-blue-300">이벤트 키워드</p>
+                  <p className="mt-2 text-lg font-semibold text-white">{newsFeatures.summary.event_keyword_count}</p>
+                  <p className="mt-1 text-[11px] text-slate-500">워드 출현 횟수 합계</p>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-blue-300">감성 분포</p>
+                  <p className="mt-2 text-sm text-slate-200">
+                    긍정 {newsFeatures.summary.positive_count} / 부정 {newsFeatures.summary.negative_count} / 중립{' '}
+                    {newsFeatures.summary.neutral_count}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                <p className="text-xs uppercase tracking-[0.2em] text-blue-300">일자별 피처</p>
+                <div className="mt-2 max-h-44 overflow-y-auto">
+                  <table className="w-full text-left text-xs text-slate-300">
+                    <thead className="text-slate-500">
+                      <tr>
+                        <th className="py-1">날짜</th>
+                        <th className="py-1">감성</th>
+                        <th className="py-1">기사수</th>
+                        <th className="py-1">키워드</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...newsFeatures.daily].slice(-10).reverse().map((row) => (
+                        <tr key={row.date} className="border-t border-slate-800/70">
+                          <td className="py-1.5">{row.date}</td>
+                          <td className="py-1.5 tabular-nums">{(row.news_sentiment_score * 100).toFixed(1)}</td>
+                          <td className="py-1.5 tabular-nums">{row.news_volume}</td>
+                          <td className="py-1.5 tabular-nums">{row.event_keyword_count}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          ) : (
+            <p className="mt-3 text-sm text-slate-400">뉴스 기반 피처 데이터가 없습니다.</p>
+          )}
         </div>
         <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="flex items-center justify-between">

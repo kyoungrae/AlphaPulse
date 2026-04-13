@@ -52,6 +52,8 @@ const rssParser = new Parser()
 type SentimentCacheValue = { label: string; score: number; analyzedAt: number }
 const sentimentCache = new Map<string, SentimentCacheValue>()
 const SENTIMENT_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7
+const NEWS_FEATURE_DEFAULT_DAYS = Math.max(1, Number(process.env.NEWS_FEATURE_DEFAULT_DAYS ?? 14))
+const NEWS_FEATURE_MAX_LIMIT = Math.max(20, Number(process.env.NEWS_FEATURE_MAX_LIMIT ?? 200))
 const S_AND_P_500_CSV_URL = 'https://datahub.io/core/s-and-p-500-companies/r/constituents.csv'
 const SP500_CACHE_TTL_MS = 1000 * 60 * 60 * 24
 
@@ -85,6 +87,14 @@ type PredictionRecord = {
   source: 'daily-close-job'
 }
 type CacheEntry<T> = { data: T; cachedAt: number }
+type NewsSentimentLabel = '긍정' | '부정' | '중립'
+type NewsItemWithSentiment = {
+  title: string
+  link?: string
+  source: string
+  publishedAt: string
+  sentiment: { label: NewsSentimentLabel; score: number }
+}
 
 const fallbackSymbols: SymbolItem[] = [
   { symbol: 'AAPL', name: 'Apple Inc.', nameKr: '애플' },
@@ -222,6 +232,215 @@ function toKoreanSentimentLabel(label: string) {
   if (normalized === 'positive' || normalized === '긍정') return '긍정'
   if (normalized === 'negative' || normalized === '부정') return '부정'
   return '중립'
+}
+
+function normalizeIsoDate(input: string | undefined): string | null {
+  if (!input) return null
+  const d = new Date(input)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toISOString().slice(0, 10)
+}
+
+function defaultDateRange(days: number): { from: string; to: string } {
+  const to = new Date()
+  const from = new Date(to)
+  from.setUTCDate(from.getUTCDate() - Math.max(0, days - 1))
+  return {
+    from: from.toISOString().slice(0, 10),
+    to: to.toISOString().slice(0, 10),
+  }
+}
+
+function buildNewsSearchQuery(ticker: string, market: Market) {
+  const base = market === 'kr' ? `${ticker} OR 한국 증시 OR 코스피 OR 코스닥` : `${ticker} OR 미국 증시 OR 연준 OR 금리`
+  return `https://news.google.com/rss/search?q=${encodeURIComponent(base)}&hl=ko&gl=KR&ceid=KR:ko`
+}
+
+async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map<string, SentimentCacheValue>> {
+  const now = Date.now()
+  const result = new Map<string, SentimentCacheValue>()
+  const uncachedTitles: string[] = []
+  for (const item of items) {
+    const cached = sentimentCache.get(item.title)
+    if (cached && now - cached.analyzedAt < SENTIMENT_CACHE_TTL_MS) {
+      result.set(item.title, cached)
+    } else {
+      uncachedTitles.push(item.title)
+    }
+  }
+
+  if (!openai || uncachedTitles.length === 0) return result
+  const prompt = `You are a financial sentiment classifier for stock market impact.
+Respond with JSON object in this exact format:
+{"data":[{"title":"...","label":"Positive|Negative|Neutral","score":-100..100}]}
+For each title, return an object {title, label, score}.
+label is one of Positive, Negative, Neutral. score is integer -100..100.
+Titles:
+${uncachedTitles.map((title, idx) => `${idx + 1}. ${title}`).join('\n')}`
+
+  const completion = await openai.responses.create({
+    model: 'gpt-4.1-mini',
+    input: prompt,
+  })
+  const parsed = JSON.parse(completion.output_text ?? '{"data": []}') as {
+    data?: { title: string; label: string; score: number }[]
+  }
+  for (const d of parsed.data ?? []) {
+    const normalized: SentimentCacheValue = {
+      label: toKoreanSentimentLabel(d.label),
+      score: Number.isFinite(d.score) ? Math.max(-100, Math.min(100, Math.round(d.score))) : 0,
+      analyzedAt: now,
+    }
+    sentimentCache.set(d.title, normalized)
+    result.set(d.title, normalized)
+  }
+  return result
+}
+
+async function fetchNewsWithSentiment(params: {
+  ticker: string
+  market: Market
+  from: string
+  to: string
+  limit: number
+}) {
+  const feed = await rssParser.parseURL(buildNewsSearchQuery(params.ticker, params.market))
+  const fromTs = new Date(`${params.from}T00:00:00Z`).getTime()
+  const toTs = new Date(`${params.to}T23:59:59Z`).getTime()
+  const rawItems =
+    feed.items
+      ?.map((item) => {
+        const publishedRaw = item.isoDate ?? item.pubDate
+        const published = publishedRaw ? new Date(publishedRaw) : null
+        const publishedAt = published && !Number.isNaN(published.getTime()) ? published : null
+        return {
+          title: item.title ?? '제목 없음',
+          link: item.link,
+          source: item.source?.title ?? '구글 뉴스',
+          publishedAt,
+        }
+      })
+      .filter((item) => item.title && item.publishedAt)
+      .filter((item) => {
+        const ts = item.publishedAt!.getTime()
+        return ts >= fromTs && ts <= toTs
+      })
+      .slice(0, params.limit) ?? []
+
+  const sentimentMap = await enrichNewsSentiment(rawItems)
+  return rawItems.map(
+    (item): NewsItemWithSentiment => ({
+      title: item.title,
+      link: item.link,
+      source: item.source,
+      publishedAt: item.publishedAt!.toISOString(),
+      sentiment: sentimentMap.get(item.title)
+        ? {
+            label: toKoreanSentimentLabel(sentimentMap.get(item.title)!.label),
+            score: sentimentMap.get(item.title)!.score,
+          }
+        : { label: '중립', score: 0 },
+    }),
+  )
+}
+
+function keywordRegexes(keywords: string[]) {
+  return keywords.map((kw) => ({ keyword: kw, regex: new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi') }))
+}
+
+function buildDailyNewsFeatures(items: NewsItemWithSentiment[], keywords: string[]) {
+  const keyRegs = keywordRegexes(keywords)
+  const byDate = new Map<
+    string,
+    {
+      count: number
+      sentimentSum: number
+      positiveCount: number
+      negativeCount: number
+      neutralCount: number
+      keywordHits: number
+      keywordByName: Record<string, number>
+    }
+  >()
+  for (const item of items) {
+    const date = item.publishedAt.slice(0, 10)
+    const cur = byDate.get(date) ?? {
+      count: 0,
+      sentimentSum: 0,
+      positiveCount: 0,
+      negativeCount: 0,
+      neutralCount: 0,
+      keywordHits: 0,
+      keywordByName: {},
+    }
+    cur.count += 1
+    cur.sentimentSum += item.sentiment.score
+    if (item.sentiment.label === '긍정') cur.positiveCount += 1
+    else if (item.sentiment.label === '부정') cur.negativeCount += 1
+    else cur.neutralCount += 1
+
+    const title = item.title.toLowerCase()
+    for (const { keyword, regex } of keyRegs) {
+      const matches = title.match(regex)
+      const hit = matches?.length ?? 0
+      if (hit > 0) {
+        cur.keywordHits += hit
+        cur.keywordByName[keyword] = (cur.keywordByName[keyword] ?? 0) + hit
+      }
+    }
+    byDate.set(date, cur)
+  }
+
+  const daily = Array.from(byDate.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, row]) => ({
+      date,
+      news_sentiment_score: Number((row.sentimentSum / row.count / 100).toFixed(4)),
+      news_volume: row.count,
+      event_keyword_count: row.keywordHits,
+      positive_count: row.positiveCount,
+      negative_count: row.negativeCount,
+      neutral_count: row.neutralCount,
+      keyword_breakdown: row.keywordByName,
+    }))
+
+  const totalCount = daily.reduce((acc, d) => acc + d.news_volume, 0)
+  const weightedSentiment =
+    totalCount > 0
+      ? Number(
+          (
+            daily.reduce((acc, d) => acc + d.news_sentiment_score * d.news_volume, 0) /
+            totalCount
+          ).toFixed(4),
+        )
+      : 0
+  const keywordTotal = daily.reduce((acc, d) => acc + d.event_keyword_count, 0)
+  const positiveTotal = daily.reduce((acc, d) => acc + d.positive_count, 0)
+  const negativeTotal = daily.reduce((acc, d) => acc + d.negative_count, 0)
+  const neutralTotal = daily.reduce((acc, d) => acc + d.neutral_count, 0)
+  const keywordMap = new Map<string, number>()
+  for (const d of daily) {
+    for (const [k, v] of Object.entries(d.keyword_breakdown)) {
+      keywordMap.set(k, (keywordMap.get(k) ?? 0) + v)
+    }
+  }
+  const topKeywords = Array.from(keywordMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([keyword, count]) => ({ keyword, count }))
+
+  return {
+    summary: {
+      news_sentiment_score: weightedSentiment,
+      news_volume: totalCount,
+      event_keyword_count: keywordTotal,
+      positive_count: positiveTotal,
+      negative_count: negativeTotal,
+      neutral_count: neutralTotal,
+    },
+    daily,
+    topKeywords,
+  }
 }
 
 async function getSp500Symbols(): Promise<SymbolItem[]> {
@@ -735,6 +954,7 @@ app.get('/', (_req: Request, res: Response) => {
       '/api/stock/:ticker',
       '/api/fx/usd-krw',
       '/api/news',
+      '/api/features/news/:ticker',
       '/api/symbols/sp500',
       '/api/predictions/history/:ticker',
       '/health',
@@ -923,6 +1143,70 @@ ${uncachedTitles.map((title, idx) => `${idx + 1}. ${title}`).join('\n')}`
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: '뉴스 데이터를 가져오지 못했습니다.' })
+  }
+})
+
+app.get('/api/features/news/:ticker', async (req: Request, res: Response) => {
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
+  if (!ticker) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  const marketRaw = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
+  const market: Market = marketRaw === 'kr' ? 'kr' : 'us'
+  const limitRaw = Number(req.query.limit ?? 80)
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 10), NEWS_FEATURE_MAX_LIMIT) : 80
+
+  const defaultRange = defaultDateRange(NEWS_FEATURE_DEFAULT_DAYS)
+  const from = normalizeIsoDate(normalizeSingle(req.query.from as string | string[] | undefined)) ?? defaultRange.from
+  const to = normalizeIsoDate(normalizeSingle(req.query.to as string | string[] | undefined)) ?? defaultRange.to
+  if (from > to) {
+    return res.status(400).json({ error: 'from은 to보다 이후일 수 없습니다.' })
+  }
+
+  const keywordsRaw = normalizeSingle(req.query.keywords as string | string[] | undefined)
+  const keywords =
+    keywordsRaw
+      ?.split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => s.length > 0)
+      .slice(0, 40) ?? [
+      'war',
+      '전쟁',
+      '봉쇄',
+      '제재',
+      '유가',
+      '금리',
+      '인플레이션',
+      '실적',
+      'guidance',
+      'recession',
+      'fed',
+    ]
+
+  try {
+    const items = await fetchNewsWithSentiment({
+      ticker,
+      market,
+      from,
+      to,
+      limit,
+    })
+    const features = buildDailyNewsFeatures(items, keywords)
+    return res.json({
+      ticker,
+      market,
+      from,
+      to,
+      generatedAt: new Date().toISOString(),
+      keywords,
+      summary: features.summary,
+      daily: features.daily,
+      topKeywords: features.topKeywords,
+      articles: items.slice(0, 20),
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '뉴스 피처 집계에 실패했습니다.' })
   }
 })
 
