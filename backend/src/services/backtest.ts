@@ -153,6 +153,8 @@ function calcSharpe(returns: number[]) {
 }
 
 export function runBacktest(input: BacktestInput): BacktestResult {
+  const STOP_LOSS_PCT = 0.05
+  const TAKE_PROFIT_PCT = 0.15
   const byDateProb = new Map(input.probabilities.map((p) => [p.date, p.probabilityUp]))
   const candles = input.candles
     .filter((c) => byDateProb.has(c.date))
@@ -166,6 +168,7 @@ export function runBacktest(input: BacktestInput): BacktestResult {
   let entryPrice = 0
   let entryDate = ''
   let holdBars = 0
+  let currentPositionSize = 0
   const trades: TradeLog[] = []
   const equityCurve: Array<{ date: string; equity: number; drawdown: number }> = []
   const dailyReturns: number[] = []
@@ -175,11 +178,24 @@ export function runBacktest(input: BacktestInput): BacktestResult {
     const today = candles[i]
     const next = candles[i + 1]
     const probabilityUp = byDateProb.get(today.date) ?? 0.5
-    const action = signalFor(input.strategy, probabilityUp, currentSide, holdBars)
+    const positionSize = probabilityUp > 0.8 || probabilityUp < 0.2 ? 1.0 : 0.6
+    let action = signalFor(input.strategy, probabilityUp, currentSide, holdBars)
     latestSignal = { date: today.date, action, probabilityUp }
     const isExtremeVolatility = probabilityUp > 0.8 || probabilityUp < 0.2
     const longPenalty = isExtremeVolatility ? 1.005 : 1.0
     const shortPenalty = isExtremeVolatility ? 0.995 : 1.0
+
+    if (currentSide === 'long') {
+      const currentReturn = today.close / entryPrice - 1
+      if (currentReturn <= -STOP_LOSS_PCT || currentReturn >= TAKE_PROFIT_PCT) {
+        action = 'sell'
+      }
+    } else if (currentSide === 'short') {
+      const currentReturn = entryPrice / today.close - 1
+      if (currentReturn <= -STOP_LOSS_PCT || currentReturn >= TAKE_PROFIT_PCT) {
+        action = 'cover'
+      }
+    }
 
     if (action === 'buy' && currentSide === null) {
       const adjustedOpen = next.open * longPenalty
@@ -187,6 +203,7 @@ export function runBacktest(input: BacktestInput): BacktestResult {
       entryPrice = entry.effectivePrice
       entryDate = next.date
       currentSide = 'long'
+      currentPositionSize = positionSize
       holdBars = 0
     } else if (action === 'short' && currentSide === null) {
       const adjustedOpen = next.open * shortPenalty
@@ -194,13 +211,14 @@ export function runBacktest(input: BacktestInput): BacktestResult {
       entryPrice = entry.effectivePrice
       entryDate = next.date
       currentSide = 'short'
+      currentPositionSize = positionSize
       holdBars = 0
     } else if (action === 'sell' && currentSide === 'long') {
       const adjustedOpen = next.open * shortPenalty
       const exit = applyExitPrice(adjustedOpen, input.cost)
       const grossReturn = next.open / entryPrice - 1
       const netReturn = exit.effectivePrice / entryPrice - 1
-      const pnl = capital * netReturn
+      const pnl = capital * currentPositionSize * netReturn
       capital += pnl
       trades.push({
         side: 'long',
@@ -215,13 +233,14 @@ export function runBacktest(input: BacktestInput): BacktestResult {
       })
       dailyReturns.push(netReturn)
       currentSide = null
+      currentPositionSize = 0
       holdBars = 0
     } else if (action === 'cover' && currentSide === 'short') {
       const adjustedOpen = next.open * longPenalty
       const exit = applyExitPrice(adjustedOpen, input.cost)
       const grossReturn = entryPrice / next.open - 1
       const netReturn = entryPrice / exit.effectivePrice - 1
-      const pnl = capital * netReturn
+      const pnl = capital * currentPositionSize * netReturn
       capital += pnl
       trades.push({
         side: 'short',
@@ -236,6 +255,7 @@ export function runBacktest(input: BacktestInput): BacktestResult {
       })
       dailyReturns.push(netReturn)
       currentSide = null
+      currentPositionSize = 0
       holdBars = 0
     }
 

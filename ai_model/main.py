@@ -16,7 +16,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -27,6 +27,10 @@ from pydantic import BaseModel
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, cross_validate
 from sklearn.preprocessing import StandardScaler
+try:
+  from lightgbm import LGBMClassifier
+except Exception:  # pragma: no cover - optional dependency
+  LGBMClassifier = None
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 from ta.volatility import BollingerBands
@@ -91,7 +95,7 @@ FINBERT_ENABLED = os.getenv("FINBERT_ENABLED", "true").lower() != "false"
 
 @dataclass
 class ModelBundle:
-  model: RandomForestClassifier
+  model: Any
   scaler: StandardScaler
   trained_at: datetime
   cv_accuracy: float
@@ -321,21 +325,41 @@ def train_model(ticker: str = "AAPL") -> ModelBundle:
   scaler = StandardScaler()
   X_scaled = scaler.fit_transform(X)
 
-  model = RandomForestClassifier(
-    n_estimators=300,
-    max_depth=8,
-    random_state=42,
-    n_jobs=-1,
-  )
+  if LGBMClassifier is not None:
+    model = LGBMClassifier(
+      n_estimators=500,
+      learning_rate=0.03,
+      max_depth=7,
+      num_leaves=31,
+      random_state=42,
+      importance_type="gain",
+    )
+  else:
+    model = RandomForestClassifier(
+      n_estimators=300,
+      max_depth=8,
+      random_state=42,
+      n_jobs=-1,
+    )
   model.fit(X_scaled, y)
 
   tscv = TimeSeriesSplit(n_splits=5)
-  cv_model = RandomForestClassifier(
-    n_estimators=300,
-    max_depth=8,
-    random_state=42,
-    n_jobs=-1,
-  )
+  if LGBMClassifier is not None:
+    cv_model = LGBMClassifier(
+      n_estimators=500,
+      learning_rate=0.03,
+      max_depth=7,
+      num_leaves=31,
+      random_state=42,
+      importance_type="gain",
+    )
+  else:
+    cv_model = RandomForestClassifier(
+      n_estimators=300,
+      max_depth=8,
+      random_state=42,
+      n_jobs=-1,
+    )
   cv_scores = cross_validate(
     cv_model,
     X_scaled,

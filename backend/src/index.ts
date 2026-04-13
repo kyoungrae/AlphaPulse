@@ -2,6 +2,7 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import admin from 'firebase-admin'
 import express, { Request, Response } from 'express'
+import { createClient } from 'redis'
 import Parser from 'rss-parser'
 import YahooFinance from 'yahoo-finance2'
 import { z } from 'zod'
@@ -33,6 +34,7 @@ const PREDICTION_HISTORY_QUERY_LIMIT = 4000
 const STOCK_CACHE_TTL_MS = 1000 * 60 * 5
 const PREDICT_CACHE_TTL_MS = 1000 * 60 * 2
 const FX_CACHE_TTL_MS = 1000 * 60 * 10
+const redisUrl = process.env.REDIS_URL
 
 app.use(cors())
 app.use(express.json())
@@ -50,6 +52,7 @@ const rssParser = new Parser()
 type SentimentCacheValue = { label: NewsSentimentLabel; score: number; analyzedAt: number }
 const sentimentCache = new Map<string, SentimentCacheValue>()
 const SENTIMENT_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7
+const SENTIMENT_REDIS_TTL_SECONDS = Math.floor(SENTIMENT_CACHE_TTL_MS / 1000)
 const NEWS_FEATURE_DEFAULT_DAYS = Math.max(1, Number(process.env.NEWS_FEATURE_DEFAULT_DAYS ?? 14))
 const NEWS_FEATURE_MAX_LIMIT = Math.max(20, Number(process.env.NEWS_FEATURE_MAX_LIMIT ?? 200))
 const S_AND_P_500_CSV_URL = 'https://datahub.io/core/s-and-p-500-companies/r/constituents.csv'
@@ -195,6 +198,33 @@ const stockCache = new Map<string, CacheEntry<{ date: string; close: number }[]>
 const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
 const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
+const redisClient = redisUrl ? createClient({ url: redisUrl }) : null
+if (redisClient) {
+  redisClient.connect().catch((err: unknown) => {
+    console.error('Redis 연결 실패. 메모리 캐시로 계속 동작합니다.', err)
+  })
+}
+
+async function getRedisJson<T>(key: string): Promise<T | null> {
+  if (!redisClient || !redisClient.isOpen) return null
+  try {
+    const raw = await redisClient.get(key)
+    if (!raw) return null
+    return JSON.parse(raw) as T
+  } catch (err) {
+    console.error('Redis 조회 실패', err)
+    return null
+  }
+}
+
+async function setRedisJson(key: string, value: unknown, ttlSeconds: number) {
+  if (!redisClient || !redisClient.isOpen) return
+  try {
+    await redisClient.setEx(key, Math.max(1, ttlSeconds), JSON.stringify(value))
+  } catch (err) {
+    console.error('Redis 저장 실패', err)
+  }
+}
 
 function normalizeSingle(value: string | string[] | undefined): string | undefined {
   if (Array.isArray(value)) return value[0]
@@ -354,7 +384,15 @@ async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map
   const result = new Map<string, SentimentCacheValue>()
   const uncachedTitles: string[] = []
   for (const item of items) {
-    const cached = sentimentCache.get(item.title)
+    const cacheKey = `sentiment:${encodeURIComponent(item.title)}`
+    let cached = sentimentCache.get(item.title)
+    if (!cached) {
+      const redisCached = await getRedisJson<SentimentCacheValue>(cacheKey)
+      if (redisCached) {
+        cached = redisCached
+        sentimentCache.set(item.title, redisCached)
+      }
+    }
     if (cached && now - cached.analyzedAt < SENTIMENT_CACHE_TTL_MS) {
       result.set(item.title, cached)
     } else {
@@ -383,6 +421,7 @@ async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map
       }
       sentimentCache.set(d.title, normalized)
       result.set(d.title, normalized)
+      await setRedisJson(`sentiment:${encodeURIComponent(d.title)}`, normalized, SENTIMENT_REDIS_TTL_SECONDS)
     }
   } catch (err) {
     console.error('FinBERT 연동 실패, 점수 fallback 사용', err)
@@ -1081,6 +1120,14 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
   const yearsRaw = Number(normalizeSingle(req.query.years as string | string[] | undefined) ?? 1)
   const years = Number.isFinite(yearsRaw) ? Math.min(Math.max(Math.floor(yearsRaw), 1), 30) : 1
   const stockCacheKey = `${ticker}:${timeframe}:${years}:ohlc-v1`
+  const redisStockKey = `stock:${stockCacheKey}`
+  const redisStock = await getRedisJson<{ date: string; open: number; high: number; low: number; close: number; volume: number }[]>(
+    redisStockKey,
+  )
+  if (redisStock) {
+    stockCache.set(stockCacheKey, { data: redisStock, cachedAt: Date.now() })
+    return res.json(redisStock)
+  }
   const stockCached = stockCache.get(stockCacheKey)
   if (stockCached && Date.now() - stockCached.cachedAt < STOCK_CACHE_TTL_MS) {
     return res.json(stockCached.data)
@@ -1137,6 +1184,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
         })) ?? []
 
     stockCache.set(stockCacheKey, { data: result, cachedAt: Date.now() })
+    await setRedisJson(redisStockKey, result, Math.floor(STOCK_CACHE_TTL_MS / 1000))
     res.json(result)
   } catch (err) {
     console.error(err)
@@ -1146,6 +1194,18 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
 
 app.get('/api/fx/usd-krw', async (_req: Request, res: Response) => {
   const cacheKey = 'USD_KRW'
+  const redisFxKey = `fx:${cacheKey}`
+  const redisFx = await getRedisJson<{ rate: number; asOf: string }>(redisFxKey)
+  if (redisFx) {
+    fxCache.set(cacheKey, { data: redisFx, cachedAt: Date.now() })
+    return res.json({
+      base: 'USD',
+      quote: 'KRW',
+      rate: redisFx.rate,
+      asOf: redisFx.asOf,
+      source: 'open.er-api.com(redis-cache)',
+    })
+  }
   const cached = fxCache.get(cacheKey)
   if (cached && Date.now() - cached.cachedAt < FX_CACHE_TTL_MS) {
     return res.json({
@@ -1172,6 +1232,7 @@ app.get('/api/fx/usd-krw', async (_req: Request, res: Response) => {
     }
     const asOf = json.time_last_update_utc ?? new Date().toISOString()
     fxCache.set(cacheKey, { data: { rate, asOf }, cachedAt: Date.now() })
+    await setRedisJson(redisFxKey, { rate, asOf }, Math.floor(FX_CACHE_TTL_MS / 1000))
     return res.json({
       base: 'USD',
       quote: 'KRW',
@@ -1618,6 +1679,12 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
   if (!ticker) {
     return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
   }
+  const redisPredictKey = `predict:${ticker}`
+  const redisPredict = await getRedisJson<Record<string, unknown>>(redisPredictKey)
+  if (redisPredict) {
+    predictCache.set(ticker, { data: redisPredict, cachedAt: Date.now() })
+    return res.json(redisPredict)
+  }
   const cached = predictCache.get(ticker)
   if (cached && Date.now() - cached.cachedAt < PREDICT_CACHE_TTL_MS) {
     return res.json(cached.data)
@@ -1635,6 +1702,7 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
     }
     const json = await response.json()
     predictCache.set(ticker, { data: json as Record<string, unknown>, cachedAt: Date.now() })
+    await setRedisJson(redisPredictKey, json, Math.floor(PREDICT_CACHE_TTL_MS / 1000))
     return res.json(json)
   } catch (err) {
     console.error('Predict proxy failed', err)

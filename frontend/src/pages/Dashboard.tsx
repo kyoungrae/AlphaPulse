@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
+  Bar,
+  BarChart,
+  Cell,
   ComposedChart,
   Line,
   ReferenceLine,
@@ -252,6 +255,28 @@ function CandlestickSeries({ data }: { data: ChartRow[] }) {
         )
       })}
     </g>
+  )
+}
+
+function SHAPContributionChart({ data }: { data: Array<{ feature: string; importance: number }> }) {
+  if (!data.length) {
+    return <p className="text-[11px] text-slate-500">기여도 데이터가 없습니다.</p>
+  }
+  return (
+    <div className="h-40 w-full">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} layout="vertical" margin={{ top: 4, right: 12, left: 12, bottom: 4 }}>
+          <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#334155" />
+          <XAxis type="number" hide />
+          <YAxis dataKey="feature" type="category" tick={{ fill: '#94a3b8', fontSize: 10 }} width={88} />
+          <Bar dataKey="importance">
+            {data.map((entry, index) => (
+              <Cell key={`shap-cell-${index}`} fill={entry.importance >= 0 ? '#10b981' : '#f43f5e'} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
   )
 }
 
@@ -1282,6 +1307,7 @@ export default function Dashboard() {
             </div>
             <div className="min-w-0 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
               <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>
+              <SHAPContributionChart data={predict?.top_feature_importance ?? []} />
               {predict?.top_feature_importance?.map((item) => (
                 <div key={item.feature} className="flex items-center justify-between gap-2">
                   <span className="truncate">{item.feature}</span>
