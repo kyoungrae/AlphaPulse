@@ -70,6 +70,7 @@ type BacktestCacheRecord = {
 }
 type PredictionRecord = {
   ticker: string
+  market: Market
   predictionDate: string
   predictedDirection: PredictionDirection
   probabilityUp: number
@@ -190,8 +191,8 @@ const sectorMap = [
 let cachedSp500: { data: SymbolItem[]; expiresAt: number } | null = null
 let firestoreDb: FirebaseFirestore.Firestore | null = null
 let firestoreDisabledReason: string | null = null
-let dailyJobRunning = false
-let dailyJobLastRunDate: string | null = null
+const dailyJobRunningByMarket: Record<Market, boolean> = { us: false, kr: false }
+const dailyJobLastRunDateByMarket: Record<Market, string | null> = { us: null, kr: null }
 const stockCache = new Map<string, CacheEntry<{ date: string; close: number }[]>>()
 const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
 const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
@@ -242,6 +243,28 @@ function getNewYorkClock() {
   const now = new Date()
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(now)
+  const map = new Map(parts.map((p) => [p.type, p.value]))
+  return {
+    date: `${map.get('year')}-${map.get('month')}-${map.get('day')}`,
+    hour: Number(map.get('hour')),
+    minute: Number(map.get('minute')),
+    weekday: map.get('weekday') ?? 'Mon',
+  }
+}
+
+function getSeoulClock() {
+  const now = new Date()
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Seoul',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -886,13 +909,14 @@ async function runInBatches<T, R>(
   return results
 }
 
-async function reconcilePendingOutcomes(bookmarkDocId: string | null) {
+async function reconcilePendingOutcomes(market: Market, bookmarkDocId: string | null) {
   const db = getFirestore()
   if (!db) {
     return { resolvedCount: 0, correctCount: 0, processedCount: 0, nextBookmark: null as string | null }
   }
   let query = db
     .collection('predictions')
+    .where('market', '==', market)
     .where('outcomeStatus', '==', 'pending')
     .orderBy(admin.firestore.FieldPath.documentId())
     .limit(RECONCILE_BATCH_LIMIT)
@@ -937,37 +961,41 @@ async function reconcilePendingOutcomes(bookmarkDocId: string | null) {
   return { resolvedCount, correctCount, processedCount: snapshot.size, nextBookmark }
 }
 
-async function runDailyCloseJob(force = false) {
-  if (dailyJobRunning) return
+async function runDailyCloseJob(market: Market, force = false) {
+  if (dailyJobRunningByMarket[market]) return
   const db = getFirestore()
   if (!db) return
-  const ny = getNewYorkClock()
-  const isWeekend = ny.weekday === 'Sat' || ny.weekday === 'Sun'
-  const marketClosed = ny.hour > 16 || (ny.hour === 16 && ny.minute >= 10)
-  if (!force && (isWeekend || !marketClosed || dailyJobLastRunDate === ny.date)) {
+  const clock = market === 'kr' ? getSeoulClock() : getNewYorkClock()
+  const isWeekend = clock.weekday === 'Sat' || clock.weekday === 'Sun'
+  const marketClosed = market === 'kr' ? clock.hour > 15 || (clock.hour === 15 && clock.minute >= 40) : clock.hour > 16 || (clock.hour === 16 && clock.minute >= 10)
+  if (!force && (isWeekend || !marketClosed || dailyJobLastRunDateByMarket[market] === clock.date)) {
     return
   }
 
-  dailyJobRunning = true
+  dailyJobRunningByMarket[market] = true
   try {
-    const metaRef = db.collection('job_meta').doc('daily_close')
+    const metaRef = db.collection('job_meta').doc(`daily_close_${market}`)
     const metaSnap = await metaRef.get()
     const meta = (metaSnap.exists ? metaSnap.data() : null) as
       | { lastRunDate?: string; pendingBookmark?: string | null }
       | null
     const lastRunDateFromDb = meta?.lastRunDate
-    if (!force && lastRunDateFromDb === ny.date) {
-      dailyJobLastRunDate = ny.date
+    if (!force && lastRunDateFromDb === clock.date) {
+      dailyJobLastRunDateByMarket[market] = clock.date
       return
     }
 
-    const symbols = (await getSp500Symbols()).slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
+    const symbols =
+      market === 'kr'
+        ? koreaSymbols.slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
+        : (await getSp500Symbols()).slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
     const predictions: PredictionRecord[] = []
     await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
       try {
         const predict = await fetchPredict(ticker)
         const record: PredictionRecord = {
           ticker,
+          market,
           predictionDate: predict.last_date,
           predictedDirection: predict.direction,
           probabilityUp: Number(predict.probability_up.toFixed(4)),
@@ -997,11 +1025,13 @@ async function runDailyCloseJob(force = false) {
 
     const pendingBookmark = typeof meta?.pendingBookmark === 'string' ? meta.pendingBookmark : null
     const { resolvedCount, correctCount, processedCount, nextBookmark } = await reconcilePendingOutcomes(
+      market,
       pendingBookmark,
     )
-    await db.collection('analysis_daily').doc(ny.date).set(
+    await db.collection('analysis_daily').doc(`${market}_${clock.date}`).set(
       {
-        date: ny.date,
+        date: clock.date,
+        market,
         generatedCount: predictions.length,
         resolvedCount,
         correctCount,
@@ -1012,7 +1042,8 @@ async function runDailyCloseJob(force = false) {
     )
     await metaRef.set(
       {
-        lastRunDate: ny.date,
+        lastRunDate: clock.date,
+        market,
         generatedCount: predictions.length,
         resolvedCount,
         reconcileProcessed: processedCount,
@@ -1021,9 +1052,9 @@ async function runDailyCloseJob(force = false) {
       },
       { merge: true },
     )
-    dailyJobLastRunDate = ny.date
+    dailyJobLastRunDateByMarket[market] = clock.date
   } finally {
-    dailyJobRunning = false
+    dailyJobRunningByMarket[market] = false
   }
 }
 
@@ -1048,7 +1079,9 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
     return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
   }
   const timeframe = (normalizeSingle(req.query.timeframe as string | string[] | undefined) ?? 'month').toLowerCase()
-  const stockCacheKey = `${ticker}:${timeframe}:ohlc-v1`
+  const yearsRaw = Number(normalizeSingle(req.query.years as string | string[] | undefined) ?? 1)
+  const years = Number.isFinite(yearsRaw) ? Math.min(Math.max(Math.floor(yearsRaw), 1), 30) : 1
+  const stockCacheKey = `${ticker}:${timeframe}:${years}:ohlc-v1`
   const stockCached = stockCache.get(stockCacheKey)
   if (stockCached && Date.now() - stockCached.cachedAt < STOCK_CACHE_TTL_MS) {
     return res.json(stockCached.data)
@@ -1059,7 +1092,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
       string,
       { interval: '1d' | '1wk' | '1h' | '15m' | '5m'; daysBack: number }
     > = {
-      year: { interval: '1d', daysBack: 365 },
+      year: { interval: '1d', daysBack: years * 365 },
       month: { interval: '1d', daysBack: 31 },
       day: { interval: '15m', daysBack: 5 },
       hour: { interval: '5m', daysBack: 1 },
@@ -1569,9 +1602,11 @@ app.get('/api/predictions/daily-summary', async (req: Request, res: Response) =>
       detail: firestoreDisabledReason ?? 'FIREBASE_SERVICE_ACCOUNT_JSON 또는 GOOGLE_CLOUD_PROJECT 설정을 확인하세요.',
     })
   }
-  const date = (req.query.date as string | undefined) ?? getNewYorkClock().date
+  const marketRaw = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
+  const market: Market = marketRaw === 'kr' ? 'kr' : 'us'
+  const date = (req.query.date as string | undefined) ?? (market === 'kr' ? getSeoulClock().date : getNewYorkClock().date)
   try {
-    const doc = await db.collection('analysis_daily').doc(date).get()
+    const doc = await db.collection('analysis_daily').doc(`${market}_${date}`).get()
     if (!doc.exists) {
       return res.status(404).json({ error: '해당 날짜의 분석 요약이 없습니다.' })
     }
@@ -1654,7 +1689,8 @@ app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
     return res.status(503).json({ error: 'Firestore 설정이 필요합니다.' })
   }
   try {
-    await runDailyCloseJob(true)
+    await runDailyCloseJob('us', true)
+    await runDailyCloseJob('kr', true)
     return res.json({ ok: true, message: '일일 마감 배치를 실행했습니다.' })
   } catch (err) {
     console.error(err)
@@ -1665,9 +1701,11 @@ app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
 app.listen(port, () => {
   console.log(`Backend server running on http://localhost:${port}`)
   setInterval(() => {
-    void runDailyCloseJob(false)
+    void runDailyCloseJob('us', false)
+    void runDailyCloseJob('kr', false)
   }, DAILY_JOB_INTERVAL_MS)
   setTimeout(() => {
-    void runDailyCloseJob(false)
+    void runDailyCloseJob('us', false)
+    void runDailyCloseJob('kr', false)
   }, 5000)
 })

@@ -417,6 +417,7 @@ export default function Dashboard() {
   const [market, setMarket] = useState<'us' | 'kr'>('us')
   const [selectedSymbol, setSelectedSymbol] = useState('AAPL')
   const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('month')
+  const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
   const [strategy, setStrategy] = useState<StrategyMode>('long_only')
   const [notionalInput, setNotionalInput] = useState('10000')
@@ -475,7 +476,7 @@ export default function Dashboard() {
     loading: stockLoading,
     error: stockError,
   } = useFetch<CandlePoint[]>(
-    `/api/stock/${encodeURIComponent(selectedSymbol)}?timeframe=${encodeURIComponent(timeframe)}`,
+    `/api/stock/${encodeURIComponent(selectedSymbol)}?timeframe=${encodeURIComponent(timeframe)}&years=${yearRange}`,
   )
   const {
     data: news,
@@ -1006,6 +1007,30 @@ export default function Dashboard() {
                   </button>
                 ))}
               </div>
+              {timeframe === 'year' && (
+                <div className="flex items-center gap-0.5 rounded-full bg-slate-950/80 p-0.5">
+                  {([
+                    { key: 1, label: '1Y' },
+                    { key: 3, label: '3Y' },
+                    { key: 5, label: '5Y' },
+                    { key: 10, label: '10Y' },
+                    { key: 20, label: 'MAX' },
+                  ] as const).map((item) => (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => setYearRange(item.key)}
+                      className={`rounded-full px-2 py-1 text-xs ${
+                        yearRange === item.key
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
           {stockError && (
