@@ -84,6 +84,29 @@ type DirectionsResponse = {
   items: DirectionItem[]
 }
 
+type StrategyMode = 'long_only' | 'long_short' | 'swing' | 'intraday'
+
+type BacktestMetrics = {
+  totalReturn: number
+  cagr: number
+  maxDrawdown: number
+  sharpe: number
+  winRate: number
+  avgWinLossRatio: number | null
+  tradeCount: number
+}
+
+type BacktestResult = {
+  ticker: string
+  strategy: StrategyMode
+  metrics: BacktestMetrics
+  latestSignal: {
+    date: string
+    action: 'buy' | 'sell' | 'short' | 'cover' | 'hold'
+    probabilityUp: number
+  } | null
+}
+
 function directionToKorean(direction: string) {
   if (direction === 'Up') return '상승'
   if (direction === 'Down') return '하락'
@@ -171,6 +194,7 @@ export default function Dashboard() {
   const [selectedSymbol, setSelectedSymbol] = useState('AAPL')
   const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('month')
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
+  const [strategy, setStrategy] = useState<StrategyMode>('long_only')
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(symbolQuery), 200)
@@ -220,6 +244,13 @@ export default function Dashboard() {
     loading: historyLoading,
     error: historyError,
   } = useFetch<HistoryResponse>(`/api/predictions/history/${encodeURIComponent(selectedSymbol)}?limit=10`)
+  const {
+    data: backtest,
+    loading: backtestLoading,
+    error: backtestError,
+  } = useFetch<BacktestResult>(
+    `/api/backtest/${encodeURIComponent(selectedSymbol)}?market=${market}&strategy=${strategy}`,
+  )
   const { data: fxData } = useFetch<FxResponse>('/api/fx/usd-krw')
   const topSymbolsCsv = useMemo(
     () =>
@@ -485,6 +516,50 @@ export default function Dashboard() {
                 <p>시계열 교차검증 정밀도: {(predict.cv_precision * 100).toFixed(1)}%</p>
                 <p>학습 기반 데이터 기간: 최소 {predict.data_years ?? 10}년</p>
                 <p className="mt-1 text-slate-400">모델 학습 시각: {predict.model_trained_at}</p>
+              </div>
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+                <div className="mb-2 flex flex-wrap items-center gap-1">
+                  {([
+                    { key: 'long_only', label: '롱' },
+                    { key: 'long_short', label: '롱/숏' },
+                    { key: 'swing', label: '스윙' },
+                    { key: 'intraday', label: '단타' },
+                  ] as const).map((item) => (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => setStrategy(item.key)}
+                      className={`rounded-full px-2 py-0.5 ${
+                        strategy === item.key
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+                {backtestLoading ? (
+                  <p className="text-slate-400">전략 수익 예측 계산 중...</p>
+                ) : backtestError ? (
+                  <p className="text-rose-300">백테스트 오류: {backtestError}</p>
+                ) : backtest ? (
+                  <div className="space-y-1">
+                    <p>총수익률: {(backtest.metrics.totalReturn * 100).toFixed(2)}%</p>
+                    <p>CAGR: {(backtest.metrics.cagr * 100).toFixed(2)}%</p>
+                    <p>최대낙폭(MDD): {(backtest.metrics.maxDrawdown * 100).toFixed(2)}%</p>
+                    <p>샤프지수: {backtest.metrics.sharpe.toFixed(2)}</p>
+                    <p>승률: {(backtest.metrics.winRate * 100).toFixed(1)}%</p>
+                    <p>
+                      신호: {backtest.latestSignal?.action ?? 'hold'} / 확률{' '}
+                      {backtest.latestSignal
+                        ? `${(backtest.latestSignal.probabilityUp * 100).toFixed(1)}%`
+                        : '-'}
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-slate-400">전략 요약 데이터가 없습니다.</p>
+                )}
               </div>
               <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
                 <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>

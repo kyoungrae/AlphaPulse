@@ -27,6 +27,30 @@ type HistoryResponse = {
   items: HistoryItem[]
 }
 
+type StrategyMode = 'long_only' | 'long_short' | 'swing' | 'intraday'
+
+type BacktestSummaryResponse = {
+  ticker: string
+  market: 'us' | 'kr'
+  strategies: Array<{
+    strategy: StrategyMode
+    metrics: {
+      totalReturn: number
+      cagr: number
+      maxDrawdown: number
+      sharpe: number
+      winRate: number
+      avgWinLossRatio: number | null
+      tradeCount: number
+    }
+    latestSignal: {
+      date: string
+      action: 'buy' | 'sell' | 'short' | 'cover' | 'hold'
+      probabilityUp: number
+    } | null
+  }>
+}
+
 function directionToKorean(direction: string) {
   if (direction === 'Up') return '상승'
   if (direction === 'Down') return '하락'
@@ -72,6 +96,7 @@ export default function StockPrediction() {
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [market, setMarket] = useState<'us' | 'kr'>('us')
   const [selected, setSelected] = useState('AAPL')
+  const [strategy, setStrategy] = useState<StrategyMode>('long_only')
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search), 200)
@@ -88,6 +113,11 @@ export default function StockPrediction() {
     loading,
     error,
   } = useFetch<HistoryResponse>(`/api/predictions/history/${encodeURIComponent(selected)}?limit=30`)
+  const {
+    data: summary,
+    loading: summaryLoading,
+    error: summaryError,
+  } = useFetch<BacktestSummaryResponse>(`/api/backtest/summary/${encodeURIComponent(selected)}?market=${market}`)
   const selectedSymbolInfo = useMemo(
     () => (symbols?.items ?? []).find((item) => item.symbol === selected),
     [symbols, selected],
@@ -97,6 +127,10 @@ export default function StockPrediction() {
   useEffect(() => {
     setSelected(market === 'kr' ? '005930.KS' : 'AAPL')
   }, [market])
+  const selectedStrategySummary = useMemo(
+    () => summary?.strategies?.find((item) => item.strategy === strategy) ?? null,
+    [summary, strategy],
+  )
 
   return (
     <div className="space-y-4 text-slate-100">
@@ -161,6 +195,45 @@ export default function StockPrediction() {
             <p className="text-xs text-slate-500">{selected}</p>
           </div>
           {loading && <span className="text-xs text-slate-400">불러오는 중...</span>}
+        </div>
+        <div className="mb-3 flex flex-wrap items-center gap-1">
+          {([
+            { key: 'long_only', label: '롱' },
+            { key: 'long_short', label: '롱/숏' },
+            { key: 'swing', label: '스윙' },
+            { key: 'intraday', label: '단타' },
+          ] as const).map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => setStrategy(item.key)}
+              className={`rounded-full px-2 py-1 text-xs ${
+                strategy === item.key
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+              }`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <div className="mb-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-300">
+          {summaryLoading ? (
+            <p>전략 요약 계산 중...</p>
+          ) : summaryError ? (
+            <p className="text-rose-400">전략 요약 오류: {summaryError}</p>
+          ) : selectedStrategySummary ? (
+            <div className="grid gap-1 md:grid-cols-3">
+              <p>총수익률: {(selectedStrategySummary.metrics.totalReturn * 100).toFixed(2)}%</p>
+              <p>CAGR: {(selectedStrategySummary.metrics.cagr * 100).toFixed(2)}%</p>
+              <p>최대낙폭: {(selectedStrategySummary.metrics.maxDrawdown * 100).toFixed(2)}%</p>
+              <p>샤프: {selectedStrategySummary.metrics.sharpe.toFixed(2)}</p>
+              <p>승률: {(selectedStrategySummary.metrics.winRate * 100).toFixed(1)}%</p>
+              <p>거래횟수: {selectedStrategySummary.metrics.tradeCount}회</p>
+            </div>
+          ) : (
+            <p>전략 요약 데이터가 없습니다.</p>
+          )}
         </div>
         {error ? (
           <p className="text-sm text-rose-400">{error}</p>

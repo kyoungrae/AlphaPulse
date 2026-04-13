@@ -6,6 +6,13 @@ import OpenAI from 'openai'
 import Parser from 'rss-parser'
 import YahooFinance from 'yahoo-finance2'
 import { z } from 'zod'
+import { resolveCostConfig, type Market } from './services/costModel'
+import {
+  runBacktest,
+  type CandlePoint,
+  type ProbabilityPoint,
+  type StrategyMode,
+} from './services/backtest'
 
 dotenv.config()
 
@@ -20,6 +27,7 @@ const DAILY_JOB_INTERVAL_MS = 1000 * 60 * 15
 const DAILY_JOB_CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
 const DAILY_JOB_SYMBOL_LIMIT = Math.max(1, Number(process.env.DAILY_JOB_SYMBOL_LIMIT ?? 500))
 const RECONCILE_BATCH_LIMIT = Math.max(50, Number(process.env.RECONCILE_BATCH_LIMIT ?? 250))
+const BACKTEST_CACHE_TTL_MS = 1000 * 60 * 60 * 6
 const STOCK_CACHE_TTL_MS = 1000 * 60 * 5
 const PREDICT_CACHE_TTL_MS = 1000 * 60 * 2
 const FX_CACHE_TTL_MS = 1000 * 60 * 10
@@ -41,6 +49,15 @@ const SP500_CACHE_TTL_MS = 1000 * 60 * 60 * 24
 
 type SymbolItem = { symbol: string; name: string; nameKr?: string }
 type PredictionDirection = 'Up' | 'Down'
+type BacktestCacheRecord = {
+  key: string
+  ticker: string
+  market: Market
+  strategy: StrategyMode
+  from: string
+  to: string
+  result: ReturnType<typeof runBacktest>
+}
 type PredictionRecord = {
   ticker: string
   predictionDate: string
@@ -127,6 +144,7 @@ let dailyJobLastRunDate: string | null = null
 const stockCache = new Map<string, CacheEntry<{ date: string; close: number }[]>>()
 const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
 const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
+const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
 
 function normalizeSingle(value: string | string[] | undefined): string | undefined {
   if (Array.isArray(value)) return value[0]
@@ -272,6 +290,146 @@ async function fetchPredict(ticker: string) {
     model_trained_at: string
     reason_summary: string
   }
+}
+
+async function loadHistoricalCandles(
+  ticker: string,
+  fromDate?: string,
+  toDate?: string,
+): Promise<CandlePoint[]> {
+  const period2 = toDate ? new Date(`${toDate}T23:59:59Z`) : new Date()
+  const period1 = fromDate
+    ? new Date(`${fromDate}T00:00:00Z`)
+    : new Date(new Date(period2).setUTCDate(period2.getUTCDate() - 365))
+  const candles = await yahooFinance.chart(ticker, {
+    period1,
+    period2,
+    interval: '1d',
+  })
+  return (
+    candles.quotes
+      ?.filter((q) => q.open != null && q.close != null && q.date != null)
+      .map((q) => ({
+        date: q.date!.toISOString().slice(0, 10),
+        open: Number(q.open),
+        close: Number(q.close),
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date)) ?? []
+  )
+}
+
+async function loadProbabilityHistory(
+  ticker: string,
+  candles: CandlePoint[],
+  fromDate?: string,
+  toDate?: string,
+): Promise<ProbabilityPoint[]> {
+  const db = getFirestore()
+  if (db) {
+    try {
+      let query = db.collection('predictions').where('ticker', '==', ticker)
+      if (fromDate) query = query.where('predictionDate', '>=', fromDate)
+      if (toDate) query = query.where('predictionDate', '<=', toDate)
+      const snap = await query.orderBy('predictionDate', 'asc').limit(500).get()
+      if (!snap.empty) {
+        return snap.docs
+          .map((d) => d.data() as PredictionRecord)
+          .map((row) => ({
+            date: row.predictionDate,
+            probabilityUp: row.probabilityUp,
+          }))
+      }
+    } catch (err) {
+      console.error('Firestore 확률 이력 조회 실패. 가격 기반 근사치 사용.', err)
+    }
+  }
+
+  // Firestore 이력이 없으면 가격 모멘텀 기반 확률 근사치 사용
+  return candles.map((candle, idx) => {
+    if (idx === 0) return { date: candle.date, probabilityUp: 0.5 }
+    const prev = candles[idx - 1]
+    const change = prev.close > 0 ? (candle.close - prev.close) / prev.close : 0
+    const probabilityUp = Math.max(0.05, Math.min(0.95, 0.5 + change * 3))
+    return { date: candle.date, probabilityUp: Number(probabilityUp.toFixed(4)) }
+  })
+}
+
+function normalizeStrategy(value: string | undefined): StrategyMode {
+  const v = (value ?? 'long_only').toLowerCase()
+  if (v === 'long_short' || v === 'swing' || v === 'intraday') return v
+  return 'long_only'
+}
+
+async function getBacktestResult(params: {
+  ticker: string
+  market: Market
+  strategy: StrategyMode
+  from?: string
+  to?: string
+  initialCapital: number
+  forceRefresh: boolean
+}) {
+  const from = params.from ?? new Date(Date.now() - 1000 * 60 * 60 * 24 * 365).toISOString().slice(0, 10)
+  const to = params.to ?? new Date().toISOString().slice(0, 10)
+  const cacheKey = `${params.ticker}:${params.market}:${params.strategy}:${from}:${to}:${params.initialCapital}`
+  const memCached = backtestMemoryCache.get(cacheKey)
+  if (!params.forceRefresh && memCached && Date.now() - memCached.cachedAt < BACKTEST_CACHE_TTL_MS) {
+    return memCached.data
+  }
+
+  const db = getFirestore()
+  if (!params.forceRefresh && db) {
+    try {
+      const cachedDoc = await db.collection('analysis_backtest').doc(cacheKey).get()
+      if (cachedDoc.exists) {
+        const row = cachedDoc.data() as BacktestCacheRecord & { createdAt?: FirebaseFirestore.Timestamp }
+        if (row.createdAt) {
+          const age = Date.now() - row.createdAt.toMillis()
+          if (age < BACKTEST_CACHE_TTL_MS) {
+            backtestMemoryCache.set(cacheKey, { data: row.result, cachedAt: Date.now() })
+            return row.result
+          }
+        }
+      }
+    } catch (err) {
+      console.error('백테스트 캐시 조회 실패. 재계산합니다.', err)
+    }
+  }
+
+  const candles = await loadHistoricalCandles(params.ticker, from, to)
+  const probabilities = await loadProbabilityHistory(params.ticker, candles, from, to)
+  const cost = resolveCostConfig(params.market)
+  const result = runBacktest({
+    ticker: params.ticker,
+    strategy: params.strategy,
+    candles,
+    probabilities,
+    initialCapital: params.initialCapital,
+    cost,
+  })
+  backtestMemoryCache.set(cacheKey, { data: result, cachedAt: Date.now() })
+
+  if (db) {
+    try {
+      await db.collection('analysis_backtest').doc(cacheKey).set(
+        {
+          key: cacheKey,
+          ticker: params.ticker,
+          market: params.market,
+          strategy: params.strategy,
+          from,
+          to,
+          result,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      )
+    } catch (err) {
+      console.error('백테스트 결과 캐시 저장 실패', err)
+    }
+  }
+
+  return result
 }
 
 async function resolveOutcomeForPrediction(record: PredictionRecord): Promise<{
@@ -739,6 +897,106 @@ app.get('/api/symbols', async (req: Request, res: Response) => {
   } catch (err) {
     console.error(err)
     return res.status(500).json({ error: '종목 목록을 가져오지 못했습니다.' })
+  }
+})
+
+app.get('/api/backtest/:ticker', async (req: Request, res: Response) => {
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
+  if (!ticker) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  try {
+    const strategy = normalizeStrategy(normalizeSingle(req.query.strategy as string | string[] | undefined))
+    const marketRaw = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
+    const market: Market = marketRaw === 'kr' ? 'kr' : 'us'
+    const from = normalizeSingle(req.query.from as string | string[] | undefined)
+    const to = normalizeSingle(req.query.to as string | string[] | undefined)
+    const initialCapital = Math.max(1000, Number(req.query.initialCapital ?? 100000))
+    const forceRefresh = normalizeSingle(req.query.refresh as string | string[] | undefined) === '1'
+    const result = await getBacktestResult({
+      ticker,
+      market,
+      strategy,
+      from,
+      to,
+      initialCapital,
+      forceRefresh,
+    })
+    return res.json(result)
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '백테스트 계산에 실패했습니다.' })
+  }
+})
+
+app.get('/api/signals/:ticker', async (req: Request, res: Response) => {
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
+  if (!ticker) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  try {
+    const strategy = normalizeStrategy(normalizeSingle(req.query.strategy as string | string[] | undefined))
+    const marketRaw = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
+    const market: Market = marketRaw === 'kr' ? 'kr' : 'us'
+    const result = await getBacktestResult({
+      ticker,
+      market,
+      strategy,
+      initialCapital: 100000,
+      forceRefresh: false,
+    })
+    return res.json({
+      ticker,
+      strategy,
+      signal: result.latestSignal,
+      latestMetrics: result.metrics,
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '신호 계산에 실패했습니다.' })
+  }
+})
+
+app.get('/api/backtest/summary/:ticker', async (req: Request, res: Response) => {
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
+  if (!ticker) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  try {
+    const marketRaw = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
+    const market: Market = marketRaw === 'kr' ? 'kr' : 'us'
+    const from = normalizeSingle(req.query.from as string | string[] | undefined)
+    const to = normalizeSingle(req.query.to as string | string[] | undefined)
+    const initialCapital = Math.max(1000, Number(req.query.initialCapital ?? 100000))
+    const strategies: StrategyMode[] = ['long_only', 'long_short', 'swing', 'intraday']
+    const summary = await Promise.all(
+      strategies.map(async (strategy) => {
+        const result = await getBacktestResult({
+          ticker,
+          market,
+          strategy,
+          from,
+          to,
+          initialCapital,
+          forceRefresh: false,
+        })
+        return {
+          strategy,
+          metrics: result.metrics,
+          latestSignal: result.latestSignal,
+        }
+      }),
+    )
+    return res.json({
+      ticker,
+      market,
+      from: from ?? null,
+      to: to ?? null,
+      strategies: summary,
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '전략 요약 계산에 실패했습니다.' })
   }
 })
 
