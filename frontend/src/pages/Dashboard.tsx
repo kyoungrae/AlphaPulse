@@ -104,6 +104,8 @@ type BacktestMetrics = {
 type BacktestResult = {
   ticker: string
   strategy: StrategyMode
+  startDate?: string
+  endDate?: string
   metrics: BacktestMetrics
   latestSignal: {
     date: string
@@ -275,6 +277,39 @@ function formatMoney(amount: number, currency: DisplayCurrency) {
     return `₩${Math.round(amount).toLocaleString('ko-KR')}`
   }
   return `$${amount.toLocaleString('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`
+}
+
+/** 원화를 억·만·원 단위 한글 표기 (예: 천만 원, 1억 2,345만 6,789원) */
+function formatWonKoreanReadout(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return ''
+  if (n < 10_000) return `${n.toLocaleString('ko-KR')}원`
+
+  const eok = Math.floor(n / 100_000_000)
+  const restAfterEok = n % 100_000_000
+  const man = Math.floor(restAfterEok / 10_000)
+  const won = restAfterEok % 10_000
+
+  const parts: string[] = []
+  if (eok > 0) parts.push(`${eok.toLocaleString('ko-KR')}억`)
+
+  if (man > 0) {
+    if (eok === 0 && won === 0 && man === 1000) parts.push('천만')
+    else if (eok === 0 && won === 0 && man === 100) parts.push('백만')
+    else if (eok === 0 && won === 0 && man === 10) parts.push('십만')
+    else if (eok === 0 && won === 0 && man === 1) parts.push('일만')
+    else parts.push(`${man.toLocaleString('ko-KR')}만`)
+  }
+
+  if (won > 0) parts.push(`${won.toLocaleString('ko-KR')}`)
+  return `${parts.join(' ')}원`
+}
+
+function formatNotionalInputDisplay(rawDigits: string, market: 'us' | 'kr'): string {
+  const d = rawDigits.replace(/\D/g, '')
+  if (!d) return ''
+  const num = Number(d)
+  if (!Number.isFinite(num)) return ''
+  return market === 'kr' ? num.toLocaleString('ko-KR') : num.toLocaleString('en-US')
 }
 
 function MetricTooltip({
@@ -623,7 +658,8 @@ export default function Dashboard() {
             <p className="text-xs uppercase tracking-[0.2em] text-blue-300">수익 참고 안내</p>
             <p className="mt-1 text-sm font-semibold text-white">{selectedDisplayName} · 과거 백테스트 기준</p>
             <p className="mt-1 text-xs text-slate-400">
-              전략별로 신호·백테스트 규칙이 다릅니다. 아래에서 전략을 바꾸면 안내가 함께 갱신됩니다(다음 거래일 시가 체결 가정).
+              기본 백테스트 구간은 최근 10년 일봉이며, AI 예측(최소 10년 학습)과 같은 길이의 과거를 최대한 반영합니다. 전략별 규칙이
+              다르며 아래에서 전략을 바꾸면 안내가 함께 갱신됩니다(다음 거래일 시가 체결 가정).
             </p>
             <div className="mt-3 flex flex-wrap gap-1">
               {([
@@ -651,15 +687,21 @@ export default function Dashboard() {
         </div>
 
         <div className="mt-4 flex flex-wrap items-center gap-3">
-          <label className="text-xs text-slate-400">
+          <label className="block text-xs text-slate-400">
             시뮬레이션 금액 ({market === 'kr' ? '원' : 'USD'})
             <input
               type="text"
               inputMode="numeric"
-              value={notionalInput}
-              onChange={(e) => setNotionalInput(e.target.value.replace(/[^\d]/g, ''))}
-              className="ml-2 inline-block w-36 rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm text-slate-100 outline-none focus:border-blue-400"
+              value={formatNotionalInputDisplay(notionalInput, market)}
+              onChange={(e) => setNotionalInput(e.target.value.replace(/\D/g, ''))}
+              placeholder={market === 'kr' ? '금액 입력' : 'Amount'}
+              className="ml-0 mt-1 block w-full min-w-[12rem] max-w-xs rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm text-slate-100 outline-none focus:border-blue-400"
             />
+            {market === 'kr' && notionalInput.replace(/\D/g, '') !== '' && (
+              <span className="mt-1 block text-[13px] font-medium text-slate-200">
+                한글 금액: {formatWonKoreanReadout(guidanceNotional)}
+              </span>
+            )}
           </label>
           <MetricTooltip
             label="금액 안내"
@@ -892,6 +934,11 @@ export default function Dashboard() {
                   <p className="text-rose-300">백테스트 오류: {backtestError}</p>
                 ) : backtest ? (
                   <div className="space-y-1">
+                    {backtest.startDate && backtest.endDate && (
+                      <p className="text-slate-500">
+                        백테스트 구간: {backtest.startDate} ~ {backtest.endDate} (기본 약 10년)
+                      </p>
+                    )}
                     <p>
                       <MetricTooltip
                         label={`총수익률: ${(backtest.metrics.totalReturn * 100).toFixed(2)}%`}

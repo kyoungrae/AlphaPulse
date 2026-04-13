@@ -29,6 +29,10 @@ const DAILY_JOB_CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURREN
 const DAILY_JOB_SYMBOL_LIMIT = Math.max(1, Number(process.env.DAILY_JOB_SYMBOL_LIMIT ?? 500))
 const RECONCILE_BATCH_LIMIT = Math.max(50, Number(process.env.RECONCILE_BATCH_LIMIT ?? 250))
 const BACKTEST_CACHE_TTL_MS = 1000 * 60 * 60 * 6
+/** AI 예측 서버(10년 학습)와 맞추기 위한 백테스트·전략 요약 기본 조회 기간 */
+const BACKTEST_DEFAULT_LOOKBACK_YEARS = 10
+/** 일봉 기준 최대 약 252거래일×10년 & 여유 */
+const PREDICTION_HISTORY_QUERY_LIMIT = 4000
 const STOCK_CACHE_TTL_MS = 1000 * 60 * 5
 const PREDICT_CACHE_TTL_MS = 1000 * 60 * 2
 const FX_CACHE_TTL_MS = 1000 * 60 * 10
@@ -303,6 +307,12 @@ async function fetchPredict(ticker: string) {
   }
 }
 
+function defaultBacktestFromDate(): string {
+  const d = new Date()
+  d.setFullYear(d.getFullYear() - BACKTEST_DEFAULT_LOOKBACK_YEARS)
+  return d.toISOString().slice(0, 10)
+}
+
 async function loadHistoricalCandles(
   ticker: string,
   fromDate?: string,
@@ -311,7 +321,11 @@ async function loadHistoricalCandles(
   const period2 = toDate ? new Date(`${toDate}T23:59:59Z`) : new Date()
   const period1 = fromDate
     ? new Date(`${fromDate}T00:00:00Z`)
-    : new Date(new Date(period2).setUTCDate(period2.getUTCDate() - 365))
+    : (() => {
+        const p = new Date(period2)
+        p.setFullYear(p.getFullYear() - BACKTEST_DEFAULT_LOOKBACK_YEARS)
+        return p
+      })()
   const candles = await yahooFinance.chart(ticker, {
     period1,
     period2,
@@ -341,7 +355,7 @@ async function loadProbabilityHistory(
       let query = db.collection('predictions').where('ticker', '==', ticker)
       if (fromDate) query = query.where('predictionDate', '>=', fromDate)
       if (toDate) query = query.where('predictionDate', '<=', toDate)
-      const snap = await query.orderBy('predictionDate', 'asc').limit(500).get()
+      const snap = await query.orderBy('predictionDate', 'asc').limit(PREDICTION_HISTORY_QUERY_LIMIT).get()
       if (!snap.empty) {
         return snap.docs
           .map((d) => d.data() as PredictionRecord)
@@ -391,7 +405,7 @@ function buildTradeGuidance(result: BacktestResult, market: Market, notional: nu
   const currency = market === 'kr' ? 'KRW' : 'USD'
 
   const disclaimer = [
-    '표시 값은 과거 데이터로 백테스트한 결과이며, 미래 수익을 보장하지 않습니다.',
+    '표시 값은 과거 데이터로 백테스트한 결과이며, 기본 구간은 최근 10년 일봉입니다. 미래 수익을 보장하지 않습니다.',
     '체결가는 다음 거래일 시가를 가정하며 실제와 다를 수 있습니다. 슬리피지·세금·수수료가 반영된 시뮬레이션입니다.',
     '투자 판단은 본인 책임이며, 참고용으로만 활용하세요.',
   ]
@@ -453,9 +467,9 @@ async function getBacktestResult(params: {
   initialCapital: number
   forceRefresh: boolean
 }) {
-  const from = params.from ?? new Date(Date.now() - 1000 * 60 * 60 * 24 * 365).toISOString().slice(0, 10)
+  const from = params.from ?? defaultBacktestFromDate()
   const to = params.to ?? new Date().toISOString().slice(0, 10)
-  const cacheKey = `${params.ticker}:${params.market}:${params.strategy}:${from}:${to}:${params.initialCapital}:v2`
+  const cacheKey = `${params.ticker}:${params.market}:${params.strategy}:${from}:${to}:${params.initialCapital}:v3`
   const memCached = backtestMemoryCache.get(cacheKey)
   if (!params.forceRefresh && memCached && Date.now() - memCached.cachedAt < BACKTEST_CACHE_TTL_MS) {
     return memCached.data

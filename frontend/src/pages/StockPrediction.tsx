@@ -237,6 +237,9 @@ export default function StockPrediction() {
             </button>
           ))}
         </div>
+        <p className="mb-3 text-xs text-slate-500">
+          전략별 백테스트 요약은 기본 최근 10년 일봉 구간을 사용합니다(AI 예측 학습 기간과 맞춤).
+        </p>
         <div className="mb-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-300">
           {summaryLoading ? (
             <p>전략 요약 계산 중...</p>
