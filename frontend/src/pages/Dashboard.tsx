@@ -1160,6 +1160,15 @@ export default function Dashboard() {
                     )}
                     cursor={{ strokeDasharray: '3 3' }}
                   />
+                  <Line
+                    type="monotone"
+                    dataKey="close"
+                    stroke="transparent"
+                    strokeWidth={1}
+                    dot={false}
+                    activeDot={{ r: 3, fill: '#cbd5f5' }}
+                    isAnimationActive={false}
+                  />
                   <CandlestickSeries data={chartData} />
                   <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.5} dot={false} connectNulls />
                   <Line type="monotone" dataKey="bbUpper" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />
