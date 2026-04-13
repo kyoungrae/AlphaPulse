@@ -1011,9 +1011,8 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+          <div className="mt-1 grid grid-cols-1 gap-3 lg:grid-cols-2 lg:items-start">
+            <div className="min-w-0 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
                 <div className="mb-2 flex flex-wrap items-center gap-1">
                   {([
                     { key: 'long_only', label: '롱' },
@@ -1090,17 +1089,16 @@ export default function Dashboard() {
                 ) : (
                   <p className="text-slate-400">전략 요약 데이터가 없습니다.</p>
                 )}
-              </div>
-              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
-                <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>
-                {predict?.top_feature_importance?.map((item) => (
-                  <div key={item.feature} className="flex items-center justify-between">
-                    <span>{item.feature}</span>
-                    <span>{(item.importance * 100).toFixed(1)}%</span>
-                  </div>
-                ))}
-                <p className="mt-2 text-slate-400">{predict?.reason_summary ?? '예측 데이터가 없습니다.'}</p>
-              </div>
+            </div>
+            <div className="min-w-0 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+              <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>
+              {predict?.top_feature_importance?.map((item) => (
+                <div key={item.feature} className="flex items-center justify-between gap-2">
+                  <span className="truncate">{item.feature}</span>
+                  <span className="shrink-0 tabular-nums">{(item.importance * 100).toFixed(1)}%</span>
+                </div>
+              ))}
+              <p className="mt-2 text-slate-400">{predict?.reason_summary ?? '예측 데이터가 없습니다.'}</p>
             </div>
           </div>
         </div>
