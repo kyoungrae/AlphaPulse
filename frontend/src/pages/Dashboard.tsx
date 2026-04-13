@@ -354,19 +354,27 @@ function useFetch<T>(url: string) {
     }
     let mounted = true
     setLoading(true)
+    setError(null)
     fetch(url)
       .then(async (res) => {
+        const bodyText = await res.text()
         if (!res.ok) {
-          const body = await res.text()
-          throw new Error(`요청 실패: ${res.status} ${body}`)
+          throw new Error(`요청 실패: ${res.status} ${bodyText}`)
         }
         const ctype = res.headers.get('content-type') ?? ''
         if (ctype.includes('application/json')) {
-          const json = (await res.json()) as T
+          if (!bodyText.trim()) {
+            throw new Error('빈 응답입니다. 잠시 후 다시 시도해 주세요.')
+          }
+          let json: T
+          try {
+            json = JSON.parse(bodyText) as T
+          } catch (err) {
+            throw new Error(`JSON 파싱 실패: ${(err as Error).message}`)
+          }
           if (mounted) setData(json)
         } else {
-          const text = await res.text()
-          throw new Error(`JSON이 아닌 응답입니다: ${text.slice(0, 200)}`)
+          throw new Error(`JSON이 아닌 응답입니다: ${bodyText.slice(0, 200)}`)
         }
       })
       .catch((err: Error) => {
@@ -624,6 +632,74 @@ export default function Dashboard() {
     () => new Map((directions?.items ?? []).map((item) => [item.symbol, item.direction])),
     [directions],
   )
+  const aiBriefing = useMemo(() => {
+    if (predictLoading || backtestLoading) {
+      return (
+        <div className="rounded-2xl border border-blue-900/40 bg-blue-950/20 p-4 shadow-lg">
+          <div className="h-16 animate-pulse rounded-xl bg-slate-800/60" />
+        </div>
+      )
+    }
+    if (!predict || !backtest) return null
+
+    const prob = (predict.probability_up * 100).toFixed(1)
+    const isUp = predict.direction === 'Up'
+    const action = backtest.latestSignal?.action ?? 'hold'
+    const topFeature = predict.top_feature_importance?.[0]?.feature ?? '시장 지표'
+
+    let actionText = ''
+    if (action === 'buy') actionText = '신규 진입(매수)을 적극적으로 고려할 수 있는 구간입니다.'
+    else if (action === 'short') actionText = '공매도 또는 인버스 대응이 통계적으로 유리한 구간입니다.'
+    else if (action === 'sell' || action === 'cover') {
+      actionText = '기존 포지션을 청산하고 수익 확정(또는 손절) 여부를 우선 점검하세요.'
+    } else {
+      actionText = '방향성이 더 명확해질 때까지 신규 진입을 줄이고 관망하는 편이 유리합니다.'
+    }
+
+    let levelText = ''
+    if (isUp && vbpLevels.resistance != null) {
+      levelText = `단기 익절 기준은 1차 저항선 ${formatMoney(vbpLevels.resistance, priceCurrency)} 부근이 유효합니다.`
+    } else if (!isUp && vbpLevels.support != null) {
+      levelText = `하락 시 1차 지지선 ${formatMoney(vbpLevels.support, priceCurrency)} 이탈 여부를 우선 확인하고, 이탈 시 손절 대응이 필요합니다.`
+    }
+
+    return (
+      <div className="rounded-2xl border border-blue-800/50 bg-blue-900/10 p-5 shadow-lg backdrop-blur-sm">
+        <h3 className="flex items-center gap-2 text-sm font-bold text-blue-300">
+          <span className="relative flex h-3 w-3">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+            <span className="relative inline-flex h-3 w-3 rounded-full bg-blue-500" />
+          </span>
+          AI 퀀트 매니저 브리핑: {selectedDisplayName}
+        </h3>
+        <ul className="mt-3 space-y-2 text-sm text-slate-200">
+          <li>
+            <strong className="text-white">오늘의 예측:</strong> 내일 종가는{' '}
+            <span className={isUp ? 'font-bold text-emerald-400' : 'font-bold text-rose-400'}>
+              {isUp ? '상승' : '하락'} (확률 {prob}%)
+            </span>{' '}
+            쪽이며, 최대 기여 요인은 <strong>[{topFeature}]</strong>입니다.
+          </li>
+          <li>
+            <strong className="text-white">투자 전략:</strong> {actionText}
+          </li>
+          {levelText && (
+            <li>
+              <strong className="text-white">리스크 관리:</strong> {levelText}
+            </li>
+          )}
+        </ul>
+      </div>
+    )
+  }, [
+    predict,
+    predictLoading,
+    backtest,
+    backtestLoading,
+    vbpLevels,
+    priceCurrency,
+    selectedDisplayName,
+  ])
   return (
     <div className="space-y-6">
       <div>
@@ -699,6 +775,8 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {aiBriefing}
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
