@@ -57,6 +57,26 @@ function directionToKorean(direction: string) {
   return direction
 }
 
+function MetricTooltip({
+  label,
+  tip,
+}: {
+  label: string
+  tip: string
+}) {
+  return (
+    <span className="group relative inline-flex items-center gap-1">
+      <span>{label}</span>
+      <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-800 text-[10px] text-slate-300">
+        ?
+      </span>
+      <span className="pointer-events-none absolute left-0 top-5 z-20 hidden w-64 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] leading-relaxed text-slate-200 group-hover:block">
+        {tip}
+      </span>
+    </span>
+  )
+}
+
 function useFetch<T>(url: string) {
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
@@ -224,12 +244,42 @@ export default function StockPrediction() {
             <p className="text-rose-400">전략 요약 오류: {summaryError}</p>
           ) : selectedStrategySummary ? (
             <div className="grid gap-1 md:grid-cols-3">
-              <p>총수익률: {(selectedStrategySummary.metrics.totalReturn * 100).toFixed(2)}%</p>
-              <p>CAGR: {(selectedStrategySummary.metrics.cagr * 100).toFixed(2)}%</p>
-              <p>최대낙폭: {(selectedStrategySummary.metrics.maxDrawdown * 100).toFixed(2)}%</p>
-              <p>샤프: {selectedStrategySummary.metrics.sharpe.toFixed(2)}</p>
-              <p>승률: {(selectedStrategySummary.metrics.winRate * 100).toFixed(1)}%</p>
-              <p>거래횟수: {selectedStrategySummary.metrics.tradeCount}회</p>
+              <p>
+                <MetricTooltip
+                  label={`총수익률: ${(selectedStrategySummary.metrics.totalReturn * 100).toFixed(2)}%`}
+                  tip="백테스트 전체 기간 누적 수익률입니다."
+                />
+              </p>
+              <p>
+                <MetricTooltip
+                  label={`CAGR: ${(selectedStrategySummary.metrics.cagr * 100).toFixed(2)}%`}
+                  tip="연평균 복리 수익률로, 기간이 달라도 비교가 쉽습니다."
+                />
+              </p>
+              <p>
+                <MetricTooltip
+                  label={`최대낙폭: ${(selectedStrategySummary.metrics.maxDrawdown * 100).toFixed(2)}%`}
+                  tip="계좌가 가장 크게 빠진 구간입니다. 리스크 기준으로 꼭 확인하세요."
+                />
+              </p>
+              <p>
+                <MetricTooltip
+                  label={`샤프: ${selectedStrategySummary.metrics.sharpe.toFixed(2)}`}
+                  tip="변동성 대비 수익 효율입니다. 높을수록 좋습니다."
+                />
+              </p>
+              <p>
+                <MetricTooltip
+                  label={`승률: ${(selectedStrategySummary.metrics.winRate * 100).toFixed(1)}%`}
+                  tip="이긴 거래 비율입니다. 손익비와 함께 해석해야 정확합니다."
+                />
+              </p>
+              <p>
+                <MetricTooltip
+                  label={`거래횟수: ${selectedStrategySummary.metrics.tradeCount}회`}
+                  tip="거래 빈도입니다. 너무 많으면 수수료/슬리피지 영향이 커질 수 있습니다."
+                />
+              </p>
             </div>
           ) : (
             <p>전략 요약 데이터가 없습니다.</p>

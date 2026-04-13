@@ -209,6 +209,13 @@ function getNewYorkClock() {
   }
 }
 
+function toKoreanSentimentLabel(label: string) {
+  const normalized = label.trim().toLowerCase()
+  if (normalized === 'positive' || normalized === '긍정') return '긍정'
+  if (normalized === 'negative' || normalized === '부정') return '부정'
+  return '중립'
+}
+
 async function getSp500Symbols(): Promise<SymbolItem[]> {
   const now = Date.now()
   if (cachedSp500 && cachedSp500.expiresAt > now) {
@@ -734,7 +741,7 @@ app.get('/api/fx/usd-krw', async (_req: Request, res: Response) => {
 app.get('/api/news', async (_req: Request, res: Response) => {
   try {
     const feed = await rssParser.parseURL(
-      'https://news.google.com/rss/search?q=US+stock+market+OR+federal+reserve+OR+interest+rate&hl=en-US&gl=US&ceid=US:en',
+      'https://news.google.com/rss/search?q=%EB%AF%B8%EA%B5%AD+%EC%A6%9D%EC%8B%9C+OR+%EC%97%B0%EC%A4%80+OR+%EA%B8%88%EB%A6%AC&hl=ko&gl=KR&ceid=KR:ko',
     )
 
     const items =
@@ -780,14 +787,18 @@ ${uncachedTitles.map((title, idx) => `${idx + 1}. ${title}`).join('\n')}`
           data?: { title: string; label: string; score: number }[]
         }
         for (const d of parsed.data ?? []) {
-          sentimentCache.set(d.title, { label: d.label, score: d.score, analyzedAt: now })
+          sentimentCache.set(d.title, {
+            label: toKoreanSentimentLabel(d.label),
+            score: d.score,
+            analyzedAt: now,
+          })
           }
         }
 
         const enriched = items.map((item) => {
           const found = cachedMap.get(item.title) ?? sentimentCache.get(item.title)
           return found
-            ? { ...item, sentiment: { label: found.label, score: found.score } }
+            ? { ...item, sentiment: { label: toKoreanSentimentLabel(found.label), score: found.score } }
             : { ...item, sentiment: { label: '중립', score: 0 } }
         })
         return res.json(enriched)

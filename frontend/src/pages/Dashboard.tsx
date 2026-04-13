@@ -143,6 +143,26 @@ function formatMoney(amount: number, currency: DisplayCurrency) {
   return `$${amount.toLocaleString('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`
 }
 
+function MetricTooltip({
+  label,
+  tip,
+}: {
+  label: string
+  tip: string
+}) {
+  return (
+    <span className="group relative inline-flex items-center gap-1">
+      <span>{label}</span>
+      <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-800 text-[10px] text-slate-300">
+        ?
+      </span>
+      <span className="pointer-events-none absolute left-0 top-5 z-20 hidden w-64 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] leading-relaxed text-slate-200 group-hover:block">
+        {tip}
+      </span>
+    </span>
+  )
+}
+
 function useFetch<T>(url: string) {
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
@@ -545,16 +565,45 @@ export default function Dashboard() {
                   <p className="text-rose-300">백테스트 오류: {backtestError}</p>
                 ) : backtest ? (
                   <div className="space-y-1">
-                    <p>총수익률: {(backtest.metrics.totalReturn * 100).toFixed(2)}%</p>
-                    <p>CAGR: {(backtest.metrics.cagr * 100).toFixed(2)}%</p>
-                    <p>최대낙폭(MDD): {(backtest.metrics.maxDrawdown * 100).toFixed(2)}%</p>
-                    <p>샤프지수: {backtest.metrics.sharpe.toFixed(2)}</p>
-                    <p>승률: {(backtest.metrics.winRate * 100).toFixed(1)}%</p>
                     <p>
-                      신호: {backtest.latestSignal?.action ?? 'hold'} / 확률{' '}
-                      {backtest.latestSignal
-                        ? `${(backtest.latestSignal.probabilityUp * 100).toFixed(1)}%`
-                        : '-'}
+                      <MetricTooltip
+                        label={`총수익률: ${(backtest.metrics.totalReturn * 100).toFixed(2)}%`}
+                        tip="백테스트 전체 기간 누적 수익률입니다. 높을수록 좋지만, 기간이 길수록 CAGR도 같이 보세요."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`CAGR: ${(backtest.metrics.cagr * 100).toFixed(2)}%`}
+                        tip="연평균 복리 수익률입니다. 기간이 달라도 비교하기 쉬운 핵심 지표입니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`최대낙폭(MDD): ${(backtest.metrics.maxDrawdown * 100).toFixed(2)}%`}
+                        tip="고점 대비 최대 손실 폭입니다. 초보자는 수익보다 MDD를 먼저 체크하면 리스크 관리에 도움이 됩니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`샤프지수: ${backtest.metrics.sharpe.toFixed(2)}`}
+                        tip="변동성 대비 수익 효율입니다. 일반적으로 높을수록 좋고 1 이상이면 양호, 2 이상이면 우수로 해석합니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`승률: ${(backtest.metrics.winRate * 100).toFixed(1)}%`}
+                        tip="이긴 거래 비율입니다. 승률이 낮아도 손익비가 좋으면 전체 수익은 플러스가 될 수 있습니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`신호: ${backtest.latestSignal?.action ?? 'hold'} / 확률 ${
+                          backtest.latestSignal
+                            ? `${(backtest.latestSignal.probabilityUp * 100).toFixed(1)}%`
+                            : '-'
+                        }`}
+                        tip="buy/short는 진입 후보, sell/cover는 청산 후보, hold는 관망 의미입니다. 확률이 임계값을 넘는지 함께 확인하세요."
+                      />
                     </p>
                   </div>
                 ) : (
