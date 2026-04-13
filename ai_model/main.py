@@ -33,7 +33,8 @@ except Exception:  # pragma: no cover - optional dependency
   LGBMClassifier = None
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volume import OnBalanceVolumeIndicator
 try:
   import torch
   from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -79,6 +80,10 @@ FEATURE_COLS: List[str] = [
   "oil_return_5d",
   "usd_krw_return_5d",
   "us10y_delta_5d",
+  "atr_pct",
+  "obv_trend",
+  "index_return_5d",
+  "relative_momentum",
 ]
 
 MODEL_TTL_HOURS = 24
@@ -172,6 +177,8 @@ def load_macro_feature_data(period_years: int = DATA_BASELINE_YEARS) -> pd.DataF
     "us10y_yield": "^TNX",
     "vix_close": "^VIX",
     "gold_price": "GC=F",
+    "spy_close": "SPY",
+    "kospi_close": "^KS11",
   }
   merged: Optional[pd.DataFrame] = None
   for col, ticker in symbols.items():
@@ -191,6 +198,8 @@ def load_macro_feature_data(period_years: int = DATA_BASELINE_YEARS) -> pd.DataF
         "us10y_yield",
         "vix_close",
         "gold_price",
+        "spy_close",
+        "kospi_close",
         "oil_return_5d",
         "usd_krw_return_5d",
         "us10y_delta_5d",
@@ -215,6 +224,7 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
   if isinstance(close, pd.DataFrame):
     close = close.iloc[:, 0]
   close = pd.to_numeric(close, errors="coerce")
+  vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
 
   df["sma_5"] = SMAIndicator(close, window=5).sma_indicator()
   df["sma_20"] = SMAIndicator(close, window=20).sma_indicator()
@@ -230,6 +240,15 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
   df["bb_bbm"] = bb.bollinger_mavg()
   df["bb_bbh"] = bb.bollinger_hband()
   df["bb_bbl"] = bb.bollinger_lband()
+
+  atr_ind = AverageTrueRange(high=df["High"], low=df["Low"], close=close, window=14)
+  df["atr_pct"] = (atr_ind.average_true_range() / close).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+
+  obv_ind = OnBalanceVolumeIndicator(close=close, volume=vol)
+  obv_vals = obv_ind.on_balance_volume()
+  df["obv_trend"] = (
+    obv_vals.diff(5) / vol.rolling(5).mean().replace(0, 1)
+  ).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
 
   df["target"] = (close.shift(-1) > close).astype(int)
 
@@ -255,9 +274,13 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df["us10y_yield"] = 0.0
     df["vix_close"] = 0.0
     df["gold_price"] = 0.0
+    df["spy_close"] = 0.0
+    df["kospi_close"] = 0.0
     df["oil_return_5d"] = 0.0
     df["usd_krw_return_5d"] = 0.0
     df["us10y_delta_5d"] = 0.0
+    df["index_return_5d"] = 0.0
+    df["relative_momentum"] = 0.0
   else:
     merged_macro = df.join(macro_df, how="left")
     df["oil_price"] = pd.to_numeric(merged_macro["oil_price"], errors="coerce").ffill().fillna(0.0)
@@ -265,13 +288,19 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df["us10y_yield"] = pd.to_numeric(merged_macro["us10y_yield"], errors="coerce").ffill().fillna(0.0)
     df["vix_close"] = pd.to_numeric(merged_macro["vix_close"], errors="coerce").ffill().fillna(0.0)
     df["gold_price"] = pd.to_numeric(merged_macro["gold_price"], errors="coerce").ffill().fillna(0.0)
+    df["spy_close"] = pd.to_numeric(merged_macro["spy_close"], errors="coerce").ffill().fillna(0.0)
+    df["kospi_close"] = pd.to_numeric(merged_macro["kospi_close"], errors="coerce").ffill().fillna(0.0)
     df["oil_return_5d"] = pd.to_numeric(merged_macro["oil_return_5d"], errors="coerce").fillna(0.0)
     df["usd_krw_return_5d"] = pd.to_numeric(merged_macro["usd_krw_return_5d"], errors="coerce").fillna(0.0)
     df["us10y_delta_5d"] = pd.to_numeric(merged_macro["us10y_delta_5d"], errors="coerce").fillna(0.0)
+    is_kr = str(ticker).upper().endswith((".KS", ".KQ"))
+    benchmark_close = df["kospi_close"] if is_kr else df["spy_close"]
+    df["index_return_5d"] = benchmark_close.pct_change(5).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+    ticker_return_5d = close.pct_change(5).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+    df["relative_momentum"] = (ticker_return_5d - df["index_return_5d"]).fillna(0.0)
 
   # Volume-by-price proxy features: approximate "물량대/평단대" 저항·지지 압력을 수치화
   typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
-  vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
   price_min = float(typical_price.min())
   price_max = float(typical_price.max())
   bin_count = 24

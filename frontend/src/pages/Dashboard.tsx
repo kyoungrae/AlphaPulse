@@ -1311,7 +1311,7 @@ export default function Dashboard() {
               {predict?.top_feature_importance?.map((item) => (
                 <div key={item.feature} className="flex items-center justify-between gap-2">
                   <span className="truncate">{item.feature}</span>
-                  <span className="shrink-0 tabular-nums">{(item.importance * 100).toFixed(1)}%</span>
+                  <span className="shrink-0 tabular-nums">{item.importance.toFixed(4)}</span>
                 </div>
               ))}
               <p className="mt-2 text-slate-400">{predict?.reason_summary ?? '예측 데이터가 없습니다.'}</p>
