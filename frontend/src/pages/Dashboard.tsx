@@ -1053,6 +1053,10 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-lg font-semibold text-white">{selectedDisplayName} 전략/근거 요약</h3>
+            <p className="text-xs text-slate-500">백테스트 요약 + 예측 근거</p>
+          </div>
           <div className="mt-1 grid grid-cols-1 gap-3 lg:grid-cols-2 lg:items-start">
             <div className="min-w-0 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
                 <div className="mb-2 flex flex-wrap items-center gap-1">

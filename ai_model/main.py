@@ -11,10 +11,14 @@ Run (port 8001, matches backend PREDICT_URL default):
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import pandas as pd
 import yfinance as yf
@@ -46,12 +50,18 @@ FEATURE_COLS: List[str] = [
   "bb_bbm",
   "bb_bbh",
   "bb_bbl",
+  "news_sentiment_score",
+  "news_volume",
+  "event_keyword_count",
 ]
 
 MODEL_TTL_HOURS = 24
 DATA_BASELINE_YEARS = 10
 PRICE_CACHE_TTL_MINUTES = 30
 PRELOAD_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "JPM", "XOM", "UNH"]
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:4000").rstrip("/")
+NEWS_FEATURE_TIMEOUT_SECONDS = float(os.getenv("NEWS_FEATURE_TIMEOUT_SECONDS", "8"))
+NEWS_FEATURES_ENABLED = os.getenv("NEWS_FEATURES_ENABLED", "true").lower() != "false"
 
 
 @dataclass
@@ -91,14 +101,40 @@ def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.
   return df.copy()
 
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
+def load_news_feature_data(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
+  if not NEWS_FEATURES_ENABLED:
+    return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
+  try:
+    market = "kr" if ticker.upper().endswith((".KS", ".KQ")) else "us"
+    query = urlencode({"from": from_date, "to": to_date, "limit": 300, "market": market})
+    url = f"{BACKEND_BASE_URL}/api/features/news/{ticker}?{query}"
+    with urlopen(url, timeout=NEWS_FEATURE_TIMEOUT_SECONDS) as response:
+      payload = json.loads(response.read().decode("utf-8"))
+    daily = payload.get("daily", [])
+    if not isinstance(daily, list) or len(daily) == 0:
+      return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
+    news_df = pd.DataFrame(daily)
+    required_cols = ["date", "news_sentiment_score", "news_volume", "event_keyword_count"]
+    missing = [c for c in required_cols if c not in news_df.columns]
+    if missing:
+      logger.warning("News feature response missing columns: %s", missing)
+      return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
+    news_df["date"] = pd.to_datetime(news_df["date"]).dt.tz_localize(None)
+    return news_df.set_index("date")[["news_sentiment_score", "news_volume", "event_keyword_count"]]
+  except Exception as err:
+    logger.warning("News feature load failed for %s: %s", ticker, err)
+    return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
+
+
+def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+  df = df.copy()
+  df.index = pd.to_datetime(df.index).tz_localize(None)
   close = df["Close"]
   # Ensure 1-D series (guard against DataFrame shape (n,1))
   if isinstance(close, pd.DataFrame):
     close = close.iloc[:, 0]
   close = pd.to_numeric(close, errors="coerce")
 
-  df = df.copy()
   df["sma_5"] = SMAIndicator(close, window=5).sma_indicator()
   df["sma_20"] = SMAIndicator(close, window=20).sma_indicator()
   df["rsi_14"] = RSIIndicator(close, window=14).rsi()
@@ -116,13 +152,28 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
   df["target"] = (close.shift(-1) > close).astype(int)
 
+  news_df = load_news_feature_data(
+    ticker=ticker,
+    from_date=df.index.min().date().isoformat(),
+    to_date=df.index.max().date().isoformat(),
+  )
+  if news_df.empty:
+    df["news_sentiment_score"] = 0.0
+    df["news_volume"] = 0.0
+    df["event_keyword_count"] = 0.0
+  else:
+    merged = df.join(news_df, how="left")
+    df["news_sentiment_score"] = pd.to_numeric(merged["news_sentiment_score"], errors="coerce").fillna(0.0)
+    df["news_volume"] = pd.to_numeric(merged["news_volume"], errors="coerce").fillna(0.0)
+    df["event_keyword_count"] = pd.to_numeric(merged["event_keyword_count"], errors="coerce").fillna(0.0)
+
   df = df.dropna()
   return df
 
 
 def train_model(ticker: str = "AAPL") -> ModelBundle:
   df = load_price_data(ticker)
-  df_feat = add_features(df)
+  df_feat = add_features(df, ticker)
 
   X = df_feat[FEATURE_COLS]
   y = df_feat["target"]
@@ -224,7 +275,7 @@ def predict(ticker: str):
 
   # Use recent data to generate the latest feature row
   df = load_price_data(ticker, period_years=DATA_BASELINE_YEARS)
-  df_feat = add_features(df)
+  df_feat = add_features(df, ticker)
   if df_feat.empty:
     raise HTTPException(status_code=400, detail="지표 계산을 위한 데이터가 충분하지 않습니다.")
 

@@ -49,7 +49,7 @@ const CandleSchema = z.object({
 })
 
 const rssParser = new Parser()
-type SentimentCacheValue = { label: string; score: number; analyzedAt: number }
+type SentimentCacheValue = { label: NewsSentimentLabel; score: number; analyzedAt: number }
 const sentimentCache = new Map<string, SentimentCacheValue>()
 const SENTIMENT_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7
 const NEWS_FEATURE_DEFAULT_DAYS = Math.max(1, Number(process.env.NEWS_FEATURE_DEFAULT_DAYS ?? 14))
@@ -95,6 +95,39 @@ type NewsItemWithSentiment = {
   publishedAt: string
   sentiment: { label: NewsSentimentLabel; score: number }
 }
+
+const POSITIVE_NEWS_KEYWORDS = [
+  'beat',
+  'surge',
+  'rally',
+  'upgrades',
+  'strong',
+  'record high',
+  'growth',
+  '상승',
+  '급등',
+  '호재',
+  '최고치',
+  '실적 개선',
+  '매수',
+  '수주',
+]
+const NEGATIVE_NEWS_KEYWORDS = [
+  'miss',
+  'plunge',
+  'drop',
+  'downgrade',
+  'weak',
+  'lawsuit',
+  'risk',
+  '하락',
+  '급락',
+  '악재',
+  '리스크',
+  '소송',
+  '경고',
+  '감소',
+]
 
 const fallbackSymbols: SymbolItem[] = [
   { symbol: 'AAPL', name: 'Apple Inc.', nameKr: '애플' },
@@ -227,7 +260,7 @@ function getNewYorkClock() {
   }
 }
 
-function toKoreanSentimentLabel(label: string) {
+function toKoreanSentimentLabel(label: string): NewsSentimentLabel {
   const normalized = label.trim().toLowerCase()
   if (normalized === 'positive' || normalized === '긍정') return '긍정'
   if (normalized === 'negative' || normalized === '부정') return '부정'
@@ -279,6 +312,20 @@ function isRelatedArticleTitle(title: string, tickerTerm: string, nameTerms: str
   const normalizedTitle = title.toLowerCase()
   if (normalizedTitle.includes(tickerTerm.toLowerCase())) return true
   return nameTerms.some((term) => normalizedTitle.includes(term.toLowerCase()))
+}
+
+function scoreSentimentFallback(title: string): SentimentCacheValue {
+  const text = title.toLowerCase()
+  let score = 0
+  for (const kw of POSITIVE_NEWS_KEYWORDS) {
+    if (text.includes(kw.toLowerCase())) score += 18
+  }
+  for (const kw of NEGATIVE_NEWS_KEYWORDS) {
+    if (text.includes(kw.toLowerCase())) score -= 18
+  }
+  score = Math.max(-100, Math.min(100, score))
+  const label: NewsSentimentLabel = score > 8 ? '긍정' : score < -8 ? '부정' : '중립'
+  return { label, score, analyzedAt: Date.now() }
 }
 
 async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map<string, SentimentCacheValue>> {
@@ -361,12 +408,18 @@ async function fetchNewsWithSentiment(params: {
       link: item.link,
       source: item.source,
       publishedAt: item.publishedAt!.toISOString(),
-      sentiment: sentimentMap.get(item.title)
-        ? {
-            label: toKoreanSentimentLabel(sentimentMap.get(item.title)!.label),
-            score: sentimentMap.get(item.title)!.score,
+      sentiment: ((): NewsItemWithSentiment['sentiment'] => {
+        const found = sentimentMap.get(item.title)
+        if (found) {
+          const label: NewsSentimentLabel = toKoreanSentimentLabel(found.label)
+          return {
+            label,
+            score: found.score,
           }
-        : { label: '중립', score: 0 },
+        }
+        const fallback = scoreSentimentFallback(item.title)
+        return { label: fallback.label, score: fallback.score }
+      })(),
     }),
   )
 }
