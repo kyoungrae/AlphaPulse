@@ -642,8 +642,10 @@ export default function Dashboard() {
     }
     if (!predict || !backtest) return null
 
-    const prob = (predict.probability_up * 100).toFixed(1)
     const isUp = predict.direction === 'Up'
+    const upProb = predict.probability_up * 100
+    const directionProb = isUp ? upProb : 100 - upProb
+    const prob = directionProb.toFixed(1)
     const action = backtest.latestSignal?.action ?? 'hold'
     const topFeature = predict.top_feature_importance?.[0]?.feature ?? '시장 지표'
 
