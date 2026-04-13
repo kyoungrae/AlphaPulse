@@ -1,10 +1,11 @@
 import cors from 'cors'
 import dotenv from 'dotenv'
+import admin from 'firebase-admin'
 import express, { Request, Response } from 'express'
+import OpenAI from 'openai'
 import Parser from 'rss-parser'
 import YahooFinance from 'yahoo-finance2'
 import { z } from 'zod'
-import OpenAI from 'openai'
 
 dotenv.config()
 
@@ -13,11 +14,15 @@ const port = process.env.PORT || 4000
 const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
 const yahooFinance = new YahooFinance()
 const openaiApiKey = process.env.OPENAI_API_KEY
-const openai = openaiApiKey
-  ? new OpenAI({
-      apiKey: openaiApiKey,
-    })
-  : null
+const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null
+const firestoreEnabled = process.env.FIRESTORE_ENABLED !== 'false'
+const DAILY_JOB_INTERVAL_MS = 1000 * 60 * 15
+const DAILY_JOB_CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
+const DAILY_JOB_SYMBOL_LIMIT = Math.max(1, Number(process.env.DAILY_JOB_SYMBOL_LIMIT ?? 500))
+const RECONCILE_BATCH_LIMIT = Math.max(50, Number(process.env.RECONCILE_BATCH_LIMIT ?? 250))
+const STOCK_CACHE_TTL_MS = 1000 * 60 * 5
+const PREDICT_CACHE_TTL_MS = 1000 * 60 * 2
+const FX_CACHE_TTL_MS = 1000 * 60 * 10
 
 app.use(cors())
 app.use(express.json())
@@ -31,6 +36,75 @@ const rssParser = new Parser()
 type SentimentCacheValue = { label: string; score: number; analyzedAt: number }
 const sentimentCache = new Map<string, SentimentCacheValue>()
 const SENTIMENT_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7
+const S_AND_P_500_CSV_URL = 'https://datahub.io/core/s-and-p-500-companies/r/constituents.csv'
+const SP500_CACHE_TTL_MS = 1000 * 60 * 60 * 24
+
+type SymbolItem = { symbol: string; name: string; nameKr?: string }
+type PredictionDirection = 'Up' | 'Down'
+type PredictionRecord = {
+  ticker: string
+  predictionDate: string
+  predictedDirection: PredictionDirection
+  probabilityUp: number
+  baseClose: number
+  targetDateExpected: string
+  modelTrainedAt?: string
+  cvAccuracy?: number
+  cvPrecision?: number
+  reasonSummary?: string
+  outcomeStatus: 'pending' | 'resolved'
+  actualDate?: string
+  actualDirection?: PredictionDirection
+  actualClose?: number
+  isCorrect?: boolean
+  source: 'daily-close-job'
+}
+type CacheEntry<T> = { data: T; cachedAt: number }
+
+const fallbackSymbols: SymbolItem[] = [
+  { symbol: 'AAPL', name: 'Apple Inc.', nameKr: '애플' },
+  { symbol: 'MSFT', name: 'Microsoft Corp.', nameKr: '마이크로소프트' },
+  { symbol: 'NVDA', name: 'NVIDIA Corp.', nameKr: '엔비디아' },
+  { symbol: 'AMZN', name: 'Amazon.com Inc.', nameKr: '아마존' },
+  { symbol: 'GOOGL', name: 'Alphabet Class A', nameKr: '알파벳 A' },
+  { symbol: 'META', name: 'Meta Platforms Inc.', nameKr: '메타' },
+  { symbol: 'BRK.B', name: 'Berkshire Hathaway B', nameKr: '버크셔 해서웨이 B' },
+  { symbol: 'JPM', name: 'JPMorgan Chase & Co.', nameKr: 'JP모건' },
+  { symbol: 'UNH', name: 'UnitedHealth Group Inc.', nameKr: '유나이티드헬스' },
+  { symbol: 'XOM', name: 'Exxon Mobil Corp.', nameKr: '엑슨모빌' },
+]
+const koreaSymbols: SymbolItem[] = [
+  { symbol: '005930.KS', name: '삼성전자' },
+  { symbol: '000660.KS', name: 'SK하이닉스' },
+  { symbol: '035420.KS', name: 'NAVER' },
+  { symbol: '005380.KS', name: '현대차' },
+  { symbol: '012330.KS', name: '현대모비스' },
+  { symbol: '051910.KS', name: 'LG화학' },
+  { symbol: '006400.KS', name: '삼성SDI' },
+  { symbol: '068270.KS', name: '셀트리온' },
+  { symbol: '207940.KS', name: '삼성바이오로직스' },
+  { symbol: '035720.KS', name: '카카오' },
+  { symbol: '105560.KS', name: 'KB금융' },
+  { symbol: '055550.KS', name: '신한지주' },
+  { symbol: '066570.KS', name: 'LG전자' },
+  { symbol: '096770.KS', name: 'SK이노베이션' },
+  { symbol: '003670.KS', name: '포스코홀딩스' },
+  { symbol: '028260.KS', name: '삼성물산' },
+  { symbol: '017670.KS', name: 'SK텔레콤' },
+  { symbol: '030200.KS', name: 'KT' },
+  { symbol: '010130.KS', name: '고려아연' },
+  { symbol: '034730.KS', name: 'SK' },
+  { symbol: '323410.KS', name: '카카오뱅크' },
+  { symbol: '259960.KS', name: '크래프톤' },
+  { symbol: '251270.KS', name: '넷마블' },
+  { symbol: '091990.KS', name: '셀트리온헬스케어' },
+  { symbol: '035900.KQ', name: 'JYP Ent.' },
+  { symbol: '041510.KQ', name: '에스엠' },
+  { symbol: '086900.KQ', name: '메디톡스' },
+  { symbol: '039030.KQ', name: '이오테크닉스' },
+  { symbol: '263750.KQ', name: '펄어비스' },
+  { symbol: '293490.KQ', name: '카카오게임즈' },
+]
 
 const sectorMap = [
   { name: '기술', symbol: 'XLK' },
@@ -45,28 +119,403 @@ const sectorMap = [
   { name: '부동산', symbol: 'XLRE' },
 ]
 
+let cachedSp500: { data: SymbolItem[]; expiresAt: number } | null = null
+let firestoreDb: FirebaseFirestore.Firestore | null = null
+let firestoreDisabledReason: string | null = null
+let dailyJobRunning = false
+let dailyJobLastRunDate: string | null = null
+const stockCache = new Map<string, CacheEntry<{ date: string; close: number }[]>>()
+const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
+const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
+
+function normalizeSingle(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) return value[0]
+  return value
+}
+
+function parseCsvRow(row: string): string[] {
+  const cells: string[] = []
+  let current = ''
+  let inQuotes = false
+  for (let i = 0; i < row.length; i += 1) {
+    const ch = row[i]
+    if (ch === '"') {
+      const next = row[i + 1]
+      if (inQuotes && next === '"') {
+        current += '"'
+        i += 1
+      } else {
+        inQuotes = !inQuotes
+      }
+      continue
+    }
+    if (ch === ',' && !inQuotes) {
+      cells.push(current.trim())
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  cells.push(current.trim())
+  return cells
+}
+
+function getNextWeekday(dateIso: string): string {
+  const date = new Date(`${dateIso}T00:00:00Z`)
+  date.setUTCDate(date.getUTCDate() + 1)
+  while (date.getUTCDay() === 0 || date.getUTCDay() === 6) {
+    date.setUTCDate(date.getUTCDate() + 1)
+  }
+  return date.toISOString().slice(0, 10)
+}
+
+function getNewYorkClock() {
+  const now = new Date()
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(now)
+  const map = new Map(parts.map((p) => [p.type, p.value]))
+  return {
+    date: `${map.get('year')}-${map.get('month')}-${map.get('day')}`,
+    hour: Number(map.get('hour')),
+    minute: Number(map.get('minute')),
+    weekday: map.get('weekday') ?? 'Mon',
+  }
+}
+
+async function getSp500Symbols(): Promise<SymbolItem[]> {
+  const now = Date.now()
+  if (cachedSp500 && cachedSp500.expiresAt > now) {
+    return cachedSp500.data
+  }
+  try {
+    const response = await fetch(S_AND_P_500_CSV_URL)
+    if (!response.ok) {
+      throw new Error(`S&P500 목록 다운로드 실패: ${response.status}`)
+    }
+    const csv = await response.text()
+    const rows = csv.trim().split('\n').slice(1)
+    const parsed = rows
+      .map((row) => parseCsvRow(row))
+      .map((cells) => ({
+        symbol: (cells[0] ?? '').replace(/\./g, '-').toUpperCase(),
+        name: cells[1] ?? cells[0] ?? '이름 없음',
+        nameKr: cells[1] ?? cells[0] ?? '이름 없음',
+      }))
+      .filter((item) => item.symbol.length > 0)
+    const unique = Array.from(new Map(parsed.map((item) => [item.symbol, item])).values())
+    cachedSp500 = { data: unique, expiresAt: now + SP500_CACHE_TTL_MS }
+    return unique
+  } catch (err) {
+    console.error('S&P500 목록 로딩 실패. fallback 목록 사용', err)
+    return fallbackSymbols
+  }
+}
+
+function getFirestore() {
+  if (!firestoreEnabled) return null
+  if (firestoreDisabledReason) return null
+  if (firestoreDb) return firestoreDb
+  try {
+    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+    const hasProjectHint =
+      Boolean(process.env.GOOGLE_CLOUD_PROJECT) ||
+      Boolean(process.env.GCLOUD_PROJECT) ||
+      Boolean(process.env.FIREBASE_CONFIG)
+    if (!serviceAccountJson && !hasProjectHint) {
+      firestoreDisabledReason = 'Firestore 설정이 없어 비활성화되었습니다.'
+      console.warn('[Firestore] FIREBASE_SERVICE_ACCOUNT_JSON 또는 프로젝트 환경변수가 없어 비활성화됩니다.')
+      return null
+    }
+    if (admin.apps.length === 0) {
+      if (serviceAccountJson) {
+        const serviceAccount = JSON.parse(serviceAccountJson)
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount),
+        })
+      } else {
+        admin.initializeApp()
+      }
+    }
+    firestoreDb = admin.firestore()
+    return firestoreDb
+  } catch (err) {
+    console.error('Firestore 초기화 실패', err)
+    firestoreDisabledReason = 'Firestore 초기화 실패'
+    return null
+  }
+}
+
+async function fetchPredict(ticker: string) {
+  const url = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+  const response = await fetch(url)
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`예측 서버 오류(${ticker}): ${response.status} ${body}`)
+  }
+  return (await response.json()) as {
+    ticker: string
+    probability_up: number
+    direction: PredictionDirection
+    last_date: string
+    last_close: number
+    cv_accuracy: number
+    cv_precision: number
+    model_trained_at: string
+    reason_summary: string
+  }
+}
+
+async function resolveOutcomeForPrediction(record: PredictionRecord): Promise<{
+  actualDate: string
+  actualDirection: PredictionDirection
+  actualClose: number
+  isCorrect: boolean
+} | null> {
+  const today = new Date()
+  const baseDate = new Date(`${record.predictionDate}T00:00:00Z`)
+  const period1 = new Date(baseDate)
+  period1.setUTCDate(period1.getUTCDate() - 3)
+  const quotes = await yahooFinance.chart(record.ticker, {
+    period1,
+    period2: today,
+    interval: '1d',
+  })
+  const normalized =
+    quotes.quotes
+      ?.filter((q) => q.close != null && q.date != null)
+      .map((q) => ({
+        date: q.date!.toISOString().slice(0, 10),
+        close: Number(q.close),
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date)) ?? []
+
+  const basePoint = normalized.find((q) => q.date === record.predictionDate)
+  const nextPoint = normalized.find((q) => q.date > record.predictionDate)
+  if (!basePoint || !nextPoint) {
+    return null
+  }
+  const actualDirection: PredictionDirection = nextPoint.close >= basePoint.close ? 'Up' : 'Down'
+  return {
+    actualDate: nextPoint.date,
+    actualDirection,
+    actualClose: Number(nextPoint.close.toFixed(2)),
+    isCorrect: actualDirection === record.predictedDirection,
+  }
+}
+
+async function runInBatches<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = []
+  let index = 0
+  const runners = Array.from({ length: concurrency }, async () => {
+    while (index < items.length) {
+      const current = items[index]
+      index += 1
+      const value = await worker(current)
+      results.push(value)
+    }
+  })
+  await Promise.all(runners)
+  return results
+}
+
+async function reconcilePendingOutcomes(bookmarkDocId: string | null) {
+  const db = getFirestore()
+  if (!db) {
+    return { resolvedCount: 0, correctCount: 0, processedCount: 0, nextBookmark: null as string | null }
+  }
+  let query = db
+    .collection('predictions')
+    .where('outcomeStatus', '==', 'pending')
+    .orderBy(admin.firestore.FieldPath.documentId())
+    .limit(RECONCILE_BATCH_LIMIT)
+  if (bookmarkDocId) {
+    query = query.startAfter(bookmarkDocId)
+  }
+  const snapshot = await query.get()
+
+  let resolvedCount = 0
+  let correctCount = 0
+  let lastDocId: string | null = null
+  for (const doc of snapshot.docs) {
+    lastDocId = doc.id
+    const data = doc.data() as PredictionRecord
+    try {
+      const outcome = await resolveOutcomeForPrediction(data)
+      if (!outcome) continue
+      // 결과는 예측 문서에 바로 반영해 Firestore 추가 읽기/쓰기 비용을 줄입니다.
+      await doc.ref.set(
+        {
+          outcomeStatus: 'resolved',
+          actualDate: outcome.actualDate,
+          actualDirection: outcome.actualDirection,
+          actualClose: outcome.actualClose,
+          isCorrect: outcome.isCorrect,
+          resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      )
+      resolvedCount += 1
+      if (outcome.isCorrect) {
+        correctCount += 1
+      }
+    } catch (err) {
+      console.error(`실측 비교 실패: ${data.ticker}`, err)
+    }
+  }
+  const nextBookmark =
+    snapshot.size === RECONCILE_BATCH_LIMIT && lastDocId
+      ? lastDocId
+      : null
+  return { resolvedCount, correctCount, processedCount: snapshot.size, nextBookmark }
+}
+
+async function runDailyCloseJob(force = false) {
+  if (dailyJobRunning) return
+  const db = getFirestore()
+  if (!db) return
+  const ny = getNewYorkClock()
+  const isWeekend = ny.weekday === 'Sat' || ny.weekday === 'Sun'
+  const marketClosed = ny.hour > 16 || (ny.hour === 16 && ny.minute >= 10)
+  if (!force && (isWeekend || !marketClosed || dailyJobLastRunDate === ny.date)) {
+    return
+  }
+
+  dailyJobRunning = true
+  try {
+    const metaRef = db.collection('job_meta').doc('daily_close')
+    const metaSnap = await metaRef.get()
+    const meta = (metaSnap.exists ? metaSnap.data() : null) as
+      | { lastRunDate?: string; pendingBookmark?: string | null }
+      | null
+    const lastRunDateFromDb = meta?.lastRunDate
+    if (!force && lastRunDateFromDb === ny.date) {
+      dailyJobLastRunDate = ny.date
+      return
+    }
+
+    const symbols = (await getSp500Symbols()).slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
+    const predictions: PredictionRecord[] = []
+    await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
+      try {
+        const predict = await fetchPredict(ticker)
+        const record: PredictionRecord = {
+          ticker,
+          predictionDate: predict.last_date,
+          predictedDirection: predict.direction,
+          probabilityUp: Number(predict.probability_up.toFixed(4)),
+          baseClose: Number(predict.last_close.toFixed(2)),
+          targetDateExpected: getNextWeekday(predict.last_date),
+          modelTrainedAt: predict.model_trained_at,
+          cvAccuracy: predict.cv_accuracy,
+          cvPrecision: predict.cv_precision,
+          reasonSummary: predict.reason_summary,
+          outcomeStatus: 'pending',
+          source: 'daily-close-job',
+        }
+        const docId = `${ticker}_${record.predictionDate}`
+        await db.collection('predictions').doc(docId).set(
+          {
+            ...record,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        )
+        predictions.push(record)
+      } catch (err) {
+        console.error(`일일 예측 저장 실패: ${ticker}`, err)
+      }
+    })
+
+    const pendingBookmark = typeof meta?.pendingBookmark === 'string' ? meta.pendingBookmark : null
+    const { resolvedCount, correctCount, processedCount, nextBookmark } = await reconcilePendingOutcomes(
+      pendingBookmark,
+    )
+    await db.collection('analysis_daily').doc(ny.date).set(
+      {
+        date: ny.date,
+        generatedCount: predictions.length,
+        resolvedCount,
+        correctCount,
+        accuracy: resolvedCount > 0 ? Number((correctCount / resolvedCount).toFixed(4)) : null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    )
+    await metaRef.set(
+      {
+        lastRunDate: ny.date,
+        generatedCount: predictions.length,
+        resolvedCount,
+        reconcileProcessed: processedCount,
+        pendingBookmark: nextBookmark,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    )
+    dailyJobLastRunDate = ny.date
+  } finally {
+    dailyJobRunning = false
+  }
+}
+
 app.get('/', (_req: Request, res: Response) => {
   res.json({
     name: 'AlphaPulse 백엔드',
-    endpoints: ['/api/stock/:ticker', '/api/news', '/health'],
+    endpoints: [
+      '/api/stock/:ticker',
+      '/api/fx/usd-krw',
+      '/api/news',
+      '/api/symbols/sp500',
+      '/api/predictions/history/:ticker',
+      '/health',
+    ],
   })
 })
 
 app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
-  const ticker = req.params.ticker?.toUpperCase()
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
   if (!ticker) {
     return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
   }
+  const timeframe = (normalizeSingle(req.query.timeframe as string | string[] | undefined) ?? 'month').toLowerCase()
+  const stockCacheKey = `${ticker}:${timeframe}`
+  const stockCached = stockCache.get(stockCacheKey)
+  if (stockCached && Date.now() - stockCached.cachedAt < STOCK_CACHE_TTL_MS) {
+    return res.json(stockCached.data)
+  }
 
   try {
-    const end = new Date()
-    const start = new Date()
-    start.setMonth(end.getMonth() - 1)
-
+    const rangeByTimeframe: Record<
+      string,
+      { interval: '1d' | '1wk' | '1h' | '15m' | '5m'; daysBack: number }
+    > = {
+      year: { interval: '1d', daysBack: 365 },
+      month: { interval: '1d', daysBack: 31 },
+      day: { interval: '15m', daysBack: 5 },
+      hour: { interval: '5m', daysBack: 1 },
+    }
+    const selected = rangeByTimeframe[timeframe] ?? rangeByTimeframe.month
+    const period2 = new Date()
+    const period1 = new Date(period2)
+    period1.setDate(period2.getDate() - selected.daysBack)
     const candles = await yahooFinance.chart(ticker, {
-      period1: start,
-      period2: end,
-      interval: '1d',
+      period1,
+      period2,
+      interval: selected.interval,
     })
 
     const result =
@@ -75,10 +524,52 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
         .map((q) => CandleSchema.parse({ date: q.date, close: q.close }))
         .map((q) => ({ date: q.date.toISOString(), close: q.close })) ?? []
 
+    stockCache.set(stockCacheKey, { data: result, cachedAt: Date.now() })
     res.json(result)
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: '주가 데이터를 가져오지 못했습니다.' })
+  }
+})
+
+app.get('/api/fx/usd-krw', async (_req: Request, res: Response) => {
+  const cacheKey = 'USD_KRW'
+  const cached = fxCache.get(cacheKey)
+  if (cached && Date.now() - cached.cachedAt < FX_CACHE_TTL_MS) {
+    return res.json({
+      base: 'USD',
+      quote: 'KRW',
+      rate: cached.data.rate,
+      asOf: cached.data.asOf,
+      source: 'open.er-api.com(cache)',
+    })
+  }
+
+  try {
+    const response = await fetch('https://open.er-api.com/v6/latest/USD')
+    if (!response.ok) {
+      throw new Error(`환율 API 오류: ${response.status}`)
+    }
+    const json = (await response.json()) as {
+      time_last_update_utc?: string
+      rates?: Record<string, number>
+    }
+    const rate = json.rates?.KRW
+    if (!rate) {
+      throw new Error('USD/KRW 환율 응답이 비어 있습니다.')
+    }
+    const asOf = json.time_last_update_utc ?? new Date().toISOString()
+    fxCache.set(cacheKey, { data: { rate, asOf }, cachedAt: Date.now() })
+    return res.json({
+      base: 'USD',
+      quote: 'KRW',
+      rate,
+      asOf,
+      source: 'open.er-api.com',
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: 'USD/KRW 환율을 가져오지 못했습니다.' })
   }
 })
 
@@ -126,23 +617,20 @@ ${uncachedTitles.map((title, idx) => `${idx + 1}. ${title}`).join('\n')}`
         const completion = await openai.responses.create({
           model: 'gpt-4.1-mini',
           input: prompt,
-          response_format: { type: 'json_object' },
         })
-
-        const raw = completion.output[0].content[0]
-        if (raw.type === 'output_text') {
-          const parsed = JSON.parse(raw.text) as { data?: { title: string; label: string; score: number }[] }
-            for (const d of parsed.data ?? []) {
-              sentimentCache.set(d.title, { label: d.label, score: d.score, analyzedAt: now })
-            }
+        const parsed = JSON.parse(completion.output_text ?? '{"data": []}') as {
+          data?: { title: string; label: string; score: number }[]
+        }
+        for (const d of parsed.data ?? []) {
+          sentimentCache.set(d.title, { label: d.label, score: d.score, analyzedAt: now })
           }
         }
 
         const enriched = items.map((item) => {
-            const found = cachedMap.get(item.title) ?? sentimentCache.get(item.title)
-            return found
-              ? { ...item, sentiment: { label: found.label, score: found.score } }
-              : { ...item, sentiment: { label: '중립', score: 0 } }
+          const found = cachedMap.get(item.title) ?? sentimentCache.get(item.title)
+          return found
+            ? { ...item, sentiment: { label: found.label, score: found.score } }
+            : { ...item, sentiment: { label: '중립', score: 0 } }
         })
         return res.json(enriched)
       } catch (err) {
@@ -213,6 +701,115 @@ app.get('/api/macro/sectors', async (_req: Request, res: Response) => {
   }
 })
 
+app.get('/api/symbols/sp500', async (req: Request, res: Response) => {
+  try {
+    const query = (req.query.q as string | undefined)?.trim().toUpperCase() ?? ''
+    const limitRaw = Number(req.query.limit ?? 40)
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 40
+    const symbols = await getSp500Symbols()
+    const filtered = symbols.filter((item) => {
+      if (!query) return true
+      return item.symbol.includes(query) || item.name.toUpperCase().includes(query)
+    })
+    return res.json({ total: filtered.length, items: filtered.slice(0, limit) })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: 'S&P500 종목 목록을 가져오지 못했습니다.' })
+  }
+})
+
+app.get('/api/symbols', async (req: Request, res: Response) => {
+  try {
+    const market = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
+    const query = (normalizeSingle(req.query.q as string | string[] | undefined) ?? '').trim().toUpperCase()
+    const limitRaw = Number(req.query.limit ?? 40)
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 40
+
+    const source = market === 'kr' ? koreaSymbols : await getSp500Symbols()
+    const filtered = source.filter((item) => {
+      if (!query) return true
+      return item.symbol.includes(query) || item.name.toUpperCase().includes(query)
+    })
+
+    return res.json({
+      market: market === 'kr' ? 'kr' : 'us',
+      total: filtered.length,
+      items: filtered.slice(0, limit),
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '종목 목록을 가져오지 못했습니다.' })
+  }
+})
+
+app.get('/api/predictions/history/:ticker', async (req: Request, res: Response) => {
+  const db = getFirestore()
+  if (!db) {
+    return res.status(503).json({
+      error: 'Firestore가 설정되지 않아 예측 이력을 조회할 수 없습니다.',
+      detail: firestoreDisabledReason ?? 'FIREBASE_SERVICE_ACCOUNT_JSON 또는 GOOGLE_CLOUD_PROJECT 설정을 확인하세요.',
+    })
+  }
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
+  const limitRaw = Number(req.query.limit ?? 30)
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 90) : 30
+  try {
+    const snap = await db
+      .collection('predictions')
+      .where('ticker', '==', ticker)
+      .orderBy('predictionDate', 'desc')
+      .limit(limit)
+      .get()
+    const records = snap.docs.map((doc) => {
+      const data = doc.data() as PredictionRecord
+      return {
+        ...data,
+        actualDirection: data.actualDirection ?? null,
+        actualDate: data.actualDate ?? null,
+        isCorrect: data.isCorrect ?? null,
+        actualClose: data.actualClose ?? null,
+      }
+    })
+    const sorted = records.sort((a, b) => a.predictionDate.localeCompare(b.predictionDate))
+    const withDelta = sorted.map((item, idx) => {
+      const prev = idx > 0 ? sorted[idx - 1] : null
+      return {
+        ...item,
+        probabilityDelta: prev ? Number((item.probabilityUp - prev.probabilityUp).toFixed(4)) : null,
+        directionChanged: prev ? item.predictedDirection !== prev.predictedDirection : false,
+      }
+    })
+    return res.json({ ticker, items: withDelta.reverse() })
+  } catch (err) {
+    console.error(err)
+    return res.status(503).json({
+      error: '예측 이력 조회에 실패했습니다.',
+      detail: 'Firestore 인증 또는 프로젝트 설정을 확인하세요.',
+    })
+  }
+})
+
+app.get('/api/predictions/daily-summary', async (req: Request, res: Response) => {
+  const db = getFirestore()
+  if (!db) {
+    return res.status(503).json({
+      error: 'Firestore가 설정되지 않아 일별 요약을 조회할 수 없습니다.',
+      detail: firestoreDisabledReason ?? 'FIREBASE_SERVICE_ACCOUNT_JSON 또는 GOOGLE_CLOUD_PROJECT 설정을 확인하세요.',
+    })
+  }
+  const date = (req.query.date as string | undefined) ?? getNewYorkClock().date
+  try {
+    const doc = await db.collection('analysis_daily').doc(date).get()
+    if (!doc.exists) {
+      return res.status(404).json({ error: '해당 날짜의 분석 요약이 없습니다.' })
+    }
+    return res.json(doc.data())
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '일별 분석 요약 조회에 실패했습니다.' })
+  }
+})
+
 app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
@@ -221,10 +818,40 @@ app.get('/health', (_req: Request, res: Response) => {
   })
 })
 
+app.get('/api/predict/directions', (req: Request, res: Response) => {
+  const raw = normalizeSingle(req.query.symbols as string | string[] | undefined) ?? ''
+  const symbols = raw
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter((s) => s.length > 0)
+    .slice(0, 60)
+
+  const items = symbols.map((symbol) => {
+    const cached = predictCache.get(symbol)
+    const validCached = cached && Date.now() - cached.cachedAt < PREDICT_CACHE_TTL_MS
+    const direction = validCached ? (cached.data.direction as PredictionDirection | undefined) : undefined
+    const probabilityUp = validCached
+      ? (cached.data.probability_up as number | undefined)
+      : undefined
+    return {
+      symbol,
+      direction: direction ?? null,
+      probabilityUp: typeof probabilityUp === 'number' ? probabilityUp : null,
+      source: validCached ? 'cache' : 'none',
+    }
+  })
+
+  return res.json({ items })
+})
+
 app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
-  const ticker = req.params.ticker?.toUpperCase()
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
   if (!ticker) {
     return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  const cached = predictCache.get(ticker)
+  if (cached && Date.now() - cached.cachedAt < PREDICT_CACHE_TTL_MS) {
+    return res.json(cached.data)
   }
 
   const url = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
@@ -238,6 +865,7 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
         .json({ error: '예측 서버 응답 오류', detail: body })
     }
     const json = await response.json()
+    predictCache.set(ticker, { data: json as Record<string, unknown>, cachedAt: Date.now() })
     return res.json(json)
   } catch (err) {
     console.error('Predict proxy failed', err)
@@ -248,6 +876,26 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
   }
 })
 
+app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
+  const db = getFirestore()
+  if (!db) {
+    return res.status(503).json({ error: 'Firestore 설정이 필요합니다.' })
+  }
+  try {
+    await runDailyCloseJob(true)
+    return res.json({ ok: true, message: '일일 마감 배치를 실행했습니다.' })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '일일 배치 실행에 실패했습니다.' })
+  }
+})
+
 app.listen(port, () => {
   console.log(`Backend server running on http://localhost:${port}`)
+  setInterval(() => {
+    void runDailyCloseJob(false)
+  }, DAILY_JOB_INTERVAL_MS)
+  setTimeout(() => {
+    void runDailyCloseJob(false)
+  }, 5000)
 })

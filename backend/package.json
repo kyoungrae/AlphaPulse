@@ -16,12 +16,14 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
+    "firebase-admin": "^13.8.0",
     "openai": "^6.34.0",
     "rss-parser": "^3.13.0",
     "yahoo-finance2": "^3.14.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
     "ts-node-dev": "^2.0.0",

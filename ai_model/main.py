@@ -4,8 +4,9 @@ FastAPI inference server for next-day direction classification.
 Install:
   pip install fastapi uvicorn yfinance pandas scikit-learn ta joblib
 
-Run (port 8000):
-  uvicorn main:app --reload --port 8000
+Run (port 8001, matches backend PREDICT_URL default):
+  ./start
+  # or: uvicorn main:app --reload --port 8001
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
@@ -48,6 +49,8 @@ FEATURE_COLS: List[str] = [
 ]
 
 MODEL_TTL_HOURS = 24
+DATA_BASELINE_YEARS = 10
+PRICE_CACHE_TTL_MINUTES = 30
 PRELOAD_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "JPM", "XOM", "UNH"]
 
 
@@ -61,9 +64,17 @@ class ModelBundle:
 
 
 MODEL_CACHE: Dict[str, ModelBundle] = {}
+PRICE_CACHE: Dict[Tuple[str, int], Tuple[pd.DataFrame, datetime]] = {}
 
 
-def load_price_data(ticker: str, period_years: int = 5) -> pd.DataFrame:
+def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.DataFrame:
+  cache_key = (ticker, period_years)
+  cached = PRICE_CACHE.get(cache_key)
+  if cached:
+    df_cached, loaded_at = cached
+    if datetime.now() - loaded_at < timedelta(minutes=PRICE_CACHE_TTL_MINUTES):
+      return df_cached.copy()
+
   df = yf.download(ticker, period=f"{period_years}y", interval="1d", auto_adjust=False)
   # Flatten multi-index columns if present (single ticker can still return multi-index)
   if isinstance(df.columns, pd.MultiIndex):
@@ -76,7 +87,8 @@ def load_price_data(ticker: str, period_years: int = 5) -> pd.DataFrame:
   missing = expected - set(df.columns)
   if missing:
     raise ValueError(f"Missing columns in price data: {missing}")
-  return df
+  PRICE_CACHE[cache_key] = (df, datetime.now())
+  return df.copy()
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -189,6 +201,7 @@ class PredictResponse(BaseModel):
   model_trained_at: str
   top_feature_importance: List[FeatureImportanceItem]
   reason_summary: str
+  data_years: int
 
 
 @app.on_event("startup")
@@ -210,7 +223,7 @@ def predict(ticker: str):
     raise HTTPException(status_code=500, detail=f"모델 학습/로드 실패: {err}") from err
 
   # Use recent data to generate the latest feature row
-  df = load_price_data(ticker, period_years=2)
+  df = load_price_data(ticker, period_years=DATA_BASELINE_YEARS)
   df_feat = add_features(df)
   if df_feat.empty:
     raise HTTPException(status_code=400, detail="지표 계산을 위한 데이터가 충분하지 않습니다.")
@@ -246,6 +259,7 @@ def predict(ticker: str):
     model_trained_at=bundle.trained_at.isoformat(timespec="seconds"),
     top_feature_importance=top_feature_importance,
     reason_summary=reason_summary,
+    data_years=DATA_BASELINE_YEARS,
   )
 
 
