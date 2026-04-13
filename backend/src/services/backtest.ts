@@ -61,6 +61,12 @@ export type BacktestResult = {
     action: SignalAction
     probabilityUp: number
   } | null
+  /** 백테스트에 사용된 가장 최근 일봉(시가·종가). 다음 시가 체결 가정 안내에 활용 */
+  referenceBar: {
+    date: string
+    open: number
+    close: number
+  }
 }
 
 type StrategyThresholds = {
@@ -249,6 +255,8 @@ export function runBacktest(input: BacktestInput): BacktestResult {
     point.drawdown = peak > 0 ? (point.equity - peak) / peak : 0
   }
 
+  const lastCandle = candles[candles.length - 1]
+
   return {
     ticker: input.ticker,
     strategy: input.strategy,
@@ -268,5 +276,10 @@ export function runBacktest(input: BacktestInput): BacktestResult {
     equityCurve,
     trades,
     latestSignal,
+    referenceBar: {
+      date: lastCandle.date,
+      open: lastCandle.open,
+      close: lastCandle.close,
+    },
   }
 }

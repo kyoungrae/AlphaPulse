@@ -9,6 +9,7 @@ import { z } from 'zod'
 import { resolveCostConfig, type Market } from './services/costModel'
 import {
   runBacktest,
+  type BacktestResult,
   type CandlePoint,
   type ProbabilityPoint,
   type StrategyMode,
@@ -370,6 +371,79 @@ function normalizeStrategy(value: string | undefined): StrategyMode {
   return 'long_only'
 }
 
+function medianNumbers(values: number[]): number | null {
+  if (values.length === 0) return null
+  const s = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(s.length / 2)
+  return s.length % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2
+}
+
+function buildTradeGuidance(result: BacktestResult, market: Market, notional: number) {
+  const trades = result.trades
+  const wins = trades.filter((t) => t.netReturn > 0)
+  const losses = trades.filter((t) => t.netReturn < 0)
+  const avgWinNet = wins.length > 0 ? wins.reduce((a, b) => a + b.netReturn, 0) / wins.length : null
+  const avgLossNet = losses.length > 0 ? losses.reduce((a, b) => a + b.netReturn, 0) / losses.length : null
+  const medianHold = medianNumbers(trades.map((t) => t.holdingDays))
+  const medianHoldWin = medianNumbers(wins.map((t) => t.holdingDays))
+
+  const sig = result.latestSignal
+  const currency = market === 'kr' ? 'KRW' : 'USD'
+
+  const disclaimer = [
+    '표시 값은 과거 데이터로 백테스트한 결과이며, 미래 수익을 보장하지 않습니다.',
+    '체결가는 다음 거래일 시가를 가정하며 실제와 다를 수 있습니다. 슬리피지·세금·수수료가 반영된 시뮬레이션입니다.',
+    '투자 판단은 본인 책임이며, 참고용으로만 활용하세요.',
+  ]
+
+  let actionSummary = ''
+  if (!sig) {
+    actionSummary = '신호를 계산하지 못했습니다.'
+  } else if (sig.action === 'buy') {
+    actionSummary =
+      "진입 후보(매수): 백테스트와 동일하게 '다음 거래일 시가'에 매수 체결된다고 가정합니다. 청산은 이후 '매도' 신호가 나온 날의 다음 거래일 시가에 매도하는 규칙을 따릅니다."
+  } else if (sig.action === 'short') {
+    actionSummary =
+      "진입 후보(공매도): 다음 거래일 시가에 공매도 진입을 가정합니다. 청산은 'cover' 신호가 나온 날의 다음 거래일 시가에 가정합니다."
+  } else if (sig.action === 'sell' || sig.action === 'cover') {
+    actionSummary =
+      '청산 후보: 기존 포지션이 있다면 다음 거래일 시가에 매도(또는 공매도 청산)를 검토할 수 있는 신호로 해석할 수 있습니다.'
+  } else {
+    actionSummary =
+      '관망(hold): 새로운 진입 신호가 나올 때까지 기다리는 구간으로 모델에서 해석됩니다.'
+  }
+
+  return {
+    ticker: result.ticker,
+    market,
+    strategy: result.strategy,
+    backtestRange: { from: result.startDate, to: result.endDate },
+    signal: sig
+      ? {
+          date: sig.date,
+          action: sig.action,
+          probabilityUp: sig.probabilityUp,
+        }
+      : null,
+    referenceBar: result.referenceBar,
+    actionSummary,
+    historical: {
+      tradeCount: trades.length,
+      avgWinNetReturn: avgWinNet,
+      avgLossNetReturn: avgLossNet,
+      medianHoldingDays: medianHold,
+      medianHoldingDaysWinners: medianHoldWin,
+    },
+    scenario: {
+      notional,
+      currency,
+      profitIfAvgWin: avgWinNet != null ? notional * avgWinNet : null,
+      lossIfAvgLoss: avgLossNet != null ? notional * avgLossNet : null,
+    },
+    disclaimer,
+  }
+}
+
 async function getBacktestResult(params: {
   ticker: string
   market: Market
@@ -381,7 +455,7 @@ async function getBacktestResult(params: {
 }) {
   const from = params.from ?? new Date(Date.now() - 1000 * 60 * 60 * 24 * 365).toISOString().slice(0, 10)
   const to = params.to ?? new Date().toISOString().slice(0, 10)
-  const cacheKey = `${params.ticker}:${params.market}:${params.strategy}:${from}:${to}:${params.initialCapital}`
+  const cacheKey = `${params.ticker}:${params.market}:${params.strategy}:${from}:${to}:${params.initialCapital}:v2`
   const memCached = backtestMemoryCache.get(cacheKey)
   if (!params.forceRefresh && memCached && Date.now() - memCached.cachedAt < BACKTEST_CACHE_TTL_MS) {
     return memCached.data
@@ -989,6 +1063,33 @@ app.get('/api/signals/:ticker', async (req: Request, res: Response) => {
   } catch (err) {
     console.error(err)
     return res.status(500).json({ error: '신호 계산에 실패했습니다.' })
+  }
+})
+
+app.get('/api/guidance/:ticker', async (req: Request, res: Response) => {
+  const ticker = normalizeSingle(req.params.ticker)?.toUpperCase()
+  if (!ticker) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  try {
+    const strategy = normalizeStrategy(normalizeSingle(req.query.strategy as string | string[] | undefined))
+    const marketRaw = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
+    const market: Market = marketRaw === 'kr' ? 'kr' : 'us'
+    const defaultNotional = market === 'kr' ? 10_000_000 : 10_000
+    const notionalRaw = Number(req.query.notional ?? defaultNotional)
+    const notional = Number.isFinite(notionalRaw) && notionalRaw > 0 ? notionalRaw : defaultNotional
+    const result = await getBacktestResult({
+      ticker,
+      market,
+      strategy,
+      initialCapital: 100_000,
+      forceRefresh: false,
+    })
+    const guidance = buildTradeGuidance(result, market, notional)
+    return res.json(guidance)
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '수익 참고 안내 계산에 실패했습니다.' })
   }
 })
 

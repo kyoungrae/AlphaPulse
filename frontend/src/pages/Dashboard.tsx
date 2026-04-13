@@ -112,10 +112,49 @@ type BacktestResult = {
   } | null
 }
 
+type GuidanceResponse = {
+  ticker: string
+  market: 'us' | 'kr'
+  strategy: StrategyMode
+  backtestRange: { from: string; to: string }
+  signal: {
+    date: string
+    action: 'buy' | 'sell' | 'short' | 'cover' | 'hold'
+    probabilityUp: number
+  } | null
+  referenceBar: { date: string; open: number; close: number }
+  actionSummary: string
+  historical: {
+    tradeCount: number
+    avgWinNetReturn: number | null
+    avgLossNetReturn: number | null
+    medianHoldingDays: number | null
+    medianHoldingDaysWinners: number | null
+  }
+  scenario: {
+    notional: number
+    currency: 'USD' | 'KRW'
+    profitIfAvgWin: number | null
+    lossIfAvgLoss: number | null
+  }
+  disclaimer: string[]
+}
+
 function directionToKorean(direction: string) {
   if (direction === 'Up') return '상승'
   if (direction === 'Down') return '하락'
   return direction
+}
+
+function signalActionToKorean(action: string) {
+  const m: Record<string, string> = {
+    buy: '매수 후보',
+    sell: '매도 후보',
+    short: '공매도 후보',
+    cover: '공매도 청산 후보',
+    hold: '관망',
+  }
+  return m[action] ?? action
 }
 
 type ChartRow = {
@@ -310,6 +349,7 @@ export default function Dashboard() {
   const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('month')
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
   const [strategy, setStrategy] = useState<StrategyMode>('long_only')
+  const [notionalInput, setNotionalInput] = useState('10000')
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(symbolQuery), 200)
@@ -329,7 +369,30 @@ export default function Dashboard() {
     setPriceCurrency(market === 'kr' ? 'krw' : 'usd')
   }, [market])
 
+  useEffect(() => {
+    setNotionalInput(market === 'kr' ? '10000000' : '10000')
+  }, [market])
+
   const nativeCurrency: NativeCurrency = market === 'kr' ? 'krw' : 'usd'
+
+  const defaultGuidanceNotional = market === 'kr' ? 10_000_000 : 10_000
+  const guidanceNotional = useMemo(() => {
+    const raw = notionalInput.replace(/,/g, '').trim()
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 ? n : defaultGuidanceNotional
+  }, [notionalInput, defaultGuidanceNotional])
+
+  const guidanceUrl = useMemo(
+    () =>
+      `/api/guidance/${encodeURIComponent(selectedSymbol)}?market=${market}&strategy=${strategy}&notional=${guidanceNotional}`,
+    [selectedSymbol, market, strategy, guidanceNotional],
+  )
+
+  const {
+    data: guidance,
+    loading: guidanceLoading,
+    error: guidanceError,
+  } = useFetch<GuidanceResponse>(guidanceUrl)
 
   const {
     data: symbols,
@@ -552,6 +615,171 @@ export default function Dashboard() {
             </p>
           </div>
         </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="text-xs uppercase tracking-[0.2em] text-blue-300">수익 참고 안내</p>
+            <p className="mt-1 text-sm font-semibold text-white">{selectedDisplayName} · 과거 백테스트 기준</p>
+            <p className="mt-1 text-xs text-slate-400">
+              전략별로 신호·백테스트 규칙이 다릅니다. 아래에서 전략을 바꾸면 안내가 함께 갱신됩니다(다음 거래일 시가 체결 가정).
+            </p>
+            <div className="mt-3 flex flex-wrap gap-1">
+              {([
+                { key: 'long_only', label: '롱' },
+                { key: 'long_short', label: '롱/숏' },
+                { key: 'swing', label: '스윙' },
+                { key: 'intraday', label: '단타' },
+              ] as const).map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setStrategy(item.key)}
+                  className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                    strategy === item.key ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {guidanceLoading && (
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-600 border-t-transparent" />
+          )}
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <label className="text-xs text-slate-400">
+            시뮬레이션 금액 ({market === 'kr' ? '원' : 'USD'})
+            <input
+              type="text"
+              inputMode="numeric"
+              value={notionalInput}
+              onChange={(e) => setNotionalInput(e.target.value.replace(/[^\d]/g, ''))}
+              className="ml-2 inline-block w-36 rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm text-slate-100 outline-none focus:border-blue-400"
+            />
+          </label>
+          <MetricTooltip
+            label="금액 안내"
+            tip="과거 승리·패배 거래의 평균 순익률을 이 금액에 곱한 참고 손익입니다. 실제 거래는 시장 상황에 따라 크게 달라집니다."
+          />
+        </div>
+
+        {guidanceError && (
+          <p className="mt-3 text-xs text-rose-400">안내를 불러오지 못했습니다: {guidanceError}</p>
+        )}
+
+        {guidanceLoading && !guidance && (
+          <div className="mt-4 h-36 rounded-xl bg-slate-800/60 animate-pulse" />
+        )}
+
+        {!guidanceLoading && guidance && (
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-sm text-slate-300">
+              <p className="text-xs font-semibold text-slate-200">지금 신호가 의미하는 것</p>
+              <p className="mt-2">
+                신호 기준일: <span className="text-slate-100">{guidance.signal?.date ?? '—'}</span>
+              </p>
+              <p className="mt-1">
+                전략 신호:{' '}
+                <span className="font-medium text-amber-200">
+                  {guidance.signal ? signalActionToKorean(guidance.signal.action) : '—'}
+                </span>
+                {' · '}
+                모델 상승확률 {(guidance.signal ? guidance.signal.probabilityUp * 100 : 0).toFixed(1)}%
+              </p>
+              <p className="mt-2 text-xs leading-relaxed text-slate-400">{guidance.actionSummary}</p>
+              <p className="mt-3 text-xs text-slate-500">
+                직전 봉 종가(참고, {guidance.referenceBar.date}):{' '}
+                <span className="tabular-nums text-slate-200">
+                  {formatMoney(
+                    convertPrice(guidance.referenceBar.close, nativeCurrency, priceCurrency, fxData?.rate),
+                    priceCurrency,
+                  )}
+                </span>
+                <span className="ml-2 text-slate-500">
+                  시가{' '}
+                  {formatMoney(
+                    convertPrice(guidance.referenceBar.open, nativeCurrency, priceCurrency, fxData?.rate),
+                    priceCurrency,
+                  )}
+                </span>
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-sm text-slate-300">
+              <p className="text-xs font-semibold text-slate-200">과거 동일 전략 거래 요약</p>
+              <p className="mt-2">
+                구간: {guidance.backtestRange.from} ~ {guidance.backtestRange.to}
+              </p>
+              <p className="mt-1">완료 거래: {guidance.historical.tradeCount}건</p>
+              <p className="mt-1">
+                승리 거래 평균 순익률:{' '}
+                {guidance.historical.avgWinNetReturn != null
+                  ? `${(guidance.historical.avgWinNetReturn * 100).toFixed(2)}%`
+                  : '—'}
+              </p>
+              <p className="mt-1">
+                패배 거래 평균 순익률:{' '}
+                {guidance.historical.avgLossNetReturn != null
+                  ? `${(guidance.historical.avgLossNetReturn * 100).toFixed(2)}%`
+                  : '—'}
+              </p>
+              <p className="mt-1">
+                보유일(중앙값):{' '}
+                {guidance.historical.medianHoldingDays != null
+                  ? `${guidance.historical.medianHoldingDays.toFixed(1)}일`
+                  : '—'}
+                {guidance.historical.medianHoldingDaysWinners != null && (
+                  <span className="text-slate-500">
+                    {' '}
+                    · 승리 거래 중앙값 {guidance.historical.medianHoldingDaysWinners.toFixed(1)}일
+                  </span>
+                )}
+              </p>
+            </div>
+
+            <div className="lg:col-span-2 rounded-xl border border-emerald-900/40 bg-emerald-950/20 p-3 text-sm text-slate-200">
+              <p className="text-xs font-semibold text-emerald-200/90">
+                입력 금액 {formatMoney(convertPrice(guidanceNotional, nativeCurrency, priceCurrency, fxData?.rate), priceCurrency)} 기준 참고 손익
+              </p>
+              <p className="mt-2 flex flex-wrap gap-x-8 gap-y-2">
+                <span>
+                  평균 승리 시(과거 승자 순익률 × 금액):{' '}
+                  <span className="font-semibold text-emerald-300">
+                    {guidance.scenario.profitIfAvgWin != null
+                      ? formatMoney(
+                          convertPrice(guidance.scenario.profitIfAvgWin, nativeCurrency, priceCurrency, fxData?.rate),
+                          priceCurrency,
+                        )
+                      : '—'}
+                  </span>
+                </span>
+                <span>
+                  평균 패배 시:{' '}
+                  <span className="font-semibold text-rose-300">
+                    {guidance.scenario.lossIfAvgLoss != null
+                      ? formatMoney(
+                          convertPrice(guidance.scenario.lossIfAvgLoss, nativeCurrency, priceCurrency, fxData?.rate),
+                          priceCurrency,
+                        )
+                      : '—'}
+                  </span>
+                </span>
+              </p>
+            </div>
+          </div>
+        )}
+
+        {guidance && (
+          <ul className="mt-4 list-disc space-y-1 pl-4 text-[11px] text-slate-500">
+            {guidance.disclaimer.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        )}
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
