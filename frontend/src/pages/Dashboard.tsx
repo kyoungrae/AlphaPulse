@@ -906,94 +906,6 @@ export default function Dashboard() {
                 <p>학습 기반 데이터 기간: 최소 {predict.data_years ?? 10}년</p>
                 <p className="mt-1 text-slate-400">모델 학습 시각: {predict.model_trained_at}</p>
               </div>
-              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
-                <div className="mb-2 flex flex-wrap items-center gap-1">
-                  {([
-                    { key: 'long_only', label: '롱' },
-                    { key: 'long_short', label: '롱/숏' },
-                    { key: 'swing', label: '스윙' },
-                    { key: 'intraday', label: '단타' },
-                  ] as const).map((item) => (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onClick={() => setStrategy(item.key)}
-                      className={`rounded-full px-2 py-0.5 ${
-                        strategy === item.key
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                      }`}
-                    >
-                      {item.label}
-                    </button>
-                  ))}
-                </div>
-                {backtestLoading ? (
-                  <p className="text-slate-400">전략 수익 예측 계산 중...</p>
-                ) : backtestError ? (
-                  <p className="text-rose-300">백테스트 오류: {backtestError}</p>
-                ) : backtest ? (
-                  <div className="space-y-1">
-                    {backtest.startDate && backtest.endDate && (
-                      <p className="text-slate-500">
-                        백테스트 구간: {backtest.startDate} ~ {backtest.endDate} (기본 약 10년)
-                      </p>
-                    )}
-                    <p>
-                      <MetricTooltip
-                        label={`총수익률: ${(backtest.metrics.totalReturn * 100).toFixed(2)}%`}
-                        tip="백테스트 전체 기간 누적 수익률입니다. 높을수록 좋지만, 기간이 길수록 CAGR도 같이 보세요."
-                      />
-                    </p>
-                    <p>
-                      <MetricTooltip
-                        label={`CAGR: ${(backtest.metrics.cagr * 100).toFixed(2)}%`}
-                        tip="연평균 복리 수익률입니다. 기간이 달라도 비교하기 쉬운 핵심 지표입니다."
-                      />
-                    </p>
-                    <p>
-                      <MetricTooltip
-                        label={`최대낙폭(MDD): ${(backtest.metrics.maxDrawdown * 100).toFixed(2)}%`}
-                        tip="고점 대비 최대 손실 폭입니다. 초보자는 수익보다 MDD를 먼저 체크하면 리스크 관리에 도움이 됩니다."
-                      />
-                    </p>
-                    <p>
-                      <MetricTooltip
-                        label={`샤프지수: ${backtest.metrics.sharpe.toFixed(2)}`}
-                        tip="변동성 대비 수익 효율입니다. 일반적으로 높을수록 좋고 1 이상이면 양호, 2 이상이면 우수로 해석합니다."
-                      />
-                    </p>
-                    <p>
-                      <MetricTooltip
-                        label={`승률: ${(backtest.metrics.winRate * 100).toFixed(1)}%`}
-                        tip="이긴 거래 비율입니다. 승률이 낮아도 손익비가 좋으면 전체 수익은 플러스가 될 수 있습니다."
-                      />
-                    </p>
-                    <p>
-                      <MetricTooltip
-                        label={`신호: ${backtest.latestSignal?.action ?? 'hold'} / 확률 ${
-                          backtest.latestSignal
-                            ? `${(backtest.latestSignal.probabilityUp * 100).toFixed(1)}%`
-                            : '-'
-                        }`}
-                        tip="buy/short는 진입 후보, sell/cover는 청산 후보, hold는 관망 의미입니다. 확률이 임계값을 넘는지 함께 확인하세요."
-                      />
-                    </p>
-                  </div>
-                ) : (
-                  <p className="text-slate-400">전략 요약 데이터가 없습니다.</p>
-                )}
-              </div>
-              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
-                <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>
-                {predict.top_feature_importance?.map((item) => (
-                  <div key={item.feature} className="flex items-center justify-between">
-                    <span>{item.feature}</span>
-                    <span>{(item.importance * 100).toFixed(1)}%</span>
-                  </div>
-                ))}
-                <p className="mt-2 text-slate-400">{predict.reason_summary}</p>
-              </div>
             </div>
           ) : (
             <div className="mt-4 text-sm text-slate-400">예측 데이터가 없습니다.</div>
@@ -1096,6 +1008,100 @@ export default function Dashboard() {
                 </ComposedChart>
               </ResponsiveContainer>
             )}
+          </div>
+        </div>
+        <div className="lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+                <div className="mb-2 flex flex-wrap items-center gap-1">
+                  {([
+                    { key: 'long_only', label: '롱' },
+                    { key: 'long_short', label: '롱/숏' },
+                    { key: 'swing', label: '스윙' },
+                    { key: 'intraday', label: '단타' },
+                  ] as const).map((item) => (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => setStrategy(item.key)}
+                      className={`rounded-full px-2 py-0.5 ${
+                        strategy === item.key
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+                {backtestLoading ? (
+                  <p className="text-slate-400">전략 수익 예측 계산 중...</p>
+                ) : backtestError ? (
+                  <p className="text-rose-300">백테스트 오류: {backtestError}</p>
+                ) : backtest ? (
+                  <div className="space-y-1">
+                    {backtest.startDate && backtest.endDate && (
+                      <p className="text-slate-500">
+                        백테스트 구간: {backtest.startDate} ~ {backtest.endDate} (기본 약 10년)
+                      </p>
+                    )}
+                    <p>
+                      <MetricTooltip
+                        label={`총수익률: ${(backtest.metrics.totalReturn * 100).toFixed(2)}%`}
+                        tip="백테스트 전체 기간 누적 수익률입니다. 높을수록 좋지만, 기간이 길수록 CAGR도 같이 보세요."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`CAGR: ${(backtest.metrics.cagr * 100).toFixed(2)}%`}
+                        tip="연평균 복리 수익률입니다. 기간이 달라도 비교하기 쉬운 핵심 지표입니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`최대낙폭(MDD): ${(backtest.metrics.maxDrawdown * 100).toFixed(2)}%`}
+                        tip="고점 대비 최대 손실 폭입니다. 초보자는 수익보다 MDD를 먼저 체크하면 리스크 관리에 도움이 됩니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`샤프지수: ${backtest.metrics.sharpe.toFixed(2)}`}
+                        tip="변동성 대비 수익 효율입니다. 일반적으로 높을수록 좋고 1 이상이면 양호, 2 이상이면 우수로 해석합니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`승률: ${(backtest.metrics.winRate * 100).toFixed(1)}%`}
+                        tip="이긴 거래 비율입니다. 승률이 낮아도 손익비가 좋으면 전체 수익은 플러스가 될 수 있습니다."
+                      />
+                    </p>
+                    <p>
+                      <MetricTooltip
+                        label={`신호: ${backtest.latestSignal?.action ?? 'hold'} / 확률 ${
+                          backtest.latestSignal
+                            ? `${(backtest.latestSignal.probabilityUp * 100).toFixed(1)}%`
+                            : '-'
+                        }`}
+                        tip="buy/short는 진입 후보, sell/cover는 청산 후보, hold는 관망 의미입니다. 확률이 임계값을 넘는지 함께 확인하세요."
+                      />
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-slate-400">전략 요약 데이터가 없습니다.</p>
+                )}
+              </div>
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+                <p className="mb-1 font-semibold text-slate-200">예측 근거(상위 중요도)</p>
+                {predict?.top_feature_importance?.map((item) => (
+                  <div key={item.feature} className="flex items-center justify-between">
+                    <span>{item.feature}</span>
+                    <span>{(item.importance * 100).toFixed(1)}%</span>
+                  </div>
+                ))}
+                <p className="mt-2 text-slate-400">{predict?.reason_summary ?? '예측 데이터가 없습니다.'}</p>
+              </div>
+            </div>
           </div>
         </div>
         <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
