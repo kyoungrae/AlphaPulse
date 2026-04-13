@@ -251,9 +251,34 @@ function defaultDateRange(days: number): { from: string; to: string } {
   }
 }
 
-function buildNewsSearchQuery(ticker: string, market: Market) {
-  const base = market === 'kr' ? `${ticker} OR 한국 증시 OR 코스피 OR 코스닥` : `${ticker} OR 미국 증시 OR 연준 OR 금리`
-  return `https://news.google.com/rss/search?q=${encodeURIComponent(base)}&hl=ko&gl=KR&ceid=KR:ko`
+function normalizeTickerForNews(ticker: string) {
+  return ticker.replace(/\.(KS|KQ)$/i, '').trim().toUpperCase()
+}
+
+async function resolveNewsEntityTerms(ticker: string, market: Market) {
+  const normalizedTicker = normalizeTickerForNews(ticker)
+  const source = market === 'kr' ? koreaSymbols : await getSp500Symbols()
+  const found = source.find((item) => item.symbol.toUpperCase() === ticker.toUpperCase())
+  const nameTerms = [found?.nameKr, found?.name]
+    .filter((v): v is string => Boolean(v && v.trim().length > 0))
+    .map((v) => v.trim())
+  return {
+    tickerTerm: normalizedTicker,
+    nameTerms,
+  }
+}
+
+function buildNewsSearchQuery(tickerTerm: string, nameTerms: string[]) {
+  const terms = [tickerTerm, ...nameTerms]
+  // 종목/회사명 중심으로만 질의해 비관련 거시 기사 유입을 줄입니다.
+  const query = terms.map((term) => `"${term}"`).join(' OR ')
+  return `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=ko&gl=KR&ceid=KR:ko`
+}
+
+function isRelatedArticleTitle(title: string, tickerTerm: string, nameTerms: string[]) {
+  const normalizedTitle = title.toLowerCase()
+  if (normalizedTitle.includes(tickerTerm.toLowerCase())) return true
+  return nameTerms.some((term) => normalizedTitle.includes(term.toLowerCase()))
 }
 
 async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map<string, SentimentCacheValue>> {
@@ -304,7 +329,8 @@ async function fetchNewsWithSentiment(params: {
   to: string
   limit: number
 }) {
-  const feed = await rssParser.parseURL(buildNewsSearchQuery(params.ticker, params.market))
+  const { tickerTerm, nameTerms } = await resolveNewsEntityTerms(params.ticker, params.market)
+  const feed = await rssParser.parseURL(buildNewsSearchQuery(tickerTerm, nameTerms))
   const fromTs = new Date(`${params.from}T00:00:00Z`).getTime()
   const toTs = new Date(`${params.to}T23:59:59Z`).getTime()
   const rawItems =
@@ -325,6 +351,7 @@ async function fetchNewsWithSentiment(params: {
         const ts = item.publishedAt!.getTime()
         return ts >= fromTs && ts <= toTs
       })
+      .filter((item) => isRelatedArticleTitle(item.title, tickerTerm, nameTerms))
       .slice(0, params.limit) ?? []
 
   const sentimentMap = await enrichNewsSentiment(rawItems)

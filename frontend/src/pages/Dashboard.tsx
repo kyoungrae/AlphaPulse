@@ -115,6 +115,13 @@ type NewsFeatureResponse = {
     neutral_count: number
   }
   daily: NewsFeatureDaily[]
+  articles: Array<{
+    title: string
+    link?: string
+    source: string
+    publishedAt: string
+    sentiment: { label: string; score: number }
+  }>
 }
 
 type StrategyMode = 'long_only' | 'long_short' | 'swing' | 'intraday'
@@ -1196,6 +1203,35 @@ export default function Dashboard() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+              </div>
+              <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                <p className="text-xs uppercase tracking-[0.2em] text-blue-300">기사 샘플 (클릭 이동)</p>
+                <div className="mt-2 max-h-56 space-y-2 overflow-y-auto">
+                  {newsFeatures.articles?.length ? (
+                    newsFeatures.articles.map((item) => (
+                      <div key={`${item.publishedAt}-${item.title}`} className="rounded-lg border border-slate-800/70 bg-slate-900/40 px-2 py-1.5">
+                        {item.link ? (
+                          <a
+                            href={item.link}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-sm text-blue-300 hover:underline"
+                          >
+                            {item.title}
+                          </a>
+                        ) : (
+                          <p className="text-sm text-slate-200">{item.title}</p>
+                        )}
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          {item.source ?? '구글 뉴스'} · {item.publishedAt.slice(0, 10)} · {item.sentiment?.label ?? '중립'} (
+                          {item.sentiment?.score ?? 0})
+                        </p>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-xs text-slate-500">표시할 기사 데이터가 없습니다.</p>
+                  )}
                 </div>
               </div>
             </>
