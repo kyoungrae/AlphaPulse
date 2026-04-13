@@ -56,6 +56,12 @@ FEATURE_COLS: List[str] = [
   "vbp_support_gap",
   "vbp_resistance_gap",
   "vbp_node_strength",
+  "oil_price",
+  "usd_krw_exchange",
+  "us10y_yield",
+  "oil_return_5d",
+  "usd_krw_return_5d",
+  "us10y_delta_5d",
 ]
 
 MODEL_TTL_HOURS = 24
@@ -65,6 +71,7 @@ PRELOAD_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "JPM
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:4000").rstrip("/")
 NEWS_FEATURE_TIMEOUT_SECONDS = float(os.getenv("NEWS_FEATURE_TIMEOUT_SECONDS", "8"))
 NEWS_FEATURES_ENABLED = os.getenv("NEWS_FEATURES_ENABLED", "true").lower() != "false"
+MACRO_CACHE_TTL_MINUTES = 60
 
 
 @dataclass
@@ -78,6 +85,7 @@ class ModelBundle:
 
 MODEL_CACHE: Dict[str, ModelBundle] = {}
 PRICE_CACHE: Dict[Tuple[str, int], Tuple[pd.DataFrame, datetime]] = {}
+MACRO_CACHE: Dict[int, Tuple[pd.DataFrame, datetime]] = {}
 
 
 def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.DataFrame:
@@ -129,6 +137,52 @@ def load_news_feature_data(ticker: str, from_date: str, to_date: str) -> pd.Data
     return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
 
 
+def load_macro_feature_data(period_years: int = DATA_BASELINE_YEARS) -> pd.DataFrame:
+  cached = MACRO_CACHE.get(period_years)
+  if cached:
+    df_cached, loaded_at = cached
+    if datetime.now() - loaded_at < timedelta(minutes=MACRO_CACHE_TTL_MINUTES):
+      return df_cached.copy()
+
+  end = datetime.now()
+  start = end - timedelta(days=max(365, period_years * 365 + 30))
+  symbols = {
+    "oil_price": "CL=F",
+    "usd_krw_exchange": "KRW=X",
+    "us10y_yield": "^TNX",
+  }
+  merged: Optional[pd.DataFrame] = None
+  for col, ticker in symbols.items():
+    df = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=False)
+    if isinstance(df.columns, pd.MultiIndex):
+      df.columns = [c[0] for c in df.columns]
+    if "Close" not in df.columns:
+      continue
+    s = pd.to_numeric(df["Close"], errors="coerce").rename(col).to_frame()
+    merged = s if merged is None else merged.join(s, how="outer")
+
+  if merged is None or merged.empty:
+    return pd.DataFrame(
+      columns=[
+        "oil_price",
+        "usd_krw_exchange",
+        "us10y_yield",
+        "oil_return_5d",
+        "usd_krw_return_5d",
+        "us10y_delta_5d",
+      ]
+    )
+
+  merged.index = pd.to_datetime(merged.index).tz_localize(None)
+  merged = merged.sort_index().ffill()
+  merged["oil_return_5d"] = merged["oil_price"].pct_change(5)
+  merged["usd_krw_return_5d"] = merged["usd_krw_exchange"].pct_change(5)
+  merged["us10y_delta_5d"] = merged["us10y_yield"].diff(5)
+  merged = merged.fillna(0.0)
+  MACRO_CACHE[period_years] = (merged, datetime.now())
+  return merged.copy()
+
+
 def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
   df = df.copy()
   df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -169,6 +223,23 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df["news_sentiment_score"] = pd.to_numeric(merged["news_sentiment_score"], errors="coerce").fillna(0.0)
     df["news_volume"] = pd.to_numeric(merged["news_volume"], errors="coerce").fillna(0.0)
     df["event_keyword_count"] = pd.to_numeric(merged["event_keyword_count"], errors="coerce").fillna(0.0)
+
+  macro_df = load_macro_feature_data(DATA_BASELINE_YEARS)
+  if macro_df.empty:
+    df["oil_price"] = 0.0
+    df["usd_krw_exchange"] = 0.0
+    df["us10y_yield"] = 0.0
+    df["oil_return_5d"] = 0.0
+    df["usd_krw_return_5d"] = 0.0
+    df["us10y_delta_5d"] = 0.0
+  else:
+    merged_macro = df.join(macro_df, how="left")
+    df["oil_price"] = pd.to_numeric(merged_macro["oil_price"], errors="coerce").ffill().fillna(0.0)
+    df["usd_krw_exchange"] = pd.to_numeric(merged_macro["usd_krw_exchange"], errors="coerce").ffill().fillna(0.0)
+    df["us10y_yield"] = pd.to_numeric(merged_macro["us10y_yield"], errors="coerce").ffill().fillna(0.0)
+    df["oil_return_5d"] = pd.to_numeric(merged_macro["oil_return_5d"], errors="coerce").fillna(0.0)
+    df["usd_krw_return_5d"] = pd.to_numeric(merged_macro["usd_krw_return_5d"], errors="coerce").fillna(0.0)
+    df["us10y_delta_5d"] = pd.to_numeric(merged_macro["us10y_delta_5d"], errors="coerce").fillna(0.0)
 
   # Volume-by-price proxy features: approximate "물량대/평단대" 저항·지지 압력을 수치화
   typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
