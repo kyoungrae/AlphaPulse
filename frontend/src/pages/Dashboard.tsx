@@ -1,16 +1,21 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
+  ComposedChart,
   Line,
-  LineChart,
   CartesianGrid,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
+  useXAxisScale,
+  useYAxisScale,
 } from 'recharts'
 
 type CandlePoint = {
   date: string
+  open: number
+  high: number
+  low: number
   close: number
 }
 
@@ -113,12 +118,102 @@ function directionToKorean(direction: string) {
   return direction
 }
 
-function indicatorLabel(key: string) {
-  if (key === 'close') return '종가'
-  if (key === 'sma20') return 'SMA20'
-  if (key === 'bbUpper') return '볼린저 상단'
-  if (key === 'bbLower') return '볼린저 하단'
-  return key
+type ChartRow = {
+  date: string
+  tooltipLabel: string
+  open: number
+  high: number
+  low: number
+  close: number
+  sma20: number | null
+  bbUpper: number | null
+  bbLower: number | null
+}
+
+function CandlestickSeries({ data }: { data: ChartRow[] }) {
+  const xScale = useXAxisScale(0)
+  const yScale = useYAxisScale(0)
+  if (!xScale || !yScale || data.length === 0) return null
+
+  return (
+    <g className="recharts-candlesticks" aria-hidden>
+      {data.map((d, i) => {
+        const xMid = xScale(d.date, { position: 'middle' })
+        const xStart = xScale(d.date, { position: 'start' })
+        const xEnd = xScale(d.date, { position: 'end' })
+        if (xMid == null || xStart == null || xEnd == null) return null
+        const band = Math.max(2, xEnd - xStart)
+        const bodyW = Math.min(12, band * 0.65)
+        const yo = yScale(d.open)
+        const yc = yScale(d.close)
+        const yh = yScale(d.high)
+        const yl = yScale(d.low)
+        if (yo == null || yc == null || yh == null || yl == null) return null
+        const top = Math.min(yo, yc)
+        const bottom = Math.max(yo, yc)
+        const isUp = d.close >= d.open
+        const stroke = isUp ? '#34d399' : '#fb7185'
+        const fill = isUp ? '#059669' : '#e11d48'
+        return (
+          <g key={`${d.date}-${i}`}>
+            <line x1={xMid} x2={xMid} y1={yh} y2={yl} stroke={stroke} strokeWidth={1} />
+            <rect
+              x={xMid - bodyW / 2}
+              y={top}
+              width={bodyW}
+              height={Math.max(1, bottom - top)}
+              fill={fill}
+              stroke={stroke}
+              strokeWidth={1}
+            />
+          </g>
+        )
+      })}
+    </g>
+  )
+}
+
+function StockChartTooltip({
+  active,
+  payload,
+  priceCurrency,
+}: {
+  active?: boolean
+  payload?: ReadonlyArray<{ payload?: ChartRow }>
+  priceCurrency: DisplayCurrency
+}) {
+  if (!active || !payload?.length) return null
+  const row = payload[0].payload
+  if (!row) return null
+  return (
+    <div className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs shadow-lg" style={{ color: '#e5e7eb' }}>
+      <p className="font-medium text-slate-100">{row.tooltipLabel}</p>
+      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+        <span className="text-slate-500">시가</span>
+        <span className="text-right tabular-nums">{formatMoney(row.open, priceCurrency)}</span>
+        <span className="text-slate-500">고가</span>
+        <span className="text-right tabular-nums">{formatMoney(row.high, priceCurrency)}</span>
+        <span className="text-slate-500">저가</span>
+        <span className="text-right tabular-nums">{formatMoney(row.low, priceCurrency)}</span>
+        <span className="text-slate-500">종가</span>
+        <span className="text-right tabular-nums">{formatMoney(row.close, priceCurrency)}</span>
+        {row.sma20 != null && (
+          <>
+            <span className="text-slate-500">SMA20</span>
+            <span className="text-right tabular-nums">{formatMoney(row.sma20, priceCurrency)}</span>
+          </>
+        )}
+        {row.bbUpper != null && row.bbLower != null && (
+          <>
+            <span className="text-slate-500">볼린저</span>
+            <span className="text-right tabular-nums text-[10px] leading-tight">
+              {formatMoney(row.bbUpper, priceCurrency)} ~ {formatMoney(row.bbLower, priceCurrency)}
+            </span>
+          </>
+        )}
+      </div>
+    </div>
+  )
 }
 
 type NativeCurrency = 'usd' | 'krw'
@@ -286,7 +381,7 @@ export default function Dashboard() {
   }, [topSymbolsCsv])
   const { data: directions } = useFetch<DirectionsResponse>(directionsUrl)
 
-  const chartData = useMemo(() => {
+  const chartData = useMemo((): ChartRow[] => {
     if (!stock || stock.length === 0) return []
 
     const rate = fxData?.rate
@@ -326,6 +421,9 @@ export default function Dashboard() {
         })
       }
       const close = pt.close
+      const open = pt.open
+      const high = pt.high
+      const low = pt.low
       let sma20: number | null = null
       let bbUpper: number | null = null
       let bbLower: number | null = null
@@ -343,6 +441,9 @@ export default function Dashboard() {
       return {
         date,
         tooltipLabel,
+        open: toDisplay(open),
+        high: toDisplay(high),
+        low: toDisplay(low),
         close: toDisplay(close),
         sma20: sma20 != null ? toDisplay(sma20) : null,
         bbUpper: bbUpper != null ? toDisplay(bbUpper) : null,
@@ -351,6 +452,16 @@ export default function Dashboard() {
     })
     return result
   }, [stock, timeframe, nativeCurrency, priceCurrency, fxData?.rate])
+
+  const chartYDomain = useMemo((): [number, number] | undefined => {
+    if (!chartData.length) return undefined
+    const lows = chartData.map((d) => d.low)
+    const highs = chartData.map((d) => d.high)
+    const min = Math.min(...lows)
+    const max = Math.max(...highs)
+    const pad = Math.max((max - min) * 0.03, Math.abs(max) * 0.001 || 0.01)
+    return [min - pad, max + pad]
+  }, [chartData])
 
   const latestHistory = history?.items?.[0] ?? null
   const previousHistory = history?.items?.[1] ?? null
@@ -367,18 +478,6 @@ export default function Dashboard() {
     () => new Map((directions?.items ?? []).map((item) => [item.symbol, item.direction])),
     [directions],
   )
-  const formatTooltipValue = (value: unknown, name: unknown) => {
-    const numeric = typeof value === 'number' ? value : Number(value ?? 0)
-    return [formatMoney(numeric, priceCurrency), indicatorLabel(String(name))]
-  }
-  const formatTooltipLabel = (label: unknown, payload: unknown) => {
-    if (Array.isArray(payload) && payload.length > 0) {
-      const candidate = (payload[0] as { payload?: { tooltipLabel?: string } })?.payload?.tooltipLabel
-      if (candidate) return candidate
-    }
-    return String(label ?? '')
-  }
-
   return (
     <div className="space-y-6">
       <div>
@@ -692,7 +791,7 @@ export default function Dashboard() {
               <div className="flex h-full items-center justify-center text-slate-500">차트 데이터 없음</div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData}>
+                <ComposedChart data={chartData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
                   <XAxis
                     dataKey="date"
@@ -702,7 +801,7 @@ export default function Dashboard() {
                   />
                   <YAxis
                     tick={{ fill: '#cbd5f5', fontSize: 11 }}
-                    domain={['dataMin - 2', 'dataMax + 2']}
+                    domain={chartYDomain ?? ['auto', 'auto']}
                     tickFormatter={(value: number) =>
                       priceCurrency === 'krw'
                         ? Math.round(value).toLocaleString('ko-KR')
@@ -710,25 +809,16 @@ export default function Dashboard() {
                     }
                   />
                   <Tooltip
-                    formatter={formatTooltipValue as never}
-                    labelFormatter={formatTooltipLabel as never}
-                    contentStyle={{
-                      background: '#0f172a',
-                      border: '1px solid #1f2937',
-                      color: '#e5e7eb',
-                    }}
+                    content={(tooltipProps) => (
+                      <StockChartTooltip {...tooltipProps} priceCurrency={priceCurrency} />
+                    )}
+                    cursor={{ strokeDasharray: '3 3' }}
                   />
-                  <Line
-                    type="monotone"
-                    dataKey="close"
-                    stroke="#38bdf8"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                  <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.5} dot={false} />
-                  <Line type="monotone" dataKey="bbUpper" stroke="#a78bfa" strokeWidth={1.2} dot={false} />
-                  <Line type="monotone" dataKey="bbLower" stroke="#a78bfa" strokeWidth={1.2} dot={false} />
-                </LineChart>
+                  <CandlestickSeries data={chartData} />
+                  <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.5} dot={false} connectNulls />
+                  <Line type="monotone" dataKey="bbUpper" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />
+                  <Line type="monotone" dataKey="bbLower" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />
+                </ComposedChart>
               </ResponsiveContainer>
             )}
           </div>

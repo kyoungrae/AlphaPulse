@@ -37,6 +37,9 @@ app.use(express.json())
 
 const CandleSchema = z.object({
   date: z.date(),
+  open: z.number(),
+  high: z.number(),
+  low: z.number(),
   close: z.number(),
 })
 
@@ -657,7 +660,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
     return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
   }
   const timeframe = (normalizeSingle(req.query.timeframe as string | string[] | undefined) ?? 'month').toLowerCase()
-  const stockCacheKey = `${ticker}:${timeframe}`
+  const stockCacheKey = `${ticker}:${timeframe}:ohlc-v1`
   const stockCached = stockCache.get(stockCacheKey)
   if (stockCached && Date.now() - stockCached.cachedAt < STOCK_CACHE_TTL_MS) {
     return res.json(stockCached.data)
@@ -685,9 +688,30 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
 
     const result =
       candles?.quotes
-        ?.filter((q) => q.close != null && q.date != null)
-        .map((q) => CandleSchema.parse({ date: q.date, close: q.close }))
-        .map((q) => ({ date: q.date.toISOString(), close: q.close })) ?? []
+        ?.filter(
+          (q) =>
+            q.close != null &&
+            q.date != null &&
+            q.open != null &&
+            q.high != null &&
+            q.low != null,
+        )
+        .map((q) =>
+          CandleSchema.parse({
+            date: q.date!,
+            open: q.open!,
+            high: q.high!,
+            low: q.low!,
+            close: q.close!,
+          }),
+        )
+        .map((q) => ({
+          date: q.date.toISOString(),
+          open: q.open,
+          high: q.high,
+          low: q.low,
+          close: q.close,
+        })) ?? []
 
     stockCache.set(stockCacheKey, { data: result, cachedAt: Date.now() })
     res.json(result)
