@@ -31,6 +31,13 @@ const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
 const CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
 const S_AND_P_500_CSV_URL = 'https://datahub.io/core/s-and-p-500-companies/r/constituents.csv'
 const yahooFinance = new YahooFinance()
+const KIS_APP_KEY = process.env.KIS_APP_KEY
+const KIS_APP_SECRET = process.env.KIS_APP_SECRET
+const KIS_URL_BASE = (process.env.KIS_URL_BASE || 'https://openapi.koreainvestment.com:9443').replace(/\/+$/, '')
+const KIS_TIMEOUT_MS = Math.max(2000, Number(process.env.KIS_TIMEOUT_MS ?? 10000))
+const KIS_RETRY_MAX_ATTEMPTS = Math.min(5, Math.max(1, Number(process.env.KIS_RETRY_MAX_ATTEMPTS ?? 3)))
+const KIS_RETRY_BASE_MS = Math.max(100, Number(process.env.KIS_RETRY_BASE_MS ?? 350))
+const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
 
 type Market = 'us' | 'kr'
 type PredictionDirection = 'Up' | 'Down'
@@ -51,6 +58,141 @@ type PredictionRecord = {
   source: 'backfill-script'
 }
 
+type RebackfillMode = 'outcome-only' | 'full-recompute'
+
+function isKoreanTicker(ticker: string): boolean {
+  return /\.(KS|KQ)$/i.test(ticker)
+}
+
+function ymdToCompact(ymd: string): string {
+  return ymd.replace(/-/g, '')
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isKisRetryableErrorMessage(message: string): boolean {
+  return (
+    message.includes('EGW00201') ||
+    message.includes('초당 거래건수') ||
+    message.includes('429') ||
+    message.includes('503')
+  )
+}
+
+async function getKisAccessToken(): Promise<string> {
+  if (!KIS_APP_KEY || !KIS_APP_SECRET) {
+    throw new Error('KIS_APP_KEY/KIS_APP_SECRET is not configured')
+  }
+  const now = Date.now()
+  if (kisTokenCache.token && now < kisTokenCache.expiresAtMs) {
+    return kisTokenCache.token
+  }
+  const response = await fetch(`${KIS_URL_BASE}/oauth2/tokenP`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      appkey: KIS_APP_KEY,
+      appsecret: KIS_APP_SECRET,
+    }),
+    signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+  })
+  if (!response.ok) {
+    throw new Error(`KIS token error: ${response.status} ${await response.text()}`)
+  }
+  const json = (await response.json()) as { access_token?: string }
+  if (!json.access_token) throw new Error('KIS token missing in response')
+  kisTokenCache.token = json.access_token
+  kisTokenCache.expiresAtMs = now + 1000 * 60 * 60 * 23
+  return json.access_token
+}
+
+async function fetchKisDailyCloses(ticker: string, fromYmd: string, toYmd: string): Promise<Array<{ date: string; close: number }>> {
+  let lastError: Error | null = null
+  for (let attempt = 1; attempt <= KIS_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const token = await getKisAccessToken()
+      const code = ticker.toUpperCase().split('.')[0]
+      const params = new URLSearchParams({
+        FID_COND_MRKT_DIV_CODE: 'J',
+        FID_INPUT_ISCD: code,
+        FID_INPUT_DATE_1: ymdToCompact(fromYmd),
+        FID_INPUT_DATE_2: ymdToCompact(toYmd),
+        FID_PERIOD_DIV_CODE: 'D',
+        FID_ORG_ADJ_PRC: '1',
+      })
+      const response = await fetch(
+        `${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice?${params.toString()}`,
+        {
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            authorization: `Bearer ${token}`,
+            appkey: KIS_APP_KEY || '',
+            appsecret: KIS_APP_SECRET || '',
+            tr_id: 'FHKST03010100',
+          },
+          signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+        },
+      )
+      if (!response.ok) {
+        throw new Error(`KIS price error: ${response.status} ${await response.text()}`)
+      }
+      const payload = (await response.json()) as { rt_cd?: string; msg1?: string; output2?: Array<Record<string, string>> }
+      if (payload.rt_cd !== '0' || !Array.isArray(payload.output2)) {
+        throw new Error(`KIS price failed: ${payload.msg1 ?? 'unknown'}`)
+      }
+      return payload.output2
+        .map((row) => ({
+          date: String(row.stck_bsop_date ?? '').replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3'),
+          close: Number(row.stck_clpr),
+        }))
+        .filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date) && Number.isFinite(row.close))
+        .sort((a, b) => a.date.localeCompare(b.date))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      lastError = err instanceof Error ? err : new Error(message)
+      const retryable = isKisRetryableErrorMessage(message)
+      if (!retryable || attempt >= KIS_RETRY_MAX_ATTEMPTS) {
+        throw lastError
+      }
+      const waitMs = KIS_RETRY_BASE_MS * 2 ** (attempt - 1)
+      await sleep(waitMs)
+    }
+  }
+  throw lastError ?? new Error('KIS price failed: unknown')
+}
+
+async function fetchYahooDailyCloses(ticker: string, period1: Date, period2: Date): Promise<Array<{ date: string; close: number }>> {
+  const quotes = await yahooFinance.chart(ticker, {
+    period1,
+    period2,
+    interval: '1d',
+  })
+  return (
+    quotes.quotes
+      ?.filter((q) => q.close != null && q.date != null)
+      .map((q) => ({
+        date: q.date!.toISOString().slice(0, 10),
+        close: Number(q.close),
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date)) ?? []
+  )
+}
+
+async function fetchDailyClosesPreferKis(ticker: string, period1: Date, period2: Date): Promise<Array<{ date: string; close: number }>> {
+  if (isKoreanTicker(ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
+    try {
+      return await fetchKisDailyCloses(ticker, period1.toISOString().slice(0, 10), period2.toISOString().slice(0, 10))
+    } catch (err) {
+      console.warn(`[KIS] close price fallback to Yahoo: ${ticker}`, err)
+      return await fetchYahooDailyCloses(ticker, period1, period2)
+    }
+  }
+  return await fetchYahooDailyCloses(ticker, period1, period2)
+}
+
 async function resolveOutcomeForPrediction(record: PredictionRecord): Promise<{
   actualDate: string
   actualDirection: PredictionDirection
@@ -61,19 +203,7 @@ async function resolveOutcomeForPrediction(record: PredictionRecord): Promise<{
   const baseDate = new Date(`${record.predictionDate}T00:00:00Z`)
   const period1 = new Date(baseDate)
   period1.setUTCDate(period1.getUTCDate() - 3)
-  const quotes = await yahooFinance.chart(record.ticker, {
-    period1,
-    period2: today,
-    interval: '1d',
-  })
-  const normalized =
-    quotes.quotes
-      ?.filter((q) => q.close != null && q.date != null)
-      .map((q) => ({
-        date: q.date!.toISOString().slice(0, 10),
-        close: Number(q.close),
-      }))
-      .sort((a, b) => a.date.localeCompare(b.date)) ?? []
+  const normalized = await fetchDailyClosesPreferKis(record.ticker, period1, today)
 
   const basePoint = normalized.find((q) => q.date === record.predictionDate)
   const nextPoint = normalized.find((q) => q.date > record.predictionDate)
@@ -94,19 +224,8 @@ async function fetchCloseOnDate(ticker: string, dateIso: string): Promise<number
   period1.setUTCDate(period1.getUTCDate() - 3)
   const period2 = new Date(target)
   period2.setUTCDate(period2.getUTCDate() + 1)
-  const quotes = await yahooFinance.chart(ticker, {
-    period1,
-    period2,
-    interval: '1d',
-  })
-  const row =
-    quotes.quotes
-      ?.filter((q) => q.close != null && q.date != null)
-      .map((q) => ({
-        date: q.date!.toISOString().slice(0, 10),
-        close: Number(q.close),
-      }))
-      .find((q) => q.date === dateIso) ?? null
+  const closes = await fetchDailyClosesPreferKis(ticker, period1, period2)
+  const row = closes.find((q) => q.date === dateIso) ?? null
   return row ? Number(row.close.toFixed(2)) : null
 }
 
@@ -214,27 +333,64 @@ async function processOneDate(
   ticker: string,
   targetDate: string,
   market: Market,
+  options?: { mode?: RebackfillMode },
 ): Promise<void> {
-  const predict = await fetchPredict(ticker, targetDate)
-  const historicalClose = await fetchCloseOnDate(ticker, targetDate)
-  const record: PredictionRecord = {
-    ticker,
-    market,
-    predictionDate: targetDate,
-    predictedDirection: predict.direction,
-    probabilityUp: Number(predict.probability_up.toFixed(4)),
-    baseClose: historicalClose ?? Number(predict.last_close.toFixed(2)),
-    targetDateExpected: getNextWeekday(targetDate),
-    modelTrainedAt: predict.model_trained_at,
-    cvAccuracy: predict.cv_accuracy,
-    cvPrecision: predict.cv_precision,
-    reasonSummary: predict.reason_summary,
-    outcomeStatus: 'pending',
-    source: 'backfill-script',
+  const mode: RebackfillMode = options?.mode ?? 'full-recompute'
+  const docRef = db.collection('predictions_v2').doc(ticker.toUpperCase())
+  const existingData = (await docRef.get()).data() as Record<string, unknown> | undefined
+  const existingRow = (existingData?.[targetDate] as Record<string, unknown> | undefined) ?? undefined
+
+  let record: PredictionRecord
+  if (
+    mode === 'outcome-only' &&
+    existingRow &&
+    typeof existingRow.predictedDirection === 'string' &&
+    typeof existingRow.probabilityUp === 'number' &&
+    typeof existingRow.baseClose === 'number'
+  ) {
+    record = {
+      ticker,
+      market:
+        existingRow.market === 'kr' || existingRow.market === 'us'
+          ? (existingRow.market as Market)
+          : market,
+      predictionDate: targetDate,
+      predictedDirection: existingRow.predictedDirection === 'Down' ? 'Down' : 'Up',
+      probabilityUp: Number(existingRow.probabilityUp),
+      baseClose: Number(existingRow.baseClose),
+      targetDateExpected:
+        typeof existingRow.targetDateExpected === 'string' ? existingRow.targetDateExpected : getNextWeekday(targetDate),
+      modelTrainedAt: typeof existingRow.modelTrainedAt === 'string' ? existingRow.modelTrainedAt : undefined,
+      cvAccuracy: typeof existingRow.cvAccuracy === 'number' ? existingRow.cvAccuracy : undefined,
+      cvPrecision: typeof existingRow.cvPrecision === 'number' ? existingRow.cvPrecision : undefined,
+      reasonSummary: typeof existingRow.reasonSummary === 'string' ? existingRow.reasonSummary : undefined,
+      outcomeStatus: 'pending',
+      source: 'backfill-script',
+    }
+  } else {
+    const predict = await fetchPredict(ticker, targetDate)
+    const historicalClose = await fetchCloseOnDate(ticker, targetDate)
+    record = {
+      ticker,
+      market,
+      predictionDate: targetDate,
+      predictedDirection: predict.direction,
+      probabilityUp: Number(predict.probability_up.toFixed(4)),
+      baseClose: historicalClose ?? Number(predict.last_close.toFixed(2)),
+      targetDateExpected: getNextWeekday(targetDate),
+      modelTrainedAt: predict.model_trained_at,
+      cvAccuracy: predict.cv_accuracy,
+      cvPrecision: predict.cv_precision,
+      reasonSummary: predict.reason_summary,
+      outcomeStatus: 'pending',
+      source: 'backfill-script',
+    }
   }
   const outcome = await resolveOutcomeForPrediction(record)
+  const preserved = existingRow ?? {}
   const enrichedRecord = outcome
     ? {
+        ...preserved,
         ...record,
         outcomeStatus: 'resolved' as const,
         actualDate: outcome.actualDate,
@@ -243,7 +399,7 @@ async function processOneDate(
         isCorrect: outcome.isCorrect,
         resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
       }
-    : record
+    : { ...preserved, ...record }
   await db
     .collection('predictions_v2')
     .doc(ticker.toUpperCase())
@@ -257,7 +413,7 @@ async function processOneDate(
       },
       { merge: true },
     )
-  console.log(`OK ${ticker} → ${targetDate} (모델 last_date=${predict.last_date})`)
+  console.log(`OK ${ticker} → ${targetDate} (mode=${mode}, predictionDate=${record.predictionDate})`)
 }
 
 function parseCsvRow(row: string): string[] {
@@ -325,6 +481,7 @@ function parseArgs() {
   let sp500 = false
   let sp500Limit = 50
   let rebackfillFromDoc: string | null = null
+  let rebackfillMode: RebackfillMode = 'outcome-only'
 
   for (const arg of raw) {
     if (arg === '--yesterday') {
@@ -343,6 +500,8 @@ function parseArgs() {
       sp500Limit = Math.max(1, Number(arg.slice('--limit='.length)) || 50)
     } else if (arg.startsWith('--rebackfill-from-doc=')) {
       rebackfillFromDoc = arg.slice('--rebackfill-from-doc='.length).trim().toUpperCase()
+    } else if (arg === '--recompute-prediction') {
+      rebackfillMode = 'full-recompute'
     } else if (arg === '--help' || arg === '-h') {
       console.log(`
 백필: predictions_v2/{티커} 문서에 [날짜] 키로 예측 레코드 저장
@@ -351,7 +510,9 @@ function parseArgs() {
   --date=YYYY-MM-DD    위와 같이 특정 날짜로 저장 (권장: 배치가 빠진 날)
   --rebackfill-from-doc=TICKER
                        해당 티커 문서에 이미 있는 모든 YYYY-MM-DD 키를 다시 백필
-                       (as_of 상승 확률·기준일 종가·실측 가능 시 outcome 갱신)
+                       (기본: 기존 예측값 유지 + 실측값만 갱신)
+  --recompute-prediction
+                       --rebackfill-from-doc 시 예측값까지 다시 계산해서 덮어씀
   --market=us|kr       기본 us (--rebackfill-from-doc 시 생략하면 문서에 저장된 market 사용)
   --symbols=A,B,C      쉼표로 구분 (미지정 시 AAPL 또는 005930.KS 단일 종목)
   --sp500              미국 시장일 때 S&P500 상위 --limit 종목
@@ -370,6 +531,7 @@ function parseArgs() {
     return {
       mode: 'rebackfill' as const,
       rebackfillTicker: rebackfillFromDoc,
+      rebackfillMode,
       market,
       marketFromArg,
       symbolsStr,
@@ -416,14 +578,14 @@ async function main() {
     }
     const market: Market = parsed.marketFromArg ? parsed.market : inferMarketFromDoc(data)
     console.log(
-      `재백필: ${ticker}, 날짜 ${dates.length}개 (${dates[0]} … ${dates[dates.length - 1]}), market=${market}`,
+      `재백필: ${ticker}, 날짜 ${dates.length}개 (${dates[0]} … ${dates[dates.length - 1]}), market=${market}, mode=${parsed.rebackfillMode}`,
     )
 
     let ok = 0
     let fail = 0
     await runInBatches(dates, CONCURRENCY, async (targetDate) => {
       try {
-        await processOneDate(db, ticker, targetDate, market)
+        await processOneDate(db, ticker, targetDate, market, { mode: parsed.rebackfillMode })
         ok += 1
       } catch (err) {
         console.error(`FAIL ${ticker} ${targetDate}`, err)

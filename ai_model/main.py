@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from dotenv import load_dotenv
 import pandas as pd
 import requests
 import yfinance as yf
@@ -49,6 +50,8 @@ except Exception:  # pragma: no cover - optional dependency
   shap = None
 
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 app = FastAPI(title="AlphaPulse 예측 서버", version="0.1.0")
 
@@ -578,7 +581,10 @@ def get_finbert_pipeline():
     return FINBERT_PIPELINE["tokenizer"], FINBERT_PIPELINE["model"], FINBERT_PIPELINE["device"]
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
-  model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL).to(device)
+  model = AutoModelForSequenceClassification.from_pretrained(
+    FINBERT_MODEL,
+    low_cpu_mem_usage=False,
+  ).to(device)
   model.eval()
   FINBERT_PIPELINE["tokenizer"] = tokenizer
   FINBERT_PIPELINE["model"] = model

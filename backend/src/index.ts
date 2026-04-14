@@ -52,6 +52,12 @@ const STOCK_CACHE_TTL_MS = 1000 * 60 * 5
 const PREDICT_CACHE_TTL_MS = 1000 * 60 * 2
 const FX_CACHE_TTL_MS = 1000 * 60 * 10
 const redisUrl = process.env.REDIS_URL
+const KIS_APP_KEY = process.env.KIS_APP_KEY
+const KIS_APP_SECRET = process.env.KIS_APP_SECRET
+const KIS_URL_BASE = (process.env.KIS_URL_BASE || 'https://openapi.koreainvestment.com:9443').replace(/\/+$/, '')
+const KIS_TIMEOUT_MS = Math.max(2000, Number(process.env.KIS_TIMEOUT_MS ?? 10000))
+const KIS_RETRY_MAX_ATTEMPTS = Math.min(5, Math.max(1, Number(process.env.KIS_RETRY_MAX_ATTEMPTS ?? 3)))
+const KIS_RETRY_BASE_MS = Math.max(100, Number(process.env.KIS_RETRY_BASE_MS ?? 350))
 
 app.use(cors())
 app.use(express.json())
@@ -215,6 +221,7 @@ const stockCache = new Map<string, CacheEntry<{ date: string; close: number }[]>
 const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
 const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
+const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
 const redisClient = redisUrl ? createClient({ url: redisUrl }) : null
 if (redisClient) {
   redisClient.connect().catch((err: unknown) => {
@@ -360,6 +367,143 @@ function isWeekendYmdInTz(ymd: string, timeZone: string): boolean {
     cursor = new Date(cursor.getTime() - 60 * 60 * 1000)
   }
   return false
+}
+
+function isKoreanTicker(ticker: string): boolean {
+  return /\.(KS|KQ)$/i.test(ticker)
+}
+
+function ymdToCompact(ymd: string): string {
+  return ymd.replace(/-/g, '')
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isKisRetryableErrorMessage(message: string): boolean {
+  return (
+    message.includes('EGW00201') ||
+    message.includes('초당 거래건수') ||
+    message.includes('429') ||
+    message.includes('503')
+  )
+}
+
+async function getKisAccessToken(): Promise<string> {
+  if (!KIS_APP_KEY || !KIS_APP_SECRET) {
+    throw new Error('KIS_APP_KEY/KIS_APP_SECRET is not configured')
+  }
+  const now = Date.now()
+  if (kisTokenCache.token && now < kisTokenCache.expiresAtMs) {
+    return kisTokenCache.token
+  }
+  const response = await fetch(`${KIS_URL_BASE}/oauth2/tokenP`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      appkey: KIS_APP_KEY,
+      appsecret: KIS_APP_SECRET,
+    }),
+    signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+  })
+  if (!response.ok) {
+    throw new Error(`KIS token error: ${response.status} ${await response.text()}`)
+  }
+  const json = (await response.json()) as { access_token?: string }
+  if (!json.access_token) throw new Error('KIS token missing in response')
+  kisTokenCache.token = json.access_token
+  kisTokenCache.expiresAtMs = now + 1000 * 60 * 60 * 23
+  return json.access_token
+}
+
+async function fetchKisDailyCloses(
+  ticker: string,
+  fromYmd: string,
+  toYmd: string,
+): Promise<Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>> {
+  let lastError: Error | null = null
+  for (let attempt = 1; attempt <= KIS_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const token = await getKisAccessToken()
+      const code = ticker.toUpperCase().split('.')[0]
+      const params = new URLSearchParams({
+        FID_COND_MRKT_DIV_CODE: 'J',
+        FID_INPUT_ISCD: code,
+        FID_INPUT_DATE_1: ymdToCompact(fromYmd),
+        FID_INPUT_DATE_2: ymdToCompact(toYmd),
+        FID_PERIOD_DIV_CODE: 'D',
+        FID_ORG_ADJ_PRC: '1',
+      })
+      const response = await fetch(
+        `${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice?${params.toString()}`,
+        {
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            authorization: `Bearer ${token}`,
+            appkey: KIS_APP_KEY || '',
+            appsecret: KIS_APP_SECRET || '',
+            tr_id: 'FHKST03010100',
+          },
+          signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+        },
+      )
+      if (!response.ok) {
+        throw new Error(`KIS price error: ${response.status} ${await response.text()}`)
+      }
+      const payload = (await response.json()) as { rt_cd?: string; msg1?: string; output2?: Array<Record<string, string>> }
+      if (payload.rt_cd !== '0' || !Array.isArray(payload.output2)) {
+        throw new Error(`KIS price failed: ${payload.msg1 ?? 'unknown'}`)
+      }
+      return payload.output2
+        .map((row) => ({
+          date: String(row.stck_bsop_date ?? '').replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3'),
+          open: Number(row.stck_oprc),
+          high: Number(row.stck_hgpr),
+          low: Number(row.stck_lwpr),
+          close: Number(row.stck_clpr),
+          volume: Number(row.acml_vol),
+        }))
+        .filter(
+          (row) =>
+            /^\d{4}-\d{2}-\d{2}$/.test(row.date) &&
+            Number.isFinite(row.open) &&
+            Number.isFinite(row.high) &&
+            Number.isFinite(row.low) &&
+            Number.isFinite(row.close) &&
+            Number.isFinite(row.volume),
+        )
+        .sort((a, b) => a.date.localeCompare(b.date))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      lastError = err instanceof Error ? err : new Error(message)
+      const retryable = isKisRetryableErrorMessage(message)
+      if (!retryable || attempt >= KIS_RETRY_MAX_ATTEMPTS) {
+        throw lastError
+      }
+      const waitMs = KIS_RETRY_BASE_MS * 2 ** (attempt - 1)
+      await sleep(waitMs)
+    }
+  }
+  throw lastError ?? new Error('KIS price failed: unknown')
+}
+
+async function fetchYahooDailyCloses(ticker: string, period1: Date, period2: Date): Promise<Array<{ date: string; close: number }>> {
+  const quotes = await yahooFinance.chart(ticker, {
+    period1,
+    period2,
+    interval: '1d',
+  })
+  return (
+    quotes.quotes
+      ?.filter((q) => q.close != null && q.date != null)
+      .map((q) => ({
+        date: q.date!.toISOString().slice(0, 10),
+        close: Number(q.close),
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date)) ?? []
+  )
 }
 
 function toKoreanSentimentLabel(label: string): NewsSentimentLabel {
@@ -734,19 +878,33 @@ async function loadHistoricalCandles(
   fromDate?: string,
   toDate?: string,
 ): Promise<CandlePoint[]> {
-  const period2 = toDate ? new Date(`${toDate}T23:59:59Z`) : new Date()
-  const period1 = fromDate
-    ? new Date(`${fromDate}T00:00:00Z`)
-    : (() => {
-        const p = new Date(period2)
-        p.setFullYear(p.getFullYear() - BACKTEST_DEFAULT_LOOKBACK_YEARS)
-        return p
-      })()
-  const candles = await yahooFinance.chart(ticker, {
-    period1,
-    period2,
-    interval: '1d',
-  })
+  const toStr = toDate ?? new Date().toISOString().slice(0, 10)
+  const fromStr =
+    fromDate ??
+    (() => {
+      const p = new Date(`${toStr}T00:00:00Z`)
+      p.setUTCFullYear(p.getUTCFullYear() - BACKTEST_DEFAULT_LOOKBACK_YEARS)
+      return p.toISOString().slice(0, 10)
+    })()
+
+  if (isKoreanTicker(ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
+    try {
+      const kisData = await fetchKisDailyCloses(ticker, fromStr, toStr)
+      return kisData.map((q) => ({
+        date: q.date,
+        open: q.open,
+        high: q.high,
+        low: q.low,
+        close: q.close,
+      }))
+    } catch (err) {
+      console.warn(`[KIS] loadHistoricalCandles fallback to Yahoo for ${ticker}`, err)
+    }
+  }
+
+  const period1 = new Date(`${fromStr}T00:00:00Z`)
+  const period2 = new Date(`${toStr}T23:59:59Z`)
+  const candles = await yahooFinance.chart(ticker, { period1, period2, interval: '1d' })
   return (
     candles.quotes
       ?.filter((q) => q.open != null && q.close != null && q.date != null)
@@ -963,19 +1121,17 @@ async function resolveOutcomeForPrediction(record: PredictionRecord): Promise<{
   const baseDate = new Date(`${record.predictionDate}T00:00:00Z`)
   const period1 = new Date(baseDate)
   period1.setUTCDate(period1.getUTCDate() - 3)
-  const quotes = await yahooFinance.chart(record.ticker, {
-    period1,
-    period2: today,
-    interval: '1d',
-  })
-  const normalized =
-    quotes.quotes
-      ?.filter((q) => q.close != null && q.date != null)
-      .map((q) => ({
-        date: q.date!.toISOString().slice(0, 10),
-        close: Number(q.close),
-      }))
-      .sort((a, b) => a.date.localeCompare(b.date)) ?? []
+  let normalized: Array<{ date: string; close: number }> = []
+  if (isKoreanTicker(record.ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
+    try {
+      normalized = await fetchKisDailyCloses(record.ticker, period1.toISOString().slice(0, 10), today.toISOString().slice(0, 10))
+    } catch (err) {
+      console.warn(`[KIS] outcome price fallback to Yahoo: ${record.ticker}`, err)
+      normalized = await fetchYahooDailyCloses(record.ticker, period1, today)
+    }
+  } else {
+    normalized = await fetchYahooDailyCloses(record.ticker, period1, today)
+  }
 
   const basePoint = normalized.find((q) => q.date === record.predictionDate)
   const nextPoint = normalized.find((q) => q.date > record.predictionDate)
@@ -1293,44 +1449,66 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
       hour: { interval: '5m', daysBack: 1 },
     }
     const selected = rangeByTimeframe[timeframe] ?? rangeByTimeframe.month
-    const period2 = new Date()
-    const period1 = new Date(period2)
-    period1.setDate(period2.getDate() - selected.daysBack)
-    const candles = await yahooFinance.chart(ticker, {
-      period1,
-      period2,
-      interval: selected.interval,
-    })
+    let result: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }> = []
 
-    const result =
-      candles?.quotes
-        ?.filter(
-          (q) =>
-            q.close != null &&
-            q.date != null &&
-            q.open != null &&
-            q.high != null &&
-            q.low != null &&
-            q.volume != null,
-        )
-        .map((q) =>
-          CandleSchema.parse({
-            date: q.date!,
-            open: q.open!,
-            high: q.high!,
-            low: q.low!,
-            close: q.close!,
-            volume: q.volume!,
-          }),
-        )
-        .map((q) => ({
-          date: q.date.toISOString(),
+    if (selected.interval === '1d' && isKoreanTicker(ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
+      const toDate = new Date().toISOString().slice(0, 10)
+      const fromDate = new Date(Date.now() - selected.daysBack * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      try {
+        const kisData = await fetchKisDailyCloses(ticker, fromDate, toDate)
+        result = kisData.map((q) => ({
+          date: `${q.date}T00:00:00.000Z`,
           open: q.open,
           high: q.high,
           low: q.low,
           close: q.close,
           volume: q.volume,
-        })) ?? []
+        }))
+      } catch (err) {
+        console.warn(`[KIS] stock chart fallback to Yahoo for ${ticker}`, err)
+      }
+    }
+
+    if (result.length === 0) {
+      const period2 = new Date()
+      const period1 = new Date(period2)
+      period1.setDate(period2.getDate() - selected.daysBack)
+      const candles = await yahooFinance.chart(ticker, {
+        period1,
+        period2,
+        interval: selected.interval,
+      })
+
+      result =
+        candles?.quotes
+          ?.filter(
+            (q) =>
+              q.close != null &&
+              q.date != null &&
+              q.open != null &&
+              q.high != null &&
+              q.low != null &&
+              q.volume != null,
+          )
+          .map((q) =>
+            CandleSchema.parse({
+              date: q.date!,
+              open: q.open!,
+              high: q.high!,
+              low: q.low!,
+              close: q.close!,
+              volume: q.volume!,
+            }),
+          )
+          .map((q) => ({
+            date: q.date.toISOString(),
+            open: q.open,
+            high: q.high,
+            low: q.low,
+            close: q.close,
+            volume: q.volume,
+          })) ?? []
+    }
 
     stockCache.set(stockCacheKey, { data: result, cachedAt: Date.now() })
     await setRedisJson(redisStockKey, result, Math.floor(STOCK_CACHE_TTL_MS / 1000))
