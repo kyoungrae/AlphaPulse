@@ -574,14 +574,16 @@ def get_finbert_pipeline():
     raise RuntimeError("FINBERT_ENABLED=false")
   if torch is None or AutoTokenizer is None or AutoModelForSequenceClassification is None:
     raise RuntimeError("transformers/torch 패키지가 설치되지 않았습니다.")
-  if "tokenizer" in FINBERT_PIPELINE and "model" in FINBERT_PIPELINE:
-    return FINBERT_PIPELINE["tokenizer"], FINBERT_PIPELINE["model"]
+  if "tokenizer" in FINBERT_PIPELINE and "model" in FINBERT_PIPELINE and "device" in FINBERT_PIPELINE:
+    return FINBERT_PIPELINE["tokenizer"], FINBERT_PIPELINE["model"], FINBERT_PIPELINE["device"]
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
-  model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
+  model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL).to(device)
   model.eval()
   FINBERT_PIPELINE["tokenizer"] = tokenizer
   FINBERT_PIPELINE["model"] = model
-  return tokenizer, model
+  FINBERT_PIPELINE["device"] = device
+  return tokenizer, model, device
 
 
 @app.on_event("startup")
@@ -699,8 +701,8 @@ def analyze_sentiment_batch(payload: SentimentAnalyzeRequest):
   if not titles:
     return SentimentAnalyzeResponse(data=[])
   try:
-    tokenizer, model = get_finbert_pipeline()
-    inputs = tokenizer(titles, padding=True, truncation=True, return_tensors="pt")
+    tokenizer, model, device = get_finbert_pipeline()
+    inputs = tokenizer(titles, padding=True, truncation=True, return_tensors="pt").to(device)
     with torch.no_grad():
       outputs = model(**inputs)
       scores = torch.softmax(outputs.logits, dim=1)
