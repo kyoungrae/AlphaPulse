@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiUrl } from '../apiBase'
+import { usePredictionHistory } from '../usePredictionHistory'
 
 type SymbolItem = {
   symbol: string
@@ -11,21 +12,6 @@ type SymbolResponse = {
   market?: 'us' | 'kr'
   total?: number
   items: SymbolItem[]
-}
-
-type HistoryItem = {
-  predictionDate: string
-  predictedDirection: 'Up' | 'Down'
-  probabilityUp: number
-  probabilityDelta: number | null
-  actualDirection: 'Up' | 'Down' | null
-  actualDate: string | null
-  isCorrect: boolean | null
-}
-
-type HistoryResponse = {
-  ticker: string
-  items: HistoryItem[]
 }
 
 type StrategyMode = 'long_only' | 'long_short' | 'swing' | 'intraday'
@@ -201,9 +187,7 @@ export default function StockPrediction() {
     data: history,
     loading,
     error,
-  } = useFetch<HistoryResponse>(
-    apiUrl(`/api/predictions/history/${encodeURIComponent(selected)}?limit=30`),
-  )
+  } = usePredictionHistory(selected, 30)
   const {
     data: summary,
     loading: summaryLoading,

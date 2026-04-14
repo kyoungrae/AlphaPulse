@@ -32,6 +32,10 @@ const DAILY_CLOSE_SCHEDULER_MS = Math.max(
 )
 const DAILY_JOB_CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
 const DAILY_JOB_SYMBOL_LIMIT = Math.max(1, Number(process.env.DAILY_JOB_SYMBOL_LIMIT ?? 500))
+/** Startup backfill: look back N calendar days per market TZ excluding today (default 7, max 14). */
+const STARTUP_CATCHUP_DAYS = Math.max(1, Math.min(14, Number(process.env.STARTUP_CATCHUP_DAYS ?? 7)))
+const STARTUP_CATCHUP_DISABLED =
+  process.env.DISABLE_STARTUP_CATCHUP === 'true' || process.env.DISABLE_STARTUP_CATCHUP === '1'
 const BACKTEST_CACHE_TTL_MS = 1000 * 60 * 60 * 6
 /** AI 예측 서버(10년 학습)와 맞추기 위한 백테스트·전략 요약 기본 조회 기간 */
 const BACKTEST_DEFAULT_LOOKBACK_YEARS = 10
@@ -315,6 +319,40 @@ function getSeoulClock() {
     minute: Number(map.get('minute')),
     weekday: map.get('weekday') ?? 'Mon',
   }
+}
+
+/** Past calendar days in `timeZone` before today (today excluded), newest-first, up to `count` days. */
+function listPriorCalendarDaysExcludingToday(count: number, timeZone: string): string[] {
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone })
+  const todayStr = fmt.format(new Date())
+  const result: string[] = []
+  let cursor = new Date()
+  let lastEmitted: string | null = null
+  const maxHours = 24 * (count + 5)
+  for (let h = 0; result.length < count && h < maxHours; h++) {
+    cursor = new Date(cursor.getTime() - 60 * 60 * 1000)
+    const ymd = fmt.format(cursor)
+    if (ymd >= todayStr) continue
+    if (ymd !== lastEmitted) {
+      lastEmitted = ymd
+      result.push(ymd)
+    }
+  }
+  return result
+}
+
+function isWeekendYmdInTz(ymd: string, timeZone: string): boolean {
+  const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone })
+  const fmtWeek = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' })
+  let cursor = new Date()
+  for (let h = 0; h < 24 * 40; h++) {
+    if (fmtDate.format(cursor) === ymd) {
+      const w = fmtWeek.format(cursor)
+      return w === 'Sat' || w === 'Sun'
+    }
+    cursor = new Date(cursor.getTime() - 60 * 60 * 1000)
+  }
+  return false
 }
 
 function toKoreanSentimentLabel(label: string): NewsSentimentLabel {
@@ -1011,13 +1049,135 @@ async function reconcilePendingOutcomes(symbols: string[]) {
   return { resolvedCount, correctCount, processedCount: symbols.length }
 }
 
+async function runDailyClosePipeline(
+  market: Market,
+  runDate: string,
+): Promise<{
+  generatedCount: number
+  resolvedCount: number
+  correctCount: number
+  processedCount: number
+} | null> {
+  const db = getFirestore()
+  if (!db || !/^\d{4}-\d{2}-\d{2}$/.test(runDate)) return null
+
+  const symbols =
+    market === 'kr'
+      ? koreaSymbols.slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
+      : (await getSp500Symbols()).slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
+  const predictions: PredictionRecord[] = []
+  await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
+    try {
+      const predict = await fetchPredict(ticker, runDate)
+      const record: PredictionRecord = {
+        ticker,
+        market,
+        predictionDate: predict.last_date,
+        predictedDirection: predict.direction,
+        probabilityUp: Number(predict.probability_up.toFixed(4)),
+        baseClose: Number(predict.last_close.toFixed(2)),
+        targetDateExpected: getNextWeekday(predict.last_date),
+        modelTrainedAt: predict.model_trained_at,
+        cvAccuracy: predict.cv_accuracy,
+        cvPrecision: predict.cv_precision,
+        reasonSummary: predict.reason_summary,
+        outcomeStatus: 'pending',
+        source: 'daily-close-job',
+      }
+      await db
+        .collection('predictions_v2')
+        .doc(ticker.toUpperCase())
+        .set(
+          {
+            [record.predictionDate]: {
+              ...record,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          },
+          { merge: true },
+        )
+      predictions.push(record)
+    } catch (err) {
+      console.error(`일일 예측 저장 실패: ${ticker}`, err)
+    }
+  })
+
+  const { resolvedCount, correctCount, processedCount } = await reconcilePendingOutcomes(symbols)
+  await db.collection('analysis_daily').doc(`${market}_${runDate}`).set(
+    {
+      date: runDate,
+      market,
+      generatedCount: predictions.length,
+      resolvedCount,
+      correctCount,
+      accuracy: resolvedCount > 0 ? Number((correctCount / resolvedCount).toFixed(4)) : null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  )
+  return {
+    generatedCount: predictions.length,
+    resolvedCount,
+    correctCount,
+    processedCount,
+  }
+}
+
+/** After server start: for each market TZ, fill missing weekdays in last N days (today excluded) when analysis_daily is absent or empty. Does not update job_meta. */
+async function runStartupDailyCloseCatchUp() {
+  if (STARTUP_CATCHUP_DISABLED) return
+  const db = getFirestore()
+  if (!db) return
+
+  console.log(
+    `[startup daily catch-up] Checking last ${STARTUP_CATCHUP_DAYS} calendar days (excluding today) per market for missing analysis_daily`,
+  )
+  for (const market of ['us', 'kr'] as const) {
+    const tz = market === 'kr' ? 'Asia/Seoul' : 'America/New_York'
+    const dates = listPriorCalendarDaysExcludingToday(STARTUP_CATCHUP_DAYS, tz)
+      .filter((d) => !isWeekendYmdInTz(d, tz))
+      .sort((a, b) => a.localeCompare(b))
+
+    for (const runDate of dates) {
+      const summaryRef = db.collection('analysis_daily').doc(`${market}_${runDate}`)
+      const snap = await summaryRef.get()
+      if (snap.exists) {
+        const g = snap.data()?.generatedCount
+        if (typeof g === 'number' && g > 0) continue
+      }
+
+      if (dailyJobRunningByMarket[market]) {
+        console.warn(`[startup daily catch-up] skip ${market} ${runDate} (daily job running)`)
+        continue
+      }
+
+      dailyJobRunningByMarket[market] = true
+      try {
+        console.log(`[startup daily catch-up] ${market} ${runDate} missing → pipeline`)
+        const result = await runDailyClosePipeline(market, runDate)
+        if (result) {
+          console.log(
+            `[startup daily catch-up] ${market} ${runDate} done · predictions ${result.generatedCount} · outcomes ${result.resolvedCount}`,
+          )
+        }
+      } catch (err) {
+        console.error(`[startup daily catch-up] ${market} ${runDate} failed`, err)
+      } finally {
+        dailyJobRunningByMarket[market] = false
+      }
+    }
+  }
+  console.log('[startup daily catch-up] finished')
+}
+
 async function runDailyCloseJob(market: Market, force = false) {
   if (dailyJobRunningByMarket[market]) return
   const db = getFirestore()
   if (!db) return
   const clock = market === 'kr' ? getSeoulClock() : getNewYorkClock()
   const isWeekend = clock.weekday === 'Sat' || clock.weekday === 'Sun'
-  /** KRX 정규 15:30 KST 종료 후 버퍼 / 미국 정규 16:00 ET 종료 후 버퍼 — 이 시각 이후에만 배치 대상 */
+  /** KRX 15:30 KST close buffer / US 16:00 ET close buffer — batch only after this time */
   const marketClosed =
     market === 'kr'
       ? clock.hour > 15 || (clock.hour === 15 && clock.minute >= 40)
@@ -1037,68 +1197,16 @@ async function runDailyCloseJob(market: Market, force = false) {
       return
     }
 
-    const symbols =
-      market === 'kr'
-        ? koreaSymbols.slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
-        : (await getSp500Symbols()).slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
-    const predictions: PredictionRecord[] = []
-    await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
-      try {
-        const predict = await fetchPredict(ticker, clock.date)
-        const record: PredictionRecord = {
-          ticker,
-          market,
-          predictionDate: predict.last_date,
-          predictedDirection: predict.direction,
-          probabilityUp: Number(predict.probability_up.toFixed(4)),
-          baseClose: Number(predict.last_close.toFixed(2)),
-          targetDateExpected: getNextWeekday(predict.last_date),
-          modelTrainedAt: predict.model_trained_at,
-          cvAccuracy: predict.cv_accuracy,
-          cvPrecision: predict.cv_precision,
-          reasonSummary: predict.reason_summary,
-          outcomeStatus: 'pending',
-          source: 'daily-close-job',
-        }
-        await db
-          .collection('predictions_v2')
-          .doc(ticker.toUpperCase())
-          .set(
-            {
-              [record.predictionDate]: {
-                ...record,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              },
-            },
-            { merge: true },
-          )
-        predictions.push(record)
-      } catch (err) {
-        console.error(`일일 예측 저장 실패: ${ticker}`, err)
-      }
-    })
+    const result = await runDailyClosePipeline(market, clock.date)
+    if (!result) return
 
-    const { resolvedCount, correctCount, processedCount } = await reconcilePendingOutcomes(symbols)
-    await db.collection('analysis_daily').doc(`${market}_${clock.date}`).set(
-      {
-        date: clock.date,
-        market,
-        generatedCount: predictions.length,
-        resolvedCount,
-        correctCount,
-        accuracy: resolvedCount > 0 ? Number((correctCount / resolvedCount).toFixed(4)) : null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    )
     await metaRef.set(
       {
         lastRunDate: clock.date,
         market,
-        generatedCount: predictions.length,
-        resolvedCount,
-        reconcileProcessed: processedCount,
+        generatedCount: result.generatedCount,
+        resolvedCount: result.resolvedCount,
+        reconcileProcessed: result.processedCount,
         pendingBookmark: null,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
@@ -1770,6 +1878,9 @@ app.listen(port, () => {
   console.log(
     `[일일 마감 배치] 한국·미국 각각 '해당 시장 정규장 마감 이후'에만 Firestore 반영, 시장별 하루 1회(job_meta). 조건 검사 주기 ${DAILY_CLOSE_SCHEDULER_MS / 1000}s (환경변수 DAILY_CLOSE_SCHEDULER_MS 로 변경 가능)`,
   )
+  setImmediate(() => {
+    void runStartupDailyCloseCatchUp()
+  })
   setInterval(() => {
     void runDailyCloseJob('us', false)
     void runDailyCloseJob('kr', false)

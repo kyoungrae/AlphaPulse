@@ -59,6 +59,14 @@ Windows CMD 는 `set VITE_API_MODE=production&& set VITE_API_BASE_URL=...&& npm 
 
 ---
 
+## Backend: daily close catch-up (once on start)
+
+If the server was off when the scheduled job should run, after **each process start** it scans the last **N** calendar days (**today excluded**) per market timezone (US `America/New_York`, KR `Asia/Seoul`). Weekends are skipped. Default **N** is 7 (max 14): set `STARTUP_CATCHUP_DAYS`.
+
+For each candidate date, if `analysis_daily/{market}_{YYYY-MM-DD}` is missing or `generatedCount` is 0, it runs the **same pipeline** as the scheduled daily close (predict → Firestore → reconcile outcomes → summary). It **does not** update `job_meta` (today’s scheduled run still controls that).
+
+Turn off with `DISABLE_STARTUP_CATCHUP=1` or `true`. See `backend/.env.example`.
+
 ## Firebase (Firestore 등)
 
 - **코드**: `frontend/src/firebase.ts` 가 로컬·운영 빌드 모두에서 **항상** 같은 방식으로 앱을 초기화합니다 (`VITE_API_MODE` 와 무관).

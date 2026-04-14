@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { apiUrl } from '../apiBase'
+import { usePredictionHistory } from '../usePredictionHistory'
 import {
   Bar,
   BarChart,
@@ -99,28 +100,6 @@ type SymbolResponse = {
   market?: 'us' | 'kr'
   total: number
   items: SymbolItem[]
-}
-
-type HistoryItem = {
-  ticker: string
-  predictionDate: string
-  predictedDirection: 'Up' | 'Down'
-  probabilityUp: number
-  baseClose: number
-  probabilityDelta: number | null
-  directionChanged: boolean
-  actualDirection: 'Up' | 'Down' | null
-  actualDate: string | null
-  actualClose: number | null
-  isCorrect: boolean | null
-}
-
-type HistoryResponse = {
-  ticker: string
-  items: HistoryItem[]
-  /** 백엔드가 Firestore 미연결 시 내려줌 — 이때 items 는 빈 배열이라 UI에서 안내 필요 */
-  warning?: string
-  detail?: string
 }
 
 type FxResponse = {
@@ -649,9 +628,7 @@ export default function Dashboard() {
     data: history,
     loading: historyLoading,
     error: historyError,
-  } = useFetch<HistoryResponse>(
-    apiUrl(`/api/predictions/history/${encodeURIComponent(selectedSymbol)}?limit=10`),
-  )
+  } = usePredictionHistory(selectedSymbol, 10)
   const {
     data: backtest,
     loading: backtestLoading,
@@ -1068,12 +1045,16 @@ export default function Dashboard() {
               {historyError && <span className="text-xs text-rose-400">오류: {historyError}</span>}
             </div>
           </div>
-          {history?.warning && (
+          {history?.warning && (history.items?.length ?? 0) === 0 && (
             <div className="mb-4 rounded-lg border border-amber-800/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-100">
               <p className="font-medium">{history.warning}</p>
               {history.detail && <p className="mt-1 text-xs text-amber-200/90">{history.detail}</p>}
               <p className="mt-2 text-xs text-amber-200/70">
-                백엔드(.env의 GOOGLE_APPLICATION_CREDENTIALS)로 Firestore에 붙은 뒤 백엔드를 재시작했는지 확인하세요.
+                Configure the backend with a Firebase Admin credential (e.g. GOOGLE_APPLICATION_CREDENTIALS in backend/.env) and restart the API server.
+              </p>
+              <p className="mt-2 text-xs text-amber-200/70">
+                Browser reads require Firestore rules that allow read on{' '}
+                <code className="rounded bg-amber-950/80 px-1">predictions_v2</code>.
               </p>
             </div>
           )}
