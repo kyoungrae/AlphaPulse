@@ -4,6 +4,7 @@ import {
   BarChart,
   Cell,
   ComposedChart,
+  Layer,
   Line,
   ReferenceLine,
   CartesianGrid,
@@ -11,9 +12,23 @@ import {
   Tooltip,
   XAxis,
   YAxis,
+  usePlotArea,
   useXAxisScale,
   useYAxisScale,
 } from 'recharts'
+
+/**
+ * 매물대(지지·저항) 텍스트 위치를 직접 조정하려면 아래 숫자만 바꾸면 됩니다.
+ * - insetFromRightPx: 플롯 오른쪽 끝에서 안쪽으로 얼마나 띄울지(클수록 글자가 왼쪽으로 감)
+ * - dx: 가로 미세 이동(px). 양수 → 오른쪽, 음수 → 왼쪽
+ * - dySupport / dyResistance: 각 라벨만 세로로 밀기(양수 → 아래, 음수 → 위)
+ */
+const VBP_LABEL_LAYOUT = {
+  insetFromRightPx: -85,
+  dx: 0,
+  dySupport: 0,
+  dyResistance: 0,
+} as const
 
 type CandlePoint = {
   date: string
@@ -176,6 +191,65 @@ function directionToKorean(direction: string) {
   if (direction === 'Up') return '상승'
   if (direction === 'Down') return '하락'
   return direction
+}
+
+function VbpLabelsOnPlotRight({
+  support,
+  resistance,
+}: {
+  support: number | null
+  resistance: number | null
+}) {
+  const plot = usePlotArea()
+  const yScale = useYAxisScale('price')
+  if (!plot || !yScale) return null
+
+  const xBase = plot.x + plot.width - VBP_LABEL_LAYOUT.insetFromRightPx + VBP_LABEL_LAYOUT.dx
+
+  const rows: Array<{ key: string; y: number; text: string; fill: string }> = []
+  if (support != null) {
+    const py = yScale(support)
+    if (py != null && Number.isFinite(py)) {
+      rows.push({
+        key: 'support',
+        y: py + VBP_LABEL_LAYOUT.dySupport,
+        text: '매물대 지지',
+        fill: '#86efac',
+      })
+    }
+  }
+  if (resistance != null) {
+    const py = yScale(resistance)
+    if (py != null && Number.isFinite(py)) {
+      rows.push({
+        key: 'resistance',
+        y: py + VBP_LABEL_LAYOUT.dyResistance,
+        text: '매물대 저항',
+        fill: '#fdba74',
+      })
+    }
+  }
+  if (rows.length === 0) return null
+
+  return (
+    <Layer className="pointer-events-none">
+      {rows.map((r) => (
+        <text
+          key={r.key}
+          x={xBase}
+          y={r.y}
+          textAnchor="end"
+          dominantBaseline="middle"
+          fill={r.fill}
+          fontSize={10}
+          fontWeight={600}
+          style={{ paintOrder: 'stroke', stroke: 'rgb(15 23 42)', strokeWidth: 3 }}
+        >
+          {r.text}
+        </text>
+      ))}
+    </Layer>
+  )
 }
 
 type ChartRow = {
@@ -1158,13 +1232,6 @@ export default function Dashboard() {
                       stroke="#22c55e"
                       strokeDasharray="4 4"
                       strokeOpacity={0.8}
-                      label={{
-                        value: '매물대 지지',
-                        fill: '#86efac',
-                        fontSize: 10,
-                        position: 'insideRight',
-                        dx: chartShowBars ? -44 : -8,
-                      }}
                     />
                   )}
                   {(chartShowCandles || chartShowLines) && vbpLevels.resistance != null && (
@@ -1174,14 +1241,10 @@ export default function Dashboard() {
                       stroke="#f97316"
                       strokeDasharray="4 4"
                       strokeOpacity={0.8}
-                      label={{
-                        value: '매물대 저항',
-                        fill: '#fdba74',
-                        fontSize: 10,
-                        position: 'insideRight',
-                        dx: chartShowBars ? -44 : -8,
-                      }}
                     />
+                  )}
+                  {(chartShowCandles || chartShowLines) && (
+                    <VbpLabelsOnPlotRight support={vbpLevels.support} resistance={vbpLevels.resistance} />
                   )}
                 </ComposedChart>
               </ResponsiveContainer>
