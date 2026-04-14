@@ -1,10 +1,13 @@
 /**
  * 지정한 날짜 키(기본: 로컬 달력 기준 어제)로 predictions_v2/{TICKER} 에 예측 스냅샷을 저장합니다.
- * 예측 값은 현재 PREDICT_URL 모델 응답을 쓰고, Firestore 문서 키와 predictionDate 만 대상 날짜로 맞춥니다.
+ * 예측 값은 PREDICT_URL 에 `?as_of=대상일` 로 요청해 해당 거래일 피처 기준 상승 확률을 쓰고,
+ * Firestore 문서 키와 predictionDate 는 대상 날짜와 맞춥니다.
  *
  * 사용 예:
  *   npx ts-node --transpile-only src/scripts/backfillPredictionDate.ts --yesterday --market=us --symbols=AAPL,MSFT
  *   npx ts-node --transpile-only src/scripts/backfillPredictionDate.ts --date=2026-04-13 --market=kr --symbols=005930.KS
+ *   npx ts-node --transpile-only src/scripts/backfillPredictionDate.ts --rebackfill-from-doc=AAPL
+ *     → predictions_v2/AAPL 문서에 있는 모든 YYYY-MM-DD 키를 as_of 백필로 다시 씀 (확률·실측 갱신)
  */
 
 import fs from 'fs'
@@ -171,8 +174,9 @@ function initFirestore(): FirebaseFirestore.Firestore {
   return admin.firestore()
 }
 
-async function fetchPredict(ticker: string) {
-  const url = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+async function fetchPredict(ticker: string, asOf: string) {
+  const base = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+  const url = `${base}?as_of=${encodeURIComponent(asOf)}`
   const response = await fetch(url)
   if (!response.ok) {
     const body = await response.text()
@@ -188,6 +192,72 @@ async function fetchPredict(ticker: string) {
     model_trained_at: string
     reason_summary: string
   }
+}
+
+function inferMarketFromDoc(data: Record<string, unknown>): Market {
+  const keys = Object.keys(data)
+    .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
+    .sort()
+  for (const k of keys) {
+    const row = data[k]
+    if (row && typeof row === 'object' && row !== null && 'market' in row) {
+      const m = (row as { market?: string }).market
+      if (m === 'kr') return 'kr'
+      if (m === 'us') return 'us'
+    }
+  }
+  return 'us'
+}
+
+async function processOneDate(
+  db: FirebaseFirestore.Firestore,
+  ticker: string,
+  targetDate: string,
+  market: Market,
+): Promise<void> {
+  const predict = await fetchPredict(ticker, targetDate)
+  const historicalClose = await fetchCloseOnDate(ticker, targetDate)
+  const record: PredictionRecord = {
+    ticker,
+    market,
+    predictionDate: targetDate,
+    predictedDirection: predict.direction,
+    probabilityUp: Number(predict.probability_up.toFixed(4)),
+    baseClose: historicalClose ?? Number(predict.last_close.toFixed(2)),
+    targetDateExpected: getNextWeekday(targetDate),
+    modelTrainedAt: predict.model_trained_at,
+    cvAccuracy: predict.cv_accuracy,
+    cvPrecision: predict.cv_precision,
+    reasonSummary: predict.reason_summary,
+    outcomeStatus: 'pending',
+    source: 'backfill-script',
+  }
+  const outcome = await resolveOutcomeForPrediction(record)
+  const enrichedRecord = outcome
+    ? {
+        ...record,
+        outcomeStatus: 'resolved' as const,
+        actualDate: outcome.actualDate,
+        actualDirection: outcome.actualDirection,
+        actualClose: outcome.actualClose,
+        isCorrect: outcome.isCorrect,
+        resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }
+    : record
+  await db
+    .collection('predictions_v2')
+    .doc(ticker.toUpperCase())
+    .set(
+      {
+        [targetDate]: {
+          ...enrichedRecord,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      },
+      { merge: true },
+    )
+  console.log(`OK ${ticker} → ${targetDate} (모델 last_date=${predict.last_date})`)
 }
 
 function parseCsvRow(row: string): string[] {
@@ -250,9 +320,11 @@ function parseArgs() {
   const raw = process.argv.slice(2)
   let dateStr: string | null = null
   let market: Market = 'us'
+  let marketFromArg = false
   let symbolsStr: string | null = null
   let sp500 = false
   let sp500Limit = 50
+  let rebackfillFromDoc: string | null = null
 
   for (const arg of raw) {
     if (arg === '--yesterday') {
@@ -262,19 +334,25 @@ function parseArgs() {
     } else if (arg.startsWith('--market=')) {
       const m = arg.slice('--market='.length).toLowerCase()
       market = m === 'kr' ? 'kr' : 'us'
+      marketFromArg = true
     } else if (arg.startsWith('--symbols=')) {
       symbolsStr = arg.slice('--symbols='.length).trim()
     } else if (arg === '--sp500') {
       sp500 = true
     } else if (arg.startsWith('--limit=')) {
       sp500Limit = Math.max(1, Number(arg.slice('--limit='.length)) || 50)
+    } else if (arg.startsWith('--rebackfill-from-doc=')) {
+      rebackfillFromDoc = arg.slice('--rebackfill-from-doc='.length).trim().toUpperCase()
     } else if (arg === '--help' || arg === '-h') {
       console.log(`
 백필: predictions_v2/{티커} 문서에 [날짜] 키로 예측 레코드 저장
 
   --yesterday          저장 키·predictionDate 를 로컬 달력 "어제"로 설정
   --date=YYYY-MM-DD    위와 같이 특정 날짜로 저장 (권장: 배치가 빠진 날)
-  --market=us|kr       기본 us
+  --rebackfill-from-doc=TICKER
+                       해당 티커 문서에 이미 있는 모든 YYYY-MM-DD 키를 다시 백필
+                       (as_of 상승 확률·기준일 종가·실측 가능 시 outcome 갱신)
+  --market=us|kr       기본 us (--rebackfill-from-doc 시 생략하면 문서에 저장된 market 사용)
   --symbols=A,B,C      쉼표로 구분 (미지정 시 AAPL 또는 005930.KS 단일 종목)
   --sp500              미국 시장일 때 S&P500 상위 --limit 종목
   --limit=N            --sp500 일 때 종목 수 (기본 50)
@@ -285,17 +363,78 @@ function parseArgs() {
     }
   }
 
+  if (rebackfillFromDoc) {
+    if (!rebackfillFromDoc.length) {
+      throw new Error('--rebackfill-from-doc 에 티커를 지정하세요.')
+    }
+    return {
+      mode: 'rebackfill' as const,
+      rebackfillTicker: rebackfillFromDoc,
+      market,
+      marketFromArg,
+      symbolsStr,
+      sp500,
+      sp500Limit,
+    }
+  }
+
   const targetDate = dateStr ?? localYesterdayYmd()
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
     throw new Error(`날짜 형식이 잘못되었습니다: ${targetDate}`)
   }
 
-  return { targetDate, market, symbolsStr, sp500, sp500Limit }
+  return {
+    mode: 'single' as const,
+    targetDate,
+    market,
+    marketFromArg,
+    symbolsStr,
+    sp500,
+    sp500Limit,
+  }
 }
 
 async function main() {
-  const { targetDate, market, symbolsStr, sp500, sp500Limit } = parseArgs()
+  const parsed = parseArgs()
+
+  if (parsed.mode === 'rebackfill') {
+    const db = initFirestore()
+    const ticker = parsed.rebackfillTicker
+    const snap = await db.collection('predictions_v2').doc(ticker).get()
+    if (!snap.exists) {
+      console.error(`문서 없음: predictions_v2/${ticker}`)
+      process.exit(1)
+    }
+    const data = snap.data() as Record<string, unknown>
+    const dates = Object.keys(data)
+      .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
+      .sort()
+    if (dates.length === 0) {
+      console.error(`YYYY-MM-DD 형식 키 없음: predictions_v2/${ticker}`)
+      process.exit(1)
+    }
+    const market: Market = parsed.marketFromArg ? parsed.market : inferMarketFromDoc(data)
+    console.log(
+      `재백필: ${ticker}, 날짜 ${dates.length}개 (${dates[0]} … ${dates[dates.length - 1]}), market=${market}`,
+    )
+
+    let ok = 0
+    let fail = 0
+    await runInBatches(dates, CONCURRENCY, async (targetDate) => {
+      try {
+        await processOneDate(db, ticker, targetDate, market)
+        ok += 1
+      } catch (err) {
+        console.error(`FAIL ${ticker} ${targetDate}`, err)
+        fail += 1
+      }
+    })
+    console.log(`완료: 성공 ${ok}, 실패 ${fail}, 티커 ${ticker}`)
+    process.exit(fail > 0 ? 1 : 0)
+  }
+
+  const { targetDate, market, symbolsStr, sp500, sp500Limit } = parsed
 
   let symbols: string[]
   if (symbolsStr) {
@@ -317,49 +456,7 @@ async function main() {
 
   await runInBatches(symbols, CONCURRENCY, async (ticker) => {
     try {
-      const predict = await fetchPredict(ticker)
-      const historicalClose = await fetchCloseOnDate(ticker, targetDate)
-      const record: PredictionRecord = {
-        ticker,
-        market,
-        predictionDate: targetDate,
-        predictedDirection: predict.direction,
-        probabilityUp: Number(predict.probability_up.toFixed(4)),
-        baseClose: historicalClose ?? Number(predict.last_close.toFixed(2)),
-        targetDateExpected: getNextWeekday(targetDate),
-        modelTrainedAt: predict.model_trained_at,
-        cvAccuracy: predict.cv_accuracy,
-        cvPrecision: predict.cv_precision,
-        reasonSummary: predict.reason_summary,
-        outcomeStatus: 'pending',
-        source: 'backfill-script',
-      }
-      const outcome = await resolveOutcomeForPrediction(record)
-      const enrichedRecord = outcome
-        ? {
-            ...record,
-            outcomeStatus: 'resolved' as const,
-            actualDate: outcome.actualDate,
-            actualDirection: outcome.actualDirection,
-            actualClose: outcome.actualClose,
-            isCorrect: outcome.isCorrect,
-            resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-          }
-        : record
-      await db
-        .collection('predictions_v2')
-        .doc(ticker.toUpperCase())
-        .set(
-          {
-            [targetDate]: {
-              ...enrichedRecord,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-          },
-          { merge: true },
-        )
-      console.log(`OK ${ticker} → ${targetDate} (모델 last_date=${predict.last_date})`)
+      await processOneDate(db, ticker, targetDate, market)
       ok += 1
     } catch (err) {
       console.error(`FAIL ${ticker}`, err)

@@ -22,7 +22,7 @@ from urllib.request import urlopen
 
 import pandas as pd
 import yfinance as yf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, cross_validate
@@ -495,20 +495,40 @@ def _startup():
 
 
 @app.get("/predict/{ticker}", response_model=PredictResponse)
-def predict(ticker: str):
+def predict(
+  ticker: str,
+  as_of: Optional[str] = Query(
+    None,
+    description="YYYY-MM-DD: 해당 달력일(또는 그 이전 마지막 거래일) 종가 시점 피처로 예측합니다. 생략 시 최신 행.",
+  ),
+):
   ticker = ticker.upper()
   try:
     bundle = get_model_bundle(ticker)
   except Exception as err:
     raise HTTPException(status_code=500, detail=f"모델 학습/로드 실패: {err}") from err
 
-  # Use recent data to generate the latest feature row
+  # Use recent data to generate the latest feature row (or the row on/before as_of)
   df = load_price_data(ticker, period_years=DATA_BASELINE_YEARS)
   df_feat = add_features(df, ticker)
   if df_feat.empty:
     raise HTTPException(status_code=400, detail="지표 계산을 위한 데이터가 충분하지 않습니다.")
 
-  latest = df_feat.iloc[-1]
+  if as_of:
+    try:
+      as_of_ts = pd.Timestamp(as_of).normalize()
+    except Exception as err:
+      raise HTTPException(status_code=400, detail="as_of는 YYYY-MM-DD 형식이어야 합니다.") from err
+    idx_norm = df_feat.index.normalize()
+    subset = df_feat.loc[idx_norm <= as_of_ts]
+    if subset.empty:
+      raise HTTPException(
+        status_code=400,
+        detail=f"as_of={as_of} 이전 구간에 지표를 계산할 수 있는 데이터가 없습니다.",
+      )
+    latest = subset.iloc[-1]
+  else:
+    latest = df_feat.iloc[-1]
   features = latest[FEATURE_COLS].to_frame().T
   features_scaled = bundle.scaler.transform(features)
 

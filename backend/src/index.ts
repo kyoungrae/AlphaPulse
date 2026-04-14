@@ -652,8 +652,10 @@ function getFirestore() {
   }
 }
 
-async function fetchPredict(ticker: string) {
-  const url = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+async function fetchPredict(ticker: string, asOf?: string) {
+  const base = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+  const url =
+    asOf && /^\d{4}-\d{2}-\d{2}$/.test(asOf) ? `${base}?as_of=${encodeURIComponent(asOf)}` : base
   const response = await fetch(url)
   if (!response.ok) {
     const body = await response.text()
@@ -1040,7 +1042,7 @@ async function runDailyCloseJob(market: Market, force = false) {
     const predictions: PredictionRecord[] = []
     await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
       try {
-        const predict = await fetchPredict(ticker)
+        const predict = await fetchPredict(ticker, clock.date)
         const record: PredictionRecord = {
           ticker,
           market,
@@ -1695,18 +1697,23 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
   if (!ticker) {
     return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
   }
+  const asOfRaw = typeof req.query.as_of === 'string' ? req.query.as_of.trim() : ''
+  const asOf = /^\d{4}-\d{2}-\d{2}$/.test(asOfRaw) ? asOfRaw : undefined
   const redisPredictKey = `predict:${ticker}`
-  const redisPredict = await getRedisJson<Record<string, unknown>>(redisPredictKey)
-  if (redisPredict) {
-    predictCache.set(ticker, { data: redisPredict, cachedAt: Date.now() })
-    return res.json(redisPredict)
-  }
-  const cached = predictCache.get(ticker)
-  if (cached && Date.now() - cached.cachedAt < PREDICT_CACHE_TTL_MS) {
-    return res.json(cached.data)
+  if (!asOf) {
+    const redisPredict = await getRedisJson<Record<string, unknown>>(redisPredictKey)
+    if (redisPredict) {
+      predictCache.set(ticker, { data: redisPredict, cachedAt: Date.now() })
+      return res.json(redisPredict)
+    }
+    const cached = predictCache.get(ticker)
+    if (cached && Date.now() - cached.cachedAt < PREDICT_CACHE_TTL_MS) {
+      return res.json(cached.data)
+    }
   }
 
-  const url = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+  const base = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
+  const url = asOf ? `${base}?as_of=${encodeURIComponent(asOf)}` : base
 
   try {
     const response = await fetch(url)
@@ -1717,8 +1724,10 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
         .json({ error: '예측 서버 응답 오류', detail: body })
     }
     const json = await response.json()
-    predictCache.set(ticker, { data: json as Record<string, unknown>, cachedAt: Date.now() })
-    await setRedisJson(redisPredictKey, json, Math.floor(PREDICT_CACHE_TTL_MS / 1000))
+    if (!asOf) {
+      predictCache.set(ticker, { data: json as Record<string, unknown>, cachedAt: Date.now() })
+      await setRedisJson(redisPredictKey, json, Math.floor(PREDICT_CACHE_TTL_MS / 1000))
+    }
     return res.json(json)
   } catch (err) {
     console.error('Predict proxy failed', err)

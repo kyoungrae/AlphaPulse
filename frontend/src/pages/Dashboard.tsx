@@ -179,7 +179,8 @@ function directionToKorean(direction: string) {
 }
 
 type ChartRow = {
-  date: string
+  /** X축·캔들 정렬용 고유 키(ISO 시각 문자열) */
+  xKey: string
   tooltipLabel: string
   open: number
   high: number
@@ -194,17 +195,30 @@ type ChartRow = {
   vbpNodeStrength: number | null
 }
 
+function formatFullAxisLabel(iso: string, timeframe: 'year' | 'month' | 'day' | 'hour') {
+  const dt = new Date(iso)
+  return dt.toLocaleString('ko-KR', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    ...(timeframe === 'hour' ? { second: '2-digit' } : {}),
+    hour12: false,
+  })
+}
+
 function CandlestickSeries({ data }: { data: ChartRow[] }) {
   const xScale = useXAxisScale(0)
-  const yScale = useYAxisScale(0)
+  const yScale = useYAxisScale('price')
   if (!xScale || !yScale || data.length === 0) return null
 
   return (
     <g className="recharts-candlesticks" aria-hidden>
       {data.map((d, i) => {
-        const xMid = xScale(d.date, { position: 'middle' })
-        const xStart = xScale(d.date, { position: 'start' })
-        const xEnd = xScale(d.date, { position: 'end' })
+        const xMid = xScale(d.xKey, { position: 'middle' })
+        const xStart = xScale(d.xKey, { position: 'start' })
+        const xEnd = xScale(d.xKey, { position: 'end' })
         if (xMid == null || xStart == null || xEnd == null) return null
         const band = Math.max(2, xEnd - xStart)
         const bodyW = Math.min(12, band * 0.65)
@@ -219,7 +233,7 @@ function CandlestickSeries({ data }: { data: ChartRow[] }) {
         const stroke = isUp ? '#34d399' : '#fb7185'
         const fill = isUp ? '#059669' : '#e11d48'
         return (
-          <g key={`${d.date}-${i}`}>
+          <g key={`${d.xKey}-${i}`}>
             <line x1={xMid} x2={xMid} y1={yh} y2={yl} stroke={stroke} strokeWidth={1} />
             <rect
               x={xMid - bodyW / 2}
@@ -309,6 +323,12 @@ function StockChartTooltip({
           <>
             <span className="text-slate-500">매물 밀집도</span>
             <span className="text-right tabular-nums">{(row.vbpNodeStrength * 100).toFixed(1)}%</span>
+          </>
+        )}
+        {typeof row.volume === 'number' && row.volume > 0 && (
+          <>
+            <span className="text-slate-500">거래량</span>
+            <span className="text-right tabular-nums">{Math.round(row.volume).toLocaleString('ko-KR')}</span>
           </>
         )}
       </div>
@@ -419,6 +439,9 @@ export default function Dashboard() {
   const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
   const [strategy, setStrategy] = useState<StrategyMode>('long_only')
+  const [chartShowCandles, setChartShowCandles] = useState(true)
+  const [chartShowLines, setChartShowLines] = useState(true)
+  const [chartShowBars, setChartShowBars] = useState(true)
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(symbolQuery), 200)
@@ -505,37 +528,8 @@ export default function Dashboard() {
 
     const closes = stock.map((s) => s.close)
     const result = stock.map((pt, idx) => {
-      const dt = new Date(pt.date)
-      let date = dt.toLocaleDateString('ko-KR', { month: 'short', day: 'numeric' })
-      let tooltipLabel = dt.toLocaleString('ko-KR', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-      })
-      if (timeframe === 'year') {
-        date = dt.toLocaleDateString('ko-KR', { year: 'numeric', month: '2-digit' })
-        tooltipLabel = dt.toLocaleDateString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit' })
-      } else if (timeframe === 'day') {
-        date = dt.toLocaleDateString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit' })
-        tooltipLabel = dt.toLocaleString('ko-KR', {
-          month: '2-digit',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false,
-        })
-      } else if (timeframe === 'hour') {
-        date = dt.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })
-        tooltipLabel = dt.toLocaleTimeString('ko-KR', {
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hour12: false,
-        })
-      }
+      const iso = typeof pt.date === 'string' ? pt.date : new Date(pt.date).toISOString()
+      const tooltipLabel = formatFullAxisLabel(iso, timeframe)
       const close = pt.close
       const open = pt.open
       const high = pt.high
@@ -601,7 +595,7 @@ export default function Dashboard() {
       }
 
       return {
-        date,
+        xKey: iso,
         tooltipLabel,
         open: toDisplay(open),
         high: toDisplay(high),
@@ -1008,51 +1002,158 @@ export default function Dashboard() {
               차트 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.
             </p>
           )}
-          <div className="h-72">
+          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-800/80 pt-3 text-xs text-slate-300">
+            <span className="text-slate-500">표시:</span>
+            <label className="inline-flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={chartShowCandles}
+                onChange={(e) => setChartShowCandles(e.target.checked)}
+                className="rounded border-slate-600 bg-slate-900 text-blue-500 focus:ring-blue-500"
+              />
+              <span>캔들</span>
+            </label>
+            <label className="inline-flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={chartShowLines}
+                onChange={(e) => setChartShowLines(e.target.checked)}
+                className="rounded border-slate-600 bg-slate-900 text-blue-500 focus:ring-blue-500"
+              />
+              <span>선형 (종가·지표)</span>
+            </label>
+            <label className="inline-flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={chartShowBars}
+                onChange={(e) => setChartShowBars(e.target.checked)}
+                className="rounded border-slate-600 bg-slate-900 text-blue-500 focus:ring-blue-500"
+              />
+              <span>막대 (거래량)</span>
+            </label>
+          </div>
+          <div className="h-80">
             {stockLoading ? (
               <div className="flex h-full items-center justify-center text-slate-500">불러오는 중...</div>
             ) : stockError ? (
               <div className="flex h-full items-center justify-center text-slate-500">차트 데이터 없음</div>
+            ) : !chartData.length ? (
+              <div className="flex h-full items-center justify-center text-slate-500">표시할 데이터가 없습니다.</div>
+            ) : !chartShowCandles && !chartShowLines && !chartShowBars ? (
+              <div className="flex h-full items-center justify-center text-center text-sm text-slate-500">
+                캔들·선형·막대 중 하나 이상 선택해 주세요.
+              </div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={chartData}>
+                <ComposedChart data={chartData} margin={{ top: 8, right: chartShowBars ? 48 : 8, bottom: 8, left: 8 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
                   <XAxis
-                    dataKey="date"
-                    tick={{ fill: '#cbd5f5', fontSize: 11 }}
+                    dataKey="xKey"
+                    tick={{ fill: '#cbd5f5', fontSize: 10 }}
                     interval="preserveStartEnd"
-                    minTickGap={24}
+                    minTickGap={8}
+                    angle={chartData.length > 24 ? -40 : 0}
+                    textAnchor={chartData.length > 24 ? 'end' : 'middle'}
+                    height={chartData.length > 24 ? 56 : 32}
+                    tickFormatter={(v: string) => formatFullAxisLabel(v, timeframe)}
                   />
-                  <YAxis
-                    tick={{ fill: '#cbd5f5', fontSize: 11 }}
-                    domain={chartYDomain ?? ['auto', 'auto']}
-                    tickFormatter={(value: number) =>
-                      priceCurrency === 'krw'
-                        ? Math.round(value).toLocaleString('ko-KR')
-                        : value.toLocaleString('en-US', { maximumFractionDigits: 0 })
-                    }
-                  />
+                  {(chartShowCandles || chartShowLines) && (
+                    <YAxis
+                      yAxisId="price"
+                      tick={{ fill: '#cbd5f5', fontSize: 11 }}
+                      domain={chartYDomain ?? ['auto', 'auto']}
+                      tickFormatter={(value: number) =>
+                        priceCurrency === 'krw'
+                          ? Math.round(value).toLocaleString('ko-KR')
+                          : value.toLocaleString('en-US', { maximumFractionDigits: 0 })
+                      }
+                      width={56}
+                    />
+                  )}
+                  {chartShowBars && (
+                    <YAxis
+                      yAxisId="vol"
+                      orientation="right"
+                      tick={{ fill: '#64748b', fontSize: 10 }}
+                      domain={[0, (dataMax: number) => (Number.isFinite(dataMax) && dataMax > 0 ? dataMax * 1.12 : 1)]}
+                      tickFormatter={(v: number) =>
+                        v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)}M` : v >= 1000 ? `${(v / 1000).toFixed(0)}k` : `${v}`
+                      }
+                      width={40}
+                    />
+                  )}
                   <Tooltip
                     content={(tooltipProps) => (
                       <StockChartTooltip {...tooltipProps} priceCurrency={priceCurrency} />
                     )}
                     cursor={{ strokeDasharray: '3 3' }}
                   />
-                  <Line
-                    type="monotone"
-                    dataKey="close"
-                    stroke="transparent"
-                    strokeWidth={1}
-                    dot={false}
-                    activeDot={{ r: 3, fill: '#cbd5f5' }}
-                    isAnimationActive={false}
-                  />
-                  <CandlestickSeries data={chartData} />
-                  <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.5} dot={false} connectNulls />
-                  <Line type="monotone" dataKey="bbUpper" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />
-                  <Line type="monotone" dataKey="bbLower" stroke="#a78bfa" strokeWidth={1.2} dot={false} connectNulls />
-                  {vbpLevels.support != null && (
+                  {chartShowBars && (
+                    <Bar
+                      yAxisId="vol"
+                      dataKey="volume"
+                      barSize={chartData.length > 120 ? 2 : chartData.length > 40 ? 4 : 8}
+                      radius={[1, 1, 0, 0]}
+                      isAnimationActive={false}
+                      fill="#475569"
+                      fillOpacity={0.5}
+                    >
+                      {chartData.map((entry) => (
+                        <Cell
+                          key={`vol-${entry.xKey}`}
+                          fill={entry.close >= entry.open ? 'rgba(52, 211, 153, 0.45)' : 'rgba(251, 113, 133, 0.45)'}
+                        />
+                      ))}
+                    </Bar>
+                  )}
+                  {chartShowLines && (
+                    <>
+                      <Line
+                        yAxisId="price"
+                        type="monotone"
+                        dataKey="close"
+                        stroke={chartShowCandles ? 'rgba(148, 163, 184, 0.9)' : '#94a3b8'}
+                        strokeWidth={chartShowCandles ? 1.2 : 1.8}
+                        dot={false}
+                        activeDot={{ r: 3, fill: '#e2e8f0' }}
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        yAxisId="price"
+                        type="monotone"
+                        dataKey="sma20"
+                        stroke="#f59e0b"
+                        strokeWidth={1.5}
+                        dot={false}
+                        connectNulls
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        yAxisId="price"
+                        type="monotone"
+                        dataKey="bbUpper"
+                        stroke="#a78bfa"
+                        strokeWidth={1.2}
+                        dot={false}
+                        connectNulls
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        yAxisId="price"
+                        type="monotone"
+                        dataKey="bbLower"
+                        stroke="#a78bfa"
+                        strokeWidth={1.2}
+                        dot={false}
+                        connectNulls
+                        isAnimationActive={false}
+                      />
+                    </>
+                  )}
+                  {chartShowCandles && <CandlestickSeries data={chartData} />}
+                  {(chartShowCandles || chartShowLines) && vbpLevels.support != null && (
                     <ReferenceLine
+                      yAxisId="price"
                       y={vbpLevels.support}
                       stroke="#22c55e"
                       strokeDasharray="4 4"
@@ -1060,8 +1161,9 @@ export default function Dashboard() {
                       label={{ value: '매물대 지지', fill: '#86efac', fontSize: 10, position: 'left' }}
                     />
                   )}
-                  {vbpLevels.resistance != null && (
+                  {(chartShowCandles || chartShowLines) && vbpLevels.resistance != null && (
                     <ReferenceLine
+                      yAxisId="price"
                       y={vbpLevels.resistance}
                       stroke="#f97316"
                       strokeDasharray="4 4"
