@@ -1,5 +1,7 @@
 import cors from 'cors'
 import dotenv from 'dotenv'
+import fs from 'fs'
+import path from 'path'
 import admin from 'firebase-admin'
 import express, { Request, Response } from 'express'
 import { createClient } from 'redis'
@@ -1752,6 +1754,16 @@ app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
     return res.status(500).json({ error: '일일 배치 실행에 실패했습니다.' })
   }
 })
+
+/** 프로덕션: 같은 오리진에서 프론트(Vite 빌드) + /api 제공. `npm run build` 후 저장소 루트에서 서버 실행 시 `frontend/dist` 사용. */
+const frontendDist = process.env.FRONTEND_DIST || path.join(process.cwd(), 'frontend', 'dist')
+if (process.env.NODE_ENV === 'production' && fs.existsSync(frontendDist)) {
+  app.use(express.static(frontendDist))
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) return next()
+    res.sendFile(path.join(frontendDist, 'index.html'))
+  })
+}
 
 app.listen(port, () => {
   console.log(`Backend server running on http://localhost:${port}`)

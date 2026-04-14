@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { apiUrl } from '../apiBase'
 
 type FearGreed = {
   value: number
@@ -26,9 +27,9 @@ export default function GlobalMacro() {
 
   useEffect(() => {
     Promise.all([
-      fetch('/api/macro/fear-greed').then((r) => r.json()),
-      fetch('/api/macro/calendar').then((r) => r.json()),
-      fetch('/api/macro/sectors').then((r) => r.json()),
+      fetch(apiUrl('/api/macro/fear-greed')).then((r) => r.json()),
+      fetch(apiUrl('/api/macro/calendar')).then((r) => r.json()),
+      fetch(apiUrl('/api/macro/sectors')).then((r) => r.json()),
     ])
       .then(([fg, cal, sec]) => {
         setFearGreed(fg)

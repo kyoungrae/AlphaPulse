@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { apiUrl } from '../apiBase'
 
 type SymbolItem = {
   symbol: string
@@ -189,7 +190,10 @@ export default function StockPrediction() {
   }, [search])
 
   const symbolsUrl = useMemo(
-    () => `/api/symbols?market=${market}&q=${encodeURIComponent(debouncedSearch.trim())}&limit=30`,
+    () =>
+      apiUrl(
+        `/api/symbols?market=${market}&q=${encodeURIComponent(debouncedSearch.trim())}&limit=30`,
+      ),
     [debouncedSearch, market],
   )
   const { data: symbols } = useFetch<SymbolResponse>(symbolsUrl)
@@ -197,12 +201,16 @@ export default function StockPrediction() {
     data: history,
     loading,
     error,
-  } = useFetch<HistoryResponse>(`/api/predictions/history/${encodeURIComponent(selected)}?limit=30`)
+  } = useFetch<HistoryResponse>(
+    apiUrl(`/api/predictions/history/${encodeURIComponent(selected)}?limit=30`),
+  )
   const {
     data: summary,
     loading: summaryLoading,
     error: summaryError,
-  } = useFetch<BacktestSummaryResponse>(`/api/backtest/summary/${encodeURIComponent(selected)}?market=${market}`)
+  } = useFetch<BacktestSummaryResponse>(
+    apiUrl(`/api/backtest/summary/${encodeURIComponent(selected)}?market=${market}`),
+  )
   const defaultGuidanceNotional = market === 'kr' ? 10_000_000 : 10_000
   const guidanceNotional = useMemo(() => {
     const raw = notionalInput.replace(/,/g, '').trim()
@@ -211,7 +219,9 @@ export default function StockPrediction() {
   }, [notionalInput, defaultGuidanceNotional])
   const guidanceUrl = useMemo(
     () =>
-      `/api/guidance/${encodeURIComponent(selected)}?market=${market}&strategy=${strategy}&notional=${guidanceNotional}`,
+      apiUrl(
+        `/api/guidance/${encodeURIComponent(selected)}?market=${market}&strategy=${strategy}&notional=${guidanceNotional}`,
+      ),
     [selected, market, strategy, guidanceNotional],
   )
   const {

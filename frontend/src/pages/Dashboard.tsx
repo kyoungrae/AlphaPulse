@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { apiUrl } from '../apiBase'
 import {
   Bar,
   BarChart,
@@ -606,7 +607,7 @@ export default function Dashboard() {
 
   const symbolsUrl = useMemo(() => {
     const q = encodeURIComponent(debouncedQuery.trim())
-    return `/api/symbols?market=${market}&q=${q}&limit=40`
+    return apiUrl(`/api/symbols?market=${market}&q=${q}&limit=40`)
   }, [debouncedQuery, market])
 
   useEffect(() => {
@@ -630,38 +631,42 @@ export default function Dashboard() {
     loading: stockLoading,
     error: stockError,
   } = useFetch<CandlePoint[]>(
-    `/api/stock/${encodeURIComponent(selectedSymbol)}?timeframe=${encodeURIComponent(timeframe)}&years=${yearRange}`,
+    apiUrl(
+      `/api/stock/${encodeURIComponent(selectedSymbol)}?timeframe=${encodeURIComponent(timeframe)}&years=${yearRange}`,
+    ),
   )
   const {
     data: news,
     loading: newsLoading,
     error: newsError,
-  } = useFetch<NewsItem[]>('/api/news')
+  } = useFetch<NewsItem[]>(apiUrl('/api/news'))
   const {
     data: predict,
     loading: predictLoading,
     error: predictError,
-  } = useFetch<PredictResponse>(`/api/predict/${encodeURIComponent(selectedSymbol)}`)
+  } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}`))
   const {
     data: history,
     loading: historyLoading,
     error: historyError,
-  } = useFetch<HistoryResponse>(`/api/predictions/history/${encodeURIComponent(selectedSymbol)}?limit=10`)
+  } = useFetch<HistoryResponse>(
+    apiUrl(`/api/predictions/history/${encodeURIComponent(selectedSymbol)}?limit=10`),
+  )
   const {
     data: backtest,
     loading: backtestLoading,
     error: backtestError,
   } = useFetch<BacktestResult>(
-    `/api/backtest/${encodeURIComponent(selectedSymbol)}?market=${market}&strategy=${strategy}`,
+    apiUrl(`/api/backtest/${encodeURIComponent(selectedSymbol)}?market=${market}&strategy=${strategy}`),
   )
   const {
     data: newsFeatures,
     loading: newsFeaturesLoading,
     error: newsFeaturesError,
   } = useFetch<NewsFeatureResponse>(
-    `/api/features/news/${encodeURIComponent(selectedSymbol)}?market=${market}&limit=100`,
+    apiUrl(`/api/features/news/${encodeURIComponent(selectedSymbol)}?market=${market}&limit=100`),
   )
-  const { data: fxData } = useFetch<FxResponse>('/api/fx/usd-krw')
+  const { data: fxData } = useFetch<FxResponse>(apiUrl('/api/fx/usd-krw'))
   const topSymbolsCsv = useMemo(
     () =>
       (symbols?.items ?? [])
@@ -672,7 +677,7 @@ export default function Dashboard() {
   )
   const directionsUrl = useMemo(() => {
     if (!topSymbolsCsv) return ''
-    return `/api/predict/directions?symbols=${encodeURIComponent(topSymbolsCsv)}`
+    return apiUrl(`/api/predict/directions?symbols=${encodeURIComponent(topSymbolsCsv)}`)
   }, [topSymbolsCsv])
   const { data: directions } = useFetch<DirectionsResponse>(directionsUrl)
 

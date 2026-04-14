@@ -1,16 +1,25 @@
-import { initializeApp } from 'firebase/app'
+import { getApp, getApps, initializeApp, type FirebaseApp } from 'firebase/app'
 import { getFirestore } from 'firebase/firestore'
 
+/**
+ * 웹 클라이언트 설정. `VITE_FIREBASE_*` 가 있으면 사용하고, 없으면 아래 기본값(동일 프로젝트).
+ * 로컬(`npm run dev`)·운영 빌드 모두 같은 방식으로 초기화되며 `VITE_API_MODE` 와 무관합니다.
+ */
 const firebaseConfig = {
-  apiKey: 'AIzaSyCYIdkp4--T54Ip2HdWRAGg03fK_4UZD-8',
-  authDomain: 'alphapulse-2083b.firebaseapp.com',
-  projectId: 'alphapulse-2083b',
-  storageBucket: 'alphapulse-2083b.firebasestorage.app',
-  messagingSenderId: '218866825385',
-  appId: '1:218866825385:web:7918799fbea66937c711b8',
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY ?? 'AIzaSyCYIdkp4--T54Ip2HdWRAGg03fK_4UZD-8',
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN ?? 'alphapulse-2083b.firebaseapp.com',
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID ?? 'alphapulse-2083b',
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET ?? 'alphapulse-2083b.firebasestorage.app',
+  messagingSenderId:
+    import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID ?? '218866825385',
+  appId: import.meta.env.VITE_FIREBASE_APP_ID ?? '1:218866825385:web:7918799fbea66937c711b8',
 }
 
-export const firebaseApp = initializeApp(firebaseConfig)
+function getOrInitApp(): FirebaseApp {
+  return getApps().length > 0 ? getApp() : initializeApp(firebaseConfig)
+}
 
-/** Cloud Firestore 클라이언트 (백엔드 `predictions_v2` 등과 동일 DB). 브라우저에서 직접 읽기/쓰기 시 콘솔 Firestore 보안 규칙이 허용해야 합니다. */
+export const firebaseApp = getOrInitApp()
+
+/** Cloud Firestore 클라이언트. 백엔드와 동일 DB — 콘솔 보안 규칙이 허용한 범위에서만 읽기/쓰기 가능. */
 export const db = getFirestore(firebaseApp)
