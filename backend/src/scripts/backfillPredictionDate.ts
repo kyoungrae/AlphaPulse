@@ -11,6 +11,7 @@ import fs from 'fs'
 import path from 'path'
 import dotenv from 'dotenv'
 import admin from 'firebase-admin'
+import YahooFinance from 'yahoo-finance2'
 import { credentialEnvDiagnostics, readServiceAccountCredential } from '../firebaseCredential'
 
 for (const envPath of [
@@ -26,6 +27,7 @@ for (const envPath of [
 const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
 const CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
 const S_AND_P_500_CSV_URL = 'https://datahub.io/core/s-and-p-500-companies/r/constituents.csv'
+const yahooFinance = new YahooFinance()
 
 type Market = 'us' | 'kr'
 type PredictionDirection = 'Up' | 'Down'
@@ -44,6 +46,65 @@ type PredictionRecord = {
   reasonSummary?: string
   outcomeStatus: 'pending' | 'resolved'
   source: 'backfill-script'
+}
+
+async function resolveOutcomeForPrediction(record: PredictionRecord): Promise<{
+  actualDate: string
+  actualDirection: PredictionDirection
+  actualClose: number
+  isCorrect: boolean
+} | null> {
+  const today = new Date()
+  const baseDate = new Date(`${record.predictionDate}T00:00:00Z`)
+  const period1 = new Date(baseDate)
+  period1.setUTCDate(period1.getUTCDate() - 3)
+  const quotes = await yahooFinance.chart(record.ticker, {
+    period1,
+    period2: today,
+    interval: '1d',
+  })
+  const normalized =
+    quotes.quotes
+      ?.filter((q) => q.close != null && q.date != null)
+      .map((q) => ({
+        date: q.date!.toISOString().slice(0, 10),
+        close: Number(q.close),
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date)) ?? []
+
+  const basePoint = normalized.find((q) => q.date === record.predictionDate)
+  const nextPoint = normalized.find((q) => q.date > record.predictionDate)
+  if (!basePoint || !nextPoint) return null
+
+  const actualDirection: PredictionDirection = nextPoint.close >= basePoint.close ? 'Up' : 'Down'
+  return {
+    actualDate: nextPoint.date,
+    actualDirection,
+    actualClose: Number(nextPoint.close.toFixed(2)),
+    isCorrect: actualDirection === record.predictedDirection,
+  }
+}
+
+async function fetchCloseOnDate(ticker: string, dateIso: string): Promise<number | null> {
+  const target = new Date(`${dateIso}T00:00:00Z`)
+  const period1 = new Date(target)
+  period1.setUTCDate(period1.getUTCDate() - 3)
+  const period2 = new Date(target)
+  period2.setUTCDate(period2.getUTCDate() + 1)
+  const quotes = await yahooFinance.chart(ticker, {
+    period1,
+    period2,
+    interval: '1d',
+  })
+  const row =
+    quotes.quotes
+      ?.filter((q) => q.close != null && q.date != null)
+      .map((q) => ({
+        date: q.date!.toISOString().slice(0, 10),
+        close: Number(q.close),
+      }))
+      .find((q) => q.date === dateIso) ?? null
+  return row ? Number(row.close.toFixed(2)) : null
 }
 
 function getNextWeekday(dateIso: string): string {
@@ -257,13 +318,14 @@ async function main() {
   await runInBatches(symbols, CONCURRENCY, async (ticker) => {
     try {
       const predict = await fetchPredict(ticker)
+      const historicalClose = await fetchCloseOnDate(ticker, targetDate)
       const record: PredictionRecord = {
         ticker,
         market,
         predictionDate: targetDate,
         predictedDirection: predict.direction,
         probabilityUp: Number(predict.probability_up.toFixed(4)),
-        baseClose: Number(predict.last_close.toFixed(2)),
+        baseClose: historicalClose ?? Number(predict.last_close.toFixed(2)),
         targetDateExpected: getNextWeekday(targetDate),
         modelTrainedAt: predict.model_trained_at,
         cvAccuracy: predict.cv_accuracy,
@@ -272,13 +334,25 @@ async function main() {
         outcomeStatus: 'pending',
         source: 'backfill-script',
       }
+      const outcome = await resolveOutcomeForPrediction(record)
+      const enrichedRecord = outcome
+        ? {
+            ...record,
+            outcomeStatus: 'resolved' as const,
+            actualDate: outcome.actualDate,
+            actualDirection: outcome.actualDirection,
+            actualClose: outcome.actualClose,
+            isCorrect: outcome.isCorrect,
+            resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }
+        : record
       await db
         .collection('predictions_v2')
         .doc(ticker.toUpperCase())
         .set(
           {
             [targetDate]: {
-              ...record,
+              ...enrichedRecord,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             },

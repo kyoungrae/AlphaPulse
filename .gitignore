@@ -7,6 +7,13 @@ build
 .DS_Store
 .env
 .env.*.local
+
+# Firebase / GCP 서비스 계정 키 (프로젝트 폴더에 두어도 되지만 절대 커밋 금지)
+**/firebase-adminsdk*.json
+**/*firebase-adminsdk*.json
+**/serviceAccount.json
+**/firebase-service-account.json
+/backend/secrets/
 *.log
 
 # frontend

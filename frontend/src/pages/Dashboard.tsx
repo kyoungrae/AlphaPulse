@@ -64,16 +64,21 @@ type HistoryItem = {
   predictionDate: string
   predictedDirection: 'Up' | 'Down'
   probabilityUp: number
+  baseClose: number
   probabilityDelta: number | null
   directionChanged: boolean
   actualDirection: 'Up' | 'Down' | null
   actualDate: string | null
+  actualClose: number | null
   isCorrect: boolean | null
 }
 
 type HistoryResponse = {
   ticker: string
   items: HistoryItem[]
+  /** 백엔드가 Firestore 미연결 시 내려줌 — 이때 items 는 빈 배열이라 UI에서 안내 필요 */
+  warning?: string
+  detail?: string
 }
 
 type FxResponse = {
@@ -1281,6 +1286,15 @@ export default function Dashboard() {
               {historyError && <span className="text-xs text-rose-400">오류: {historyError}</span>}
             </div>
           </div>
+          {history?.warning && (
+            <div className="mb-4 rounded-lg border border-amber-800/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-100">
+              <p className="font-medium">{history.warning}</p>
+              {history.detail && <p className="mt-1 text-xs text-amber-200/90">{history.detail}</p>}
+              <p className="mt-2 text-xs text-amber-200/70">
+                백엔드(.env의 GOOGLE_APPLICATION_CREDENTIALS)로 Firestore에 붙은 뒤 백엔드를 재시작했는지 확인하세요.
+              </p>
+            </div>
+          )}
 
           <div className="mb-5 flex flex-col items-start gap-4 md:flex-row md:items-center">
             <div className="flex-shrink-0 rounded-xl border border-blue-800/50 bg-blue-900/30 px-5 py-3">
@@ -1315,10 +1329,12 @@ export default function Dashboard() {
               <thead className="border-b border-slate-700 bg-slate-800/80 text-[11px] uppercase tracking-wider text-slate-400">
                 <tr>
                   <th className="px-4 py-3 font-semibold">예측 기준일</th>
+                  <th className="px-4 py-3 font-semibold">기준일 종가</th>
                   <th className="px-4 py-3 font-semibold">AI 예상 방향</th>
                   <th className="px-4 py-3 font-semibold">상승 확률</th>
                   <th className="px-4 py-3 font-semibold">확률 변동 (전일대비)</th>
                   <th className="border-l border-slate-700 px-4 py-3 font-semibold">실측일</th>
+                  <th className="px-4 py-3 font-semibold">실측 종가</th>
                   <th className="px-4 py-3 font-semibold">실제 종가 방향</th>
                   <th className="px-4 py-3 text-center font-semibold">결과</th>
                 </tr>
@@ -1327,6 +1343,9 @@ export default function Dashboard() {
                 {history?.items?.map((item) => (
                   <tr key={item.predictionDate} className="transition-colors hover:bg-slate-800/40">
                     <td className="px-4 py-3 text-slate-200">{item.predictionDate}</td>
+                    <td className="px-4 py-3 font-medium tabular-nums text-slate-200">
+                      {formatMoney(convertPrice(item.baseClose, nativeCurrency, priceCurrency, fxData?.rate), priceCurrency)}
+                    </td>
                     <td className="px-4 py-3 font-medium">
                       <span
                         className={item.predictedDirection === 'Up' ? 'text-emerald-400' : 'text-rose-400'}
@@ -1348,6 +1367,11 @@ export default function Dashboard() {
                     </td>
                     <td className="border-l border-slate-700 px-4 py-3 text-slate-400">
                       {item.actualDate ?? '대기 중'}
+                    </td>
+                    <td className="px-4 py-3 font-medium tabular-nums text-slate-200">
+                      {item.actualClose == null
+                        ? '-'
+                        : formatMoney(convertPrice(item.actualClose, nativeCurrency, priceCurrency, fxData?.rate), priceCurrency)}
                     </td>
                     <td className="px-4 py-3 font-medium">
                       {item.actualDirection ? (
@@ -1377,7 +1401,7 @@ export default function Dashboard() {
                 ))}
                 {(!history?.items || history.items.length === 0) && (
                   <tr>
-                    <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                    <td colSpan={9} className="px-4 py-8 text-center text-slate-500">
                       저장된 예측 이력이 없습니다. 일일 배치가 실행되면 여기에 누적됩니다.
                     </td>
                   </tr>

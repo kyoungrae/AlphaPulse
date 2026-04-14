@@ -23,7 +23,11 @@ const port = process.env.PORT || 4000
 const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
 const yahooFinance = new YahooFinance()
 const firestoreEnabled = process.env.FIRESTORE_ENABLED !== 'false'
-const DAILY_JOB_INTERVAL_MS = 1000 * 60 * 15
+/** 장 마감 조건을 몇 초마다 검사할지(실제 DB 반영은 마감 후·당일 미실행일 때만). 기본 1분. */
+const DAILY_CLOSE_SCHEDULER_MS = Math.max(
+  30_000,
+  Number(process.env.DAILY_CLOSE_SCHEDULER_MS ?? 60_000),
+)
 const DAILY_JOB_CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
 const DAILY_JOB_SYMBOL_LIMIT = Math.max(1, Number(process.env.DAILY_JOB_SYMBOL_LIMIT ?? 500))
 const BACKTEST_CACHE_TTL_MS = 1000 * 60 * 60 * 6
@@ -1009,7 +1013,11 @@ async function runDailyCloseJob(market: Market, force = false) {
   if (!db) return
   const clock = market === 'kr' ? getSeoulClock() : getNewYorkClock()
   const isWeekend = clock.weekday === 'Sat' || clock.weekday === 'Sun'
-  const marketClosed = market === 'kr' ? clock.hour > 15 || (clock.hour === 15 && clock.minute >= 40) : clock.hour > 16 || (clock.hour === 16 && clock.minute >= 10)
+  /** KRX 정규 15:30 KST 종료 후 버퍼 / 미국 정규 16:00 ET 종료 후 버퍼 — 이 시각 이후에만 배치 대상 */
+  const marketClosed =
+    market === 'kr'
+      ? clock.hour > 15 || (clock.hour === 15 && clock.minute >= 40)
+      : clock.hour > 16 || (clock.hour === 16 && clock.minute >= 10)
   if (!force && (isWeekend || !marketClosed || dailyJobLastRunDateByMarket[market] === clock.date)) {
     return
   }
@@ -1593,6 +1601,10 @@ app.get('/api/predictions/history/:ticker', async (req: Request, res: Response) 
     const records = Object.keys(data)
       .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
       .map((k) => data[k] as PredictionRecord)
+      .filter((row) => {
+        if (row == null || typeof row !== 'object') return false
+        return typeof row.predictionDate === 'string' && typeof row.probabilityUp === 'number'
+      })
       .map((row) => ({
         ...row,
         actualDirection: row.actualDirection ?? null,
@@ -1734,12 +1746,11 @@ app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
 
 app.listen(port, () => {
   console.log(`Backend server running on http://localhost:${port}`)
+  console.log(
+    `[일일 마감 배치] 한국·미국 각각 '해당 시장 정규장 마감 이후'에만 Firestore 반영, 시장별 하루 1회(job_meta). 조건 검사 주기 ${DAILY_CLOSE_SCHEDULER_MS / 1000}s (환경변수 DAILY_CLOSE_SCHEDULER_MS 로 변경 가능)`,
+  )
   setInterval(() => {
     void runDailyCloseJob('us', false)
     void runDailyCloseJob('kr', false)
-  }, DAILY_JOB_INTERVAL_MS)
-  setTimeout(() => {
-    void runDailyCloseJob('us', false)
-    void runDailyCloseJob('kr', false)
-  }, 5000)
+  }, DAILY_CLOSE_SCHEDULER_MS)
 })
