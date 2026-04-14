@@ -98,6 +98,7 @@ type PredictionRecord = {
   predictionDate: string
   predictedDirection: PredictionDirection
   probabilityUp: number
+  probabilities?: { h1: number; h3: number; h5: number; h10: number }
   baseClose: number
   targetDateExpected: string
   modelTrainedAt?: string
@@ -109,7 +110,7 @@ type PredictionRecord = {
   actualDirection?: PredictionDirection
   actualClose?: number
   isCorrect?: boolean
-  source: 'daily-close-job'
+  source: 'daily-close-job' | 'backfill-script'
 }
 type CacheEntry<T> = { data: T; cachedAt: number }
 type NewsSentimentLabel = '긍정' | '부정' | '중립'
@@ -222,6 +223,7 @@ const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
 const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
 const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
+let kisTokenPromise: Promise<string> | null = null
 const redisClient = redisUrl ? createClient({ url: redisUrl }) : null
 if (redisClient) {
   redisClient.connect().catch((err: unknown) => {
@@ -398,24 +400,34 @@ async function getKisAccessToken(): Promise<string> {
   if (kisTokenCache.token && now < kisTokenCache.expiresAtMs) {
     return kisTokenCache.token
   }
-  const response = await fetch(`${KIS_URL_BASE}/oauth2/tokenP`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'client_credentials',
-      appkey: KIS_APP_KEY,
-      appsecret: KIS_APP_SECRET,
-    }),
-    signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
-  })
-  if (!response.ok) {
-    throw new Error(`KIS token error: ${response.status} ${await response.text()}`)
+  if (kisTokenPromise) {
+    return kisTokenPromise
   }
-  const json = (await response.json()) as { access_token?: string }
-  if (!json.access_token) throw new Error('KIS token missing in response')
-  kisTokenCache.token = json.access_token
-  kisTokenCache.expiresAtMs = now + 1000 * 60 * 60 * 23
-  return json.access_token
+  kisTokenPromise = (async () => {
+    try {
+      const response = await fetch(`${KIS_URL_BASE}/oauth2/tokenP`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'client_credentials',
+          appkey: KIS_APP_KEY,
+          appsecret: KIS_APP_SECRET,
+        }),
+        signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+      })
+      if (!response.ok) {
+        throw new Error(`KIS token error: ${response.status} ${await response.text()}`)
+      }
+      const json = (await response.json()) as { access_token?: string }
+      if (!json.access_token) throw new Error('KIS token missing in response')
+      kisTokenCache.token = json.access_token
+      kisTokenCache.expiresAtMs = Date.now() + 1000 * 60 * 60 * 23
+      return json.access_token
+    } finally {
+      kisTokenPromise = null
+    }
+  })()
+  return kisTokenPromise
 }
 
 async function fetchKisDailyCloses(
@@ -1238,19 +1250,30 @@ async function runDailyClosePipeline(
   const predictions: PredictionRecord[] = []
   await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
     try {
-      const predict = await fetchPredict(ticker, runDate)
+      const horizons = [1, 3, 5, 10] as const
+      const predicts: Awaited<ReturnType<typeof fetchPredict>>[] = []
+      for (const h of horizons) {
+        predicts.push(await fetchPredict(ticker, runDate, h))
+      }
+      const basePredict = predicts[0]
       const record: PredictionRecord = {
         ticker,
         market,
-        predictionDate: predict.last_date,
-        predictedDirection: predict.direction,
-        probabilityUp: Number(predict.probability_up.toFixed(4)),
-        baseClose: Number(predict.last_close.toFixed(2)),
-        targetDateExpected: getNextWeekday(predict.last_date),
-        modelTrainedAt: predict.model_trained_at,
-        cvAccuracy: predict.cv_accuracy,
-        cvPrecision: predict.cv_precision,
-        reasonSummary: predict.reason_summary,
+        predictionDate: basePredict.last_date,
+        predictedDirection: basePredict.direction,
+        probabilityUp: Number(basePredict.probability_up.toFixed(4)),
+        probabilities: {
+          h1: Number(predicts[0].probability_up.toFixed(4)),
+          h3: Number(predicts[1].probability_up.toFixed(4)),
+          h5: Number(predicts[2].probability_up.toFixed(4)),
+          h10: Number(predicts[3].probability_up.toFixed(4)),
+        },
+        baseClose: Number(basePredict.last_close.toFixed(2)),
+        targetDateExpected: getNextWeekday(basePredict.last_date),
+        modelTrainedAt: basePredict.model_trained_at,
+        cvAccuracy: basePredict.cv_accuracy,
+        cvPrecision: basePredict.cv_precision,
+        reasonSummary: basePredict.reason_summary,
         outcomeStatus: 'pending',
         source: 'daily-close-job',
       }

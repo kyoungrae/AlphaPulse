@@ -7,6 +7,7 @@ export type PredictionHistoryItem = {
   predictionDate: string
   predictedDirection: 'Up' | 'Down'
   probabilityUp: number
+  probabilities?: { h1: number; h3: number; h5: number; h10: number }
   baseClose: number
   probabilityDelta: number | null
   directionChanged: boolean
@@ -22,6 +23,7 @@ type RawPredictionRow = {
   direction?: string
   probabilityUp?: number
   probability_up?: number
+  probabilities?: unknown
   baseClose?: number
   base_close?: number
   actualDirection?: string | null
@@ -32,6 +34,31 @@ type RawPredictionRow = {
   actual_close?: number | null
   isCorrect?: boolean | null
   is_correct?: boolean | null
+}
+
+function readMultiHorizonProbabilities(
+  row: RawPredictionRow,
+): { h1: number; h3: number; h5: number; h10: number } | undefined {
+  const value = row.probabilities
+  if (value == null || typeof value !== 'object') return undefined
+  const typed = value as Record<string, unknown>
+  const h1 = typed.h1
+  const h3 = typed.h3
+  const h5 = typed.h5
+  const h10 = typed.h10
+  if (
+    typeof h1 === 'number' &&
+    Number.isFinite(h1) &&
+    typeof h3 === 'number' &&
+    Number.isFinite(h3) &&
+    typeof h5 === 'number' &&
+    Number.isFinite(h5) &&
+    typeof h10 === 'number' &&
+    Number.isFinite(h10)
+  ) {
+    return { h1, h3, h5, h10 }
+  }
+  return undefined
 }
 
 function normalizeDirection(v: unknown): 'Up' | 'Down' | null {
@@ -70,6 +97,7 @@ export function buildHistoryItemsFromPredictionsDoc(
         typeof row.predictionDate === 'string' ? row.predictionDate : k
       const probabilityUp = readProbability(row)
       if (probabilityUp == null) return null
+      const probabilities = readMultiHorizonProbabilities(row)
       const predictedDirection = normalizeDirection(row.predictedDirection ?? row.direction)
       if (!predictedDirection) return null
       let baseClose = 0
@@ -100,6 +128,7 @@ export function buildHistoryItemsFromPredictionsDoc(
         predictionDate,
         predictedDirection,
         probabilityUp,
+        probabilities,
         baseClose,
         actualDirection,
         actualDate,

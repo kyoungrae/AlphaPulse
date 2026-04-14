@@ -1169,7 +1169,55 @@ export default function Dashboard() {
                         {item.predictedDirection === 'Up' ? '▲ 상승' : '▼ 하락'}
                       </span>
                     </td>
-                    <td className="px-4 py-3 font-semibold tabular-nums">{(item.probabilityUp * 100).toFixed(1)}%</td>
+                    <td className="group relative cursor-help px-4 py-3 font-semibold tabular-nums">
+                      <span
+                        className={
+                          item.probabilityUp >= 0.5
+                            ? 'text-emerald-400 underline decoration-dotted'
+                            : 'text-rose-400 underline decoration-dotted'
+                        }
+                      >
+                        {(item.probabilityUp * 100).toFixed(1)}%
+                      </span>
+
+                      <div className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 hidden w-[360px] max-w-[90vw] -translate-x-1/2 whitespace-normal group-hover:block">
+                        <div className="rounded-xl border border-slate-700 bg-slate-900/95 p-4 shadow-2xl backdrop-blur-md">
+                          <p className="mb-3 text-[11px] font-bold text-blue-300">
+                            {item.predictionDate} 기준 기간별 예측 추이
+                          </p>
+                          <div className="flex h-16 items-end gap-2">
+                            {[
+                              { name: '1D(내일)', prob: item.probabilities?.h1 ?? item.probabilityUp },
+                              { name: '3D', prob: item.probabilities?.h3 },
+                              { name: '5D(기본)', prob: item.probabilities?.h5 },
+                              { name: '10D', prob: item.probabilities?.h10 },
+                            ].map(
+                              (d, i) =>
+                                d.prob != null && (
+                                  <div key={i} className="flex flex-1 flex-col items-center gap-1">
+                                    <div
+                                      className={`w-full rounded-t-sm transition-all duration-300 ${
+                                        d.prob >= 0.5
+                                          ? 'bg-emerald-500/80 shadow-[0_0_8px_rgba(16,185,129,0.5)]'
+                                          : 'bg-rose-500/80 shadow-[0_0_8px_rgba(244,63,94,0.5)]'
+                                      }`}
+                                      style={{ height: `${Math.max(5, d.prob * 100)}%` }}
+                                    />
+                                    <span className="text-[9px] leading-none text-slate-400">{d.name}</span>
+                                    <span className="text-[10px] leading-none font-bold text-white">
+                                      {(d.prob * 100).toFixed(1)}%
+                                    </span>
+                                  </div>
+                                ),
+                            )}
+                          </div>
+                          <p className="mt-3 border-t border-slate-800/80 pt-2 text-[9px] leading-relaxed text-slate-500 whitespace-normal break-keep">
+                            * 배치는 가장 즉각적인 반응(1D)을 기준으로 적중 여부를 채점하며, 대시보드는 큰 추세(5D)를
+                            기본으로 보여줍니다.
+                          </p>
+                        </div>
+                      </div>
+                    </td>
                     <td className="px-4 py-3 text-xs tabular-nums">
                       {item.probabilityDelta == null ? (
                         <span className="text-slate-500">-</span>
