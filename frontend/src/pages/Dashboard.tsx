@@ -1158,7 +1158,13 @@ export default function Dashboard() {
                       stroke="#22c55e"
                       strokeDasharray="4 4"
                       strokeOpacity={0.8}
-                      label={{ value: '매물대 지지', fill: '#86efac', fontSize: 10, position: 'left' }}
+                      label={{
+                        value: '매물대 지지',
+                        fill: '#86efac',
+                        fontSize: 10,
+                        position: 'insideRight',
+                        dx: chartShowBars ? -44 : -8,
+                      }}
                     />
                   )}
                   {(chartShowCandles || chartShowLines) && vbpLevels.resistance != null && (
@@ -1168,7 +1174,13 @@ export default function Dashboard() {
                       stroke="#f97316"
                       strokeDasharray="4 4"
                       strokeOpacity={0.8}
-                      label={{ value: '매물대 저항', fill: '#fdba74', fontSize: 10, position: 'left' }}
+                      label={{
+                        value: '매물대 저항',
+                        fill: '#fdba74',
+                        fontSize: 10,
+                        position: 'insideRight',
+                        dx: chartShowBars ? -44 : -8,
+                      }}
                     />
                   )}
                 </ComposedChart>
