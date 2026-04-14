@@ -639,6 +639,10 @@ export default function Dashboard() {
     loading: predictLoading,
     error: predictError,
   } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=${horizon}`))
+  const { data: predictH1 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=1`))
+  const { data: predictH3 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=3`))
+  const { data: predictH5 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=5`))
+  const { data: predictH10 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=10`))
   const {
     data: history,
     loading: historyLoading,
@@ -1181,33 +1185,7 @@ export default function Dashboard() {
                         {item.predictedDirection === 'Up' ? '▲ 상승' : '▼ 하락'}
                       </span>
                     </td>
-                    <td
-                      className="cursor-help px-4 py-3 font-semibold tabular-nums"
-                      onMouseEnter={(e) => {
-                        const rect = e.currentTarget.getBoundingClientRect()
-                        setProbabilityTooltip({
-                          x: rect.left + rect.width / 2,
-                          y: rect.top - 8,
-                          item: {
-                            predictionDate: item.predictionDate,
-                            probabilityUp: item.probabilityUp,
-                            probabilities: item.probabilities,
-                          },
-                        })
-                      }}
-                      onMouseMove={(e) => {
-                        setProbabilityTooltip((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                x: e.clientX,
-                                y: e.clientY - 10,
-                              }
-                            : prev,
-                        )
-                      }}
-                      onMouseLeave={() => setProbabilityTooltip(null)}
-                    >
+                    <td className="px-4 py-3 font-semibold tabular-nums">
                       <span
                         className={
                           item.probabilityUp >= 0.5
@@ -1343,9 +1321,38 @@ export default function Dashboard() {
               <div className="flex items-center justify-between">
                 <span className="text-slate-200">상승 확률</span>
                 <span
-                  className={`text-lg font-bold ${
+                  className={`cursor-help text-lg font-bold underline decoration-dotted ${
                     predict.probability_up >= 0.5 ? 'text-emerald-400' : 'text-rose-400'
                   }`}
+                  onMouseEnter={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    setProbabilityTooltip({
+                      x: rect.left + rect.width / 2,
+                      y: rect.top - 8,
+                      item: {
+                        predictionDate: predict.last_date,
+                        probabilityUp: predict.probability_up,
+                        probabilities: {
+                          h1: predictH1?.probability_up,
+                          h3: predictH3?.probability_up,
+                          h5: predictH5?.probability_up,
+                          h10: predictH10?.probability_up,
+                        },
+                      },
+                    })
+                  }}
+                  onMouseMove={(e) => {
+                    setProbabilityTooltip((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            x: e.clientX,
+                            y: e.clientY - 10,
+                          }
+                        : prev,
+                    )
+                  }}
+                  onMouseLeave={() => setProbabilityTooltip(null)}
                 >
                   {(predict.probability_up * 100).toFixed(1)}%
                 </span>
