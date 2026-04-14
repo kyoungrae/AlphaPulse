@@ -7,6 +7,8 @@ export type SignalAction = 'buy' | 'sell' | 'short' | 'cover' | 'hold'
 export type CandlePoint = {
   date: string
   open: number
+  high?: number
+  low?: number
   close: number
 }
 
@@ -152,9 +154,26 @@ function calcSharpe(returns: number[]) {
   return (mean / std) * Math.sqrt(252)
 }
 
+function calculateATR(candles: CandlePoint[], period = 14): number[] {
+  const atr = new Array(candles.length).fill(0)
+  let trSum = 0
+  for (let i = 0; i < candles.length; i += 1) {
+    const c = candles[i]
+    const high = Number.isFinite(c.high) ? (c.high as number) : Math.max(c.open, c.close)
+    const low = Number.isFinite(c.low) ? (c.low as number) : Math.min(c.open, c.close)
+    const prevClose = i > 0 ? candles[i - 1].close : c.open
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose))
+    if (i < period) {
+      trSum += tr
+      atr[i] = trSum / (i + 1)
+    } else {
+      atr[i] = (atr[i - 1] * (period - 1) + tr) / period
+    }
+  }
+  return atr
+}
+
 export function runBacktest(input: BacktestInput): BacktestResult {
-  const STOP_LOSS_PCT = 0.05
-  const TAKE_PROFIT_PCT = 0.15
   const byDateProb = new Map(input.probabilities.map((p) => [p.date, p.probabilityUp]))
   const candles = input.candles
     .filter((c) => byDateProb.has(c.date))
@@ -162,6 +181,7 @@ export function runBacktest(input: BacktestInput): BacktestResult {
   if (candles.length < 3) {
     throw new Error('백테스트를 위한 데이터가 충분하지 않습니다.')
   }
+  const atrArray = calculateATR(candles, 14)
 
   let capital = input.initialCapital
   let currentSide: PositionSide | null = null
@@ -184,15 +204,19 @@ export function runBacktest(input: BacktestInput): BacktestResult {
     const isExtremeVolatility = probabilityUp > 0.8 || probabilityUp < 0.2
     const longPenalty = isExtremeVolatility ? 1.005 : 1.0
     const shortPenalty = isExtremeVolatility ? 0.995 : 1.0
+    const currentAtr = atrArray[i] ?? 0
+    const atrPct = today.close > 0 ? currentAtr / today.close : 0
+    const dynamicStopLossPct = Math.max(0.025, atrPct * 2.0)
+    const dynamicTakeProfitPct = Math.max(0.05, atrPct * 3.5)
 
     if (currentSide === 'long') {
       const currentReturn = today.close / entryPrice - 1
-      if (currentReturn <= -STOP_LOSS_PCT || currentReturn >= TAKE_PROFIT_PCT) {
+      if (currentReturn <= -dynamicStopLossPct || currentReturn >= dynamicTakeProfitPct) {
         action = 'sell'
       }
     } else if (currentSide === 'short') {
       const currentReturn = entryPrice / today.close - 1
-      if (currentReturn <= -STOP_LOSS_PCT || currentReturn >= TAKE_PROFIT_PCT) {
+      if (currentReturn <= -dynamicStopLossPct || currentReturn >= dynamicTakeProfitPct) {
         action = 'cover'
       }
     }

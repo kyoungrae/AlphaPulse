@@ -699,10 +699,12 @@ function getFirestore() {
   }
 }
 
-async function fetchPredict(ticker: string, asOf?: string) {
+async function fetchPredict(ticker: string, asOf?: string, horizon = 1) {
   const base = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
-  const url =
-    asOf && /^\d{4}-\d{2}-\d{2}$/.test(asOf) ? `${base}?as_of=${encodeURIComponent(asOf)}` : base
+  const query = new URLSearchParams()
+  if (asOf && /^\d{4}-\d{2}-\d{2}$/.test(asOf)) query.set('as_of', asOf)
+  query.set('horizon', String(horizon))
+  const url = query.size > 0 ? `${base}?${query.toString()}` : base
   const response = await fetch(url)
   if (!response.ok) {
     const body = await response.text()
@@ -751,6 +753,8 @@ async function loadHistoricalCandles(
       .map((q) => ({
         date: q.date!.toISOString().slice(0, 10),
         open: Number(q.open),
+        high: Number(q.high ?? q.open ?? q.close),
+        low: Number(q.low ?? q.open ?? q.close),
         close: Number(q.close),
       }))
       .sort((a, b) => a.date.localeCompare(b.date)) ?? []
@@ -1832,21 +1836,27 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
   }
   const asOfRaw = typeof req.query.as_of === 'string' ? req.query.as_of.trim() : ''
   const asOf = /^\d{4}-\d{2}-\d{2}$/.test(asOfRaw) ? asOfRaw : undefined
-  const redisPredictKey = `predict:${ticker}`
+  const horizonRaw = Number(req.query.horizon ?? 1)
+  const horizon = Number.isFinite(horizonRaw) ? Math.min(Math.max(Math.floor(horizonRaw), 1), 30) : 1
+  const cacheKey = `${ticker}:${horizon}`
+  const redisPredictKey = `predict:${cacheKey}`
   if (!asOf) {
     const redisPredict = await getRedisJson<Record<string, unknown>>(redisPredictKey)
     if (redisPredict) {
-      predictCache.set(ticker, { data: redisPredict, cachedAt: Date.now() })
+      predictCache.set(cacheKey, { data: redisPredict, cachedAt: Date.now() })
       return res.json(redisPredict)
     }
-    const cached = predictCache.get(ticker)
+    const cached = predictCache.get(cacheKey)
     if (cached && Date.now() - cached.cachedAt < PREDICT_CACHE_TTL_MS) {
       return res.json(cached.data)
     }
   }
 
   const base = `${predictBase.replace(/\/+$/, '')}/predict/${encodeURIComponent(ticker)}`
-  const url = asOf ? `${base}?as_of=${encodeURIComponent(asOf)}` : base
+  const query = new URLSearchParams()
+  if (asOf) query.set('as_of', asOf)
+  query.set('horizon', String(horizon))
+  const url = `${base}?${query.toString()}`
 
   try {
     const response = await fetch(url)
@@ -1858,7 +1868,7 @@ app.get('/api/predict/:ticker', async (req: Request, res: Response) => {
     }
     const json = await response.json()
     if (!asOf) {
-      predictCache.set(ticker, { data: json as Record<string, unknown>, cachedAt: Date.now() })
+      predictCache.set(cacheKey, { data: json as Record<string, unknown>, cachedAt: Date.now() })
       await setRedisJson(redisPredictKey, json, Math.floor(PREDICT_CACHE_TTL_MS / 1000))
     }
     return res.json(json)

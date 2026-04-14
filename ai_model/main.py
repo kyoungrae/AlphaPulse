@@ -21,6 +21,7 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -96,6 +97,10 @@ NEWS_FEATURES_ENABLED = os.getenv("NEWS_FEATURES_ENABLED", "true").lower() != "f
 MACRO_CACHE_TTL_MINUTES = 60
 FINBERT_MODEL = os.getenv("FINBERT_MODEL", "ProsusAI/finbert")
 FINBERT_ENABLED = os.getenv("FINBERT_ENABLED", "true").lower() != "false"
+KIS_APP_KEY = os.getenv("KIS_APP_KEY")
+KIS_APP_SECRET = os.getenv("KIS_APP_SECRET")
+KIS_URL_BASE = os.getenv("KIS_URL_BASE", "https://openapi.koreainvestment.com:9443").rstrip("/")
+KIS_TIMEOUT_SECONDS = float(os.getenv("KIS_TIMEOUT_SECONDS", "10"))
 
 
 @dataclass
@@ -111,6 +116,7 @@ MODEL_CACHE: Dict[str, ModelBundle] = {}
 PRICE_CACHE: Dict[Tuple[str, int], Tuple[pd.DataFrame, datetime]] = {}
 MACRO_CACHE: Dict[int, Tuple[pd.DataFrame, datetime]] = {}
 FINBERT_PIPELINE: Dict[str, object] = {}
+kis_token_cache: Dict[str, Optional[object]] = {"token": None, "expires_at": None}
 
 
 def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.DataFrame:
@@ -121,12 +127,23 @@ def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.
     if datetime.now() - loaded_at < timedelta(minutes=PRICE_CACHE_TTL_MINUTES):
       return df_cached.copy()
 
-  df = yf.download(ticker, period=f"{period_years}y", interval="1d", auto_adjust=False)
-  # Flatten multi-index columns if present (single ticker can still return multi-index)
-  if isinstance(df.columns, pd.MultiIndex):
-    # Select the second level (ticker) and rename to single-level columns
-    df.columns = [col[0] for col in df.columns]  # e.g., ('Close','AAPL') -> 'Close'
-  df = df.dropna()
+  is_korean_stock = str(ticker).upper().endswith((".KS", ".KQ"))
+  df: Optional[pd.DataFrame] = None
+  if is_korean_stock and KIS_APP_KEY and KIS_APP_SECRET:
+    try:
+      logger.info("[%s] Loading OHLCV from KIS API", ticker)
+      df = fetch_kis_ohlcv(ticker, period_years)
+    except Exception as err:
+      logger.warning("[%s] KIS load failed, falling back to yfinance: %s", ticker, err)
+      df = None
+
+  if df is None:
+    df = yf.download(ticker, period=f"{period_years}y", interval="1d", auto_adjust=False)
+    # Flatten multi-index columns if present (single ticker can still return multi-index)
+    if isinstance(df.columns, pd.MultiIndex):
+      # Select the second level (ticker) and rename to single-level columns
+      df.columns = [col[0] for col in df.columns]  # e.g., ('Close','AAPL') -> 'Close'
+    df = df.dropna()
 
   # Ensure required columns exist
   expected = {"Open", "High", "Low", "Close", "Volume"}
@@ -135,6 +152,84 @@ def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.
     raise ValueError(f"Missing columns in price data: {missing}")
   PRICE_CACHE[cache_key] = (df, datetime.now())
   return df.copy()
+
+
+def get_kis_access_token() -> str:
+  """Issue and cache KIS OAuth token for ~23h."""
+  if not KIS_APP_KEY or not KIS_APP_SECRET:
+    raise RuntimeError("KIS_APP_KEY/KIS_APP_SECRET not configured")
+
+  now = datetime.now()
+  cached_token = kis_token_cache.get("token")
+  cached_exp = kis_token_cache.get("expires_at")
+  if isinstance(cached_token, str) and isinstance(cached_exp, datetime) and now < cached_exp:
+    return cached_token
+
+  headers = {"content-type": "application/json"}
+  body = {
+    "grant_type": "client_credentials",
+    "appkey": KIS_APP_KEY,
+    "appsecret": KIS_APP_SECRET,
+  }
+  res = requests.post(
+    f"{KIS_URL_BASE}/oauth2/tokenP",
+    headers=headers,
+    json=body,
+    timeout=KIS_TIMEOUT_SECONDS,
+  )
+  res.raise_for_status()
+  payload = res.json()
+  token = payload.get("access_token")
+  if not token:
+    raise RuntimeError(f"KIS token missing in response: {payload}")
+
+  kis_token_cache["token"] = token
+  kis_token_cache["expires_at"] = now + timedelta(hours=23)
+  return token
+
+
+def fetch_kis_ohlcv(ticker: str, period_years: int) -> pd.DataFrame:
+  token = get_kis_access_token()
+  code = str(ticker).upper().split(".")[0]
+
+  end_date = datetime.now()
+  start_date = end_date - timedelta(days=period_years * 365)
+  headers = {
+    "content-type": "application/json; charset=utf-8",
+    "authorization": f"Bearer {token}",
+    "appkey": KIS_APP_KEY or "",
+    "appsecret": KIS_APP_SECRET or "",
+    "tr_id": "FHKST03010100",
+  }
+  params = {
+    "FID_COND_MRKT_DIV_CODE": "J",
+    "FID_INPUT_ISCD": code,
+    "FID_INPUT_DATE_1": start_date.strftime("%Y%m%d"),
+    "FID_INPUT_DATE_2": end_date.strftime("%Y%m%d"),
+    "FID_PERIOD_DIV_CODE": "D",
+    "FID_ORG_ADJ_PRC": "1",
+  }
+  res = requests.get(
+    f"{KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+    headers=headers,
+    params=params,
+    timeout=KIS_TIMEOUT_SECONDS,
+  )
+  res.raise_for_status()
+  payload = res.json()
+  if payload.get("rt_cd") != "0" or not payload.get("output2"):
+    raise ValueError(f"KIS API 조회 실패: {payload.get('msg1')}")
+
+  raw = pd.DataFrame(payload["output2"])
+  raw["Date"] = pd.to_datetime(raw["stck_bsop_date"], format="%Y%m%d")
+  raw = raw.set_index("Date").sort_index()
+  standard = pd.DataFrame(index=raw.index)
+  standard["Open"] = pd.to_numeric(raw["stck_oprc"], errors="coerce")
+  standard["High"] = pd.to_numeric(raw["stck_hgpr"], errors="coerce")
+  standard["Low"] = pd.to_numeric(raw["stck_lwpr"], errors="coerce")
+  standard["Close"] = pd.to_numeric(raw["stck_clpr"], errors="coerce")
+  standard["Volume"] = pd.to_numeric(raw["acml_vol"], errors="coerce")
+  return standard.dropna()
 
 
 def load_news_feature_data(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
@@ -216,7 +311,7 @@ def load_macro_feature_data(period_years: int = DATA_BASELINE_YEARS) -> pd.DataF
   return merged.copy()
 
 
-def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+def add_features(df: pd.DataFrame, ticker: str, horizon: int = 1) -> pd.DataFrame:
   df = df.copy()
   df.index = pd.to_datetime(df.index).tz_localize(None)
   close = df["Close"]
@@ -257,7 +352,7 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     obv_vals.diff(5) / vol.rolling(5).mean().replace(0, 1)
   ).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
 
-  df["target"] = (close.shift(-1) > close).astype(int)
+  df["target"] = (close.shift(-horizon) > close * 1.01).astype(int)
 
   news_df = load_news_feature_data(
     ticker=ticker,
@@ -351,12 +446,15 @@ def add_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
   return df
 
 
-def train_model(ticker: str = "AAPL") -> ModelBundle:
+def train_model(ticker: str = "AAPL", horizon: int = 1) -> ModelBundle:
   df = load_price_data(ticker)
-  df_feat = add_features(df, ticker)
+  df_feat = add_features(df, ticker, horizon=horizon)
+  if horizon >= len(df_feat):
+    raise ValueError(f"horizon={horizon} is too large for available rows={len(df_feat)}")
+  df_train = df_feat.iloc[:-horizon].dropna(subset=["target"])
 
-  X = df_feat[FEATURE_COLS]
-  y = df_feat["target"]
+  X = df_train[FEATURE_COLS]
+  y = df_train["target"]
 
   scaler = StandardScaler()
   X_scaled = scaler.fit_transform(X)
@@ -409,8 +507,9 @@ def train_model(ticker: str = "AAPL") -> ModelBundle:
   cv_precision = float(cv_scores["test_precision"].mean())
 
   logger.info(
-    "Model trained for %s (samples=%s, cv_acc=%.4f, cv_prec=%.4f)",
+    "Model trained for %s horizon=%s (samples=%s, cv_acc=%.4f, cv_prec=%.4f)",
     ticker,
+    horizon,
     len(X),
     cv_accuracy,
     cv_precision,
@@ -424,15 +523,16 @@ def train_model(ticker: str = "AAPL") -> ModelBundle:
   )
 
 
-def get_model_bundle(ticker: str) -> ModelBundle:
-  cached = MODEL_CACHE.get(ticker)
+def get_model_bundle(ticker: str, horizon: int = 1) -> ModelBundle:
+  cache_key = f"{ticker}_{horizon}"
+  cached = MODEL_CACHE.get(cache_key)
   if cached:
     age = datetime.now() - cached.trained_at
     if age < timedelta(hours=MODEL_TTL_HOURS):
       return cached
 
-  bundle = train_model(ticker)
-  MODEL_CACHE[ticker] = bundle
+  bundle = train_model(ticker, horizon=horizon)
+  MODEL_CACHE[cache_key] = bundle
   return bundle
 
 
@@ -488,7 +588,7 @@ def get_finbert_pipeline():
 def _startup():
   for ticker in PRELOAD_TICKERS:
     try:
-      MODEL_CACHE[ticker] = train_model(ticker)
+      MODEL_CACHE[f"{ticker}_1"] = train_model(ticker, horizon=1)
     except Exception as err:
       logger.warning("Preload failed for %s: %s", ticker, err)
   logger.info("Startup preload complete. cached=%s", len(MODEL_CACHE))
@@ -501,16 +601,17 @@ def predict(
     None,
     description="YYYY-MM-DD: 해당 달력일(또는 그 이전 마지막 거래일) 종가 시점 피처로 예측합니다. 생략 시 최신 행.",
   ),
+  horizon: int = Query(1, ge=1, le=30, description="예측 기간(거래일 기준). 기본 1일"),
 ):
   ticker = ticker.upper()
   try:
-    bundle = get_model_bundle(ticker)
+    bundle = get_model_bundle(ticker, horizon=horizon)
   except Exception as err:
     raise HTTPException(status_code=500, detail=f"모델 학습/로드 실패: {err}") from err
 
   # Use recent data to generate the latest feature row (or the row on/before as_of)
   df = load_price_data(ticker, period_years=DATA_BASELINE_YEARS)
-  df_feat = add_features(df, ticker)
+  df_feat = add_features(df, ticker, horizon=horizon)
   if df_feat.empty:
     raise HTTPException(status_code=400, detail="지표 계산을 위한 데이터가 충분하지 않습니다.")
 

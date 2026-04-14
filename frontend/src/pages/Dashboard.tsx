@@ -574,6 +574,7 @@ export default function Dashboard() {
   const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
   const [strategy, setStrategy] = useState<StrategyMode>('long_only')
+  const [horizon, setHorizon] = useState<1 | 3 | 5 | 10>(5)
   const [chartShowCandles, setChartShowCandles] = useState(true)
   const [chartShowLines, setChartShowLines] = useState(true)
   const [chartShowBars, setChartShowBars] = useState(true)
@@ -626,7 +627,7 @@ export default function Dashboard() {
     data: predict,
     loading: predictLoading,
     error: predictError,
-  } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}`))
+  } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=${horizon}`))
   const {
     data: history,
     loading: historyLoading,
@@ -948,7 +949,7 @@ export default function Dashboard() {
           AI 퀀트 매니저 상세 분석 리포트
         </h3>
         <p className="mt-2 text-sm text-slate-200">
-          AI 모델 기준 내일 <span className="font-semibold text-white">{selectedDisplayName}</span>은(는)
+          AI 모델 기준 {horizon === 1 ? '내일' : `${horizon}일 후`} <span className="font-semibold text-white">{selectedDisplayName}</span>은(는)
           <span className={isUp ? ' font-bold text-emerald-400' : ' font-bold text-rose-400'}>
             {isUp ? ' 상승' : ' 하락'} 확률 {prob}%
           </span>
@@ -991,6 +992,7 @@ export default function Dashboard() {
     vbpLevels,
     priceCurrency,
     selectedDisplayName,
+    horizon,
   ])
   return (
     <div className="space-y-6">
@@ -1061,6 +1063,23 @@ export default function Dashboard() {
             <p className="text-xs uppercase tracking-[0.2em] text-blue-300">현재 선택</p>
             <p className="mt-1 text-xl font-bold text-white">{selectedDisplayName}</p>
             <p className="mt-1 text-xs text-slate-500">{selectedSymbol}</p>
+            <div className="mt-3">
+              <p className="text-[11px] uppercase tracking-[0.2em] text-blue-300">예측 기간</p>
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                {([1, 3, 5, 10] as const).map((d) => (
+                  <button
+                    key={d}
+                    type="button"
+                    onClick={() => setHorizon(d)}
+                    className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
+                      horizon === d ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                    }`}
+                  >
+                    {d === 1 ? '내일(1D)' : `${d}일`}
+                  </button>
+                ))}
+              </div>
+            </div>
             <p className="mt-2 text-xs text-slate-400">
               목록 크기: {symbols?.total ?? 0}개 (상세 데이터는 선택 종목만 조회)
             </p>

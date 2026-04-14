@@ -34,3 +34,11 @@ build
 # debug
 *.tsbuildinfo
 
+# python / ai_model
+__pycache__/
+*.py[cod]
+.pycache/
+.venv/
+venv/
+/ai_model/.env
+
