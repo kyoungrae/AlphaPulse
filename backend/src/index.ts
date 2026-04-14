@@ -36,6 +36,13 @@ const DAILY_JOB_SYMBOL_LIMIT = Math.max(1, Number(process.env.DAILY_JOB_SYMBOL_L
 const STARTUP_CATCHUP_DAYS = Math.max(1, Math.min(14, Number(process.env.STARTUP_CATCHUP_DAYS ?? 7)))
 const STARTUP_CATCHUP_DISABLED =
   process.env.DISABLE_STARTUP_CATCHUP === 'true' || process.env.DISABLE_STARTUP_CATCHUP === '1'
+const STARTUP_CATCHUP_ENABLED =
+  !STARTUP_CATCHUP_DISABLED &&
+  (process.env.ENABLE_STARTUP_CATCHUP === 'true' ||
+    process.env.ENABLE_STARTUP_CATCHUP === '1' ||
+    process.env.NODE_ENV === 'production')
+/** Catch-up should be lighter than scheduled daily job to avoid startup log storms. */
+const STARTUP_CATCHUP_SYMBOL_LIMIT = Math.max(1, Number(process.env.STARTUP_CATCHUP_SYMBOL_LIMIT ?? 30))
 const BACKTEST_CACHE_TTL_MS = 1000 * 60 * 60 * 6
 /** AI 예측 서버(10년 학습)와 맞추기 위한 백테스트·전략 요약 기본 조회 기간 */
 const BACKTEST_DEFAULT_LOOKBACK_YEARS = 10
@@ -1052,19 +1059,22 @@ async function reconcilePendingOutcomes(symbols: string[]) {
 async function runDailyClosePipeline(
   market: Market,
   runDate: string,
+  options?: { symbolLimit?: number; throwIfNoSuccess?: boolean },
 ): Promise<{
   generatedCount: number
   resolvedCount: number
   correctCount: number
   processedCount: number
+  failedCount: number
 } | null> {
   const db = getFirestore()
   if (!db || !/^\d{4}-\d{2}-\d{2}$/.test(runDate)) return null
 
+  const limit = Math.max(1, Math.min(options?.symbolLimit ?? DAILY_JOB_SYMBOL_LIMIT, DAILY_JOB_SYMBOL_LIMIT))
   const symbols =
     market === 'kr'
-      ? koreaSymbols.slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
-      : (await getSp500Symbols()).slice(0, DAILY_JOB_SYMBOL_LIMIT).map((s) => s.symbol)
+      ? koreaSymbols.slice(0, limit).map((s) => s.symbol)
+      : (await getSp500Symbols()).slice(0, limit).map((s) => s.symbol)
   const predictions: PredictionRecord[] = []
   await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
     try {
@@ -1102,6 +1112,12 @@ async function runDailyClosePipeline(
       console.error(`일일 예측 저장 실패: ${ticker}`, err)
     }
   })
+  const failedCount = Math.max(0, symbols.length - predictions.length)
+  if (options?.throwIfNoSuccess && predictions.length === 0 && failedCount > 0) {
+    throw new Error(
+      `[daily-close pipeline] all predictions failed for market=${market}, runDate=${runDate}, symbols=${symbols.length}`,
+    )
+  }
 
   const { resolvedCount, correctCount, processedCount } = await reconcilePendingOutcomes(symbols)
   await db.collection('analysis_daily').doc(`${market}_${runDate}`).set(
@@ -1121,17 +1137,21 @@ async function runDailyClosePipeline(
     resolvedCount,
     correctCount,
     processedCount,
+    failedCount,
   }
 }
 
 /** After server start: for each market TZ, fill missing weekdays in last N days (today excluded) when analysis_daily is absent or empty. Does not update job_meta. */
 async function runStartupDailyCloseCatchUp() {
-  if (STARTUP_CATCHUP_DISABLED) return
+  if (!STARTUP_CATCHUP_ENABLED) {
+    console.log('[startup daily catch-up] skipped (disabled for this environment)')
+    return
+  }
   const db = getFirestore()
   if (!db) return
 
   console.log(
-    `[startup daily catch-up] Checking last ${STARTUP_CATCHUP_DAYS} calendar days (excluding today) per market for missing analysis_daily`,
+    `[startup daily catch-up] Checking last ${STARTUP_CATCHUP_DAYS} days, symbolLimit=${STARTUP_CATCHUP_SYMBOL_LIMIT}`,
   )
   for (const market of ['us', 'kr'] as const) {
     const tz = market === 'kr' ? 'Asia/Seoul' : 'America/New_York'
@@ -1155,10 +1175,13 @@ async function runStartupDailyCloseCatchUp() {
       dailyJobRunningByMarket[market] = true
       try {
         console.log(`[startup daily catch-up] ${market} ${runDate} missing → pipeline`)
-        const result = await runDailyClosePipeline(market, runDate)
+        const result = await runDailyClosePipeline(market, runDate, {
+          symbolLimit: STARTUP_CATCHUP_SYMBOL_LIMIT,
+          throwIfNoSuccess: true,
+        })
         if (result) {
           console.log(
-            `[startup daily catch-up] ${market} ${runDate} done · predictions ${result.generatedCount} · outcomes ${result.resolvedCount}`,
+            `[startup daily catch-up] ${market} ${runDate} done · predictions ${result.generatedCount} · failed ${result.failedCount} · outcomes ${result.resolvedCount}`,
           )
         }
       } catch (err) {
