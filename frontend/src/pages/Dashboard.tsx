@@ -359,50 +359,63 @@ function StockChartTooltip({
   if (!active || !payload?.length) return null
   const row = payload[0].payload
   if (!row) return null
+  const candleUp = row.close >= row.open
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs shadow-lg" style={{ color: '#e5e7eb' }}>
+    <div className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs shadow-lg">
       <p className="font-medium text-slate-100">{row.tooltipLabel}</p>
       <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
-        <span className="text-slate-500">시가</span>
-        <span className="text-right tabular-nums">{formatMoney(row.open, priceCurrency)}</span>
-        <span className="text-slate-500">고가</span>
-        <span className="text-right tabular-nums">{formatMoney(row.high, priceCurrency)}</span>
-        <span className="text-slate-500">저가</span>
-        <span className="text-right tabular-nums">{formatMoney(row.low, priceCurrency)}</span>
-        <span className="text-slate-500">종가</span>
-        <span className="text-right tabular-nums">{formatMoney(row.close, priceCurrency)}</span>
+        <span className="font-medium text-sky-400">시가</span>
+        <span className="text-right tabular-nums text-sky-200">{formatMoney(row.open, priceCurrency)}</span>
+        <span className="font-medium text-emerald-400">고가</span>
+        <span className="text-right tabular-nums text-emerald-200">{formatMoney(row.high, priceCurrency)}</span>
+        <span className="font-medium text-rose-400">저가</span>
+        <span className="text-right tabular-nums text-rose-200">{formatMoney(row.low, priceCurrency)}</span>
+        <span className="font-medium text-amber-400">종가</span>
+        <span
+          className={`text-right tabular-nums font-medium ${
+            candleUp ? 'text-emerald-300' : 'text-rose-300'
+          }`}
+        >
+          {formatMoney(row.close, priceCurrency)}
+        </span>
         {row.sma20 != null && (
           <>
-            <span className="text-slate-500">SMA20</span>
-            <span className="text-right tabular-nums">{formatMoney(row.sma20, priceCurrency)}</span>
+            <span className="font-medium text-orange-400">SMA20</span>
+            <span className="text-right tabular-nums text-orange-200">{formatMoney(row.sma20, priceCurrency)}</span>
           </>
         )}
         {row.bbUpper != null && row.bbLower != null && (
           <>
-            <span className="text-slate-500">볼린저</span>
-            <span className="text-right tabular-nums text-[10px] leading-tight">
-              {formatMoney(row.bbUpper, priceCurrency)} ~ {formatMoney(row.bbLower, priceCurrency)}
+            <span className="font-medium text-violet-400">볼린저</span>
+            <span className="text-right text-[10px] leading-tight tabular-nums">
+              <span className="text-violet-200">{formatMoney(row.bbUpper, priceCurrency)}</span>
+              <span className="text-slate-500"> ~ </span>
+              <span className="text-indigo-200">{formatMoney(row.bbLower, priceCurrency)}</span>
             </span>
           </>
         )}
         {row.vbpSupport != null && row.vbpResistance != null && (
           <>
-            <span className="text-slate-500">매물대 지지/저항</span>
-            <span className="text-right tabular-nums text-[10px] leading-tight">
-              {formatMoney(row.vbpSupport, priceCurrency)} / {formatMoney(row.vbpResistance, priceCurrency)}
+            <span className="font-medium text-slate-400">매물대 지지/저항</span>
+            <span className="text-right text-[10px] leading-tight tabular-nums">
+              <span className="text-emerald-300">{formatMoney(row.vbpSupport, priceCurrency)}</span>
+              <span className="text-slate-500"> / </span>
+              <span className="text-orange-300">{formatMoney(row.vbpResistance, priceCurrency)}</span>
             </span>
           </>
         )}
         {row.vbpNodeStrength != null && (
           <>
-            <span className="text-slate-500">매물 밀집도</span>
-            <span className="text-right tabular-nums">{(row.vbpNodeStrength * 100).toFixed(1)}%</span>
+            <span className="font-medium text-cyan-400">매물 밀집도</span>
+            <span className="text-right tabular-nums text-cyan-200">{(row.vbpNodeStrength * 100).toFixed(1)}%</span>
           </>
         )}
         {typeof row.volume === 'number' && row.volume > 0 && (
           <>
-            <span className="text-slate-500">거래량</span>
-            <span className="text-right tabular-nums">{Math.round(row.volume).toLocaleString('ko-KR')}</span>
+            <span className="font-medium text-slate-400">거래량</span>
+            <span className="text-right tabular-nums text-slate-200">
+              {Math.round(row.volume).toLocaleString('ko-KR')}
+            </span>
           </>
         )}
       </div>
