@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Bar,
   BarChart,
@@ -29,6 +29,53 @@ const VBP_LABEL_LAYOUT = {
   dySupport: 0,
   dyResistance: 0,
 } as const
+
+/** 차트 휠 줌: 보이는 인덱스 구간 */
+const CHART_ZOOM_MIN_BARS = 12
+const CHART_ZOOM_STEP = 0.14
+
+function zoomRangeIn(start: number, end: number, fullLen: number): { start: number; end: number } {
+  const w = end - start + 1
+  const nw = Math.max(CHART_ZOOM_MIN_BARS, Math.floor(w * (1 - CHART_ZOOM_STEP)))
+  const center = (start + end) / 2
+  let ns = Math.round(center - nw / 2)
+  let ne = ns + nw - 1
+  if (ns < 0) {
+    ne -= ns
+    ns = 0
+  }
+  if (ne > fullLen - 1) {
+    ns -= ne - (fullLen - 1)
+    ne = fullLen - 1
+  }
+  ns = Math.max(0, ns)
+  ne = Math.min(fullLen - 1, ne)
+  if (ne - ns + 1 < CHART_ZOOM_MIN_BARS) {
+    ne = Math.min(fullLen - 1, ns + CHART_ZOOM_MIN_BARS - 1)
+  }
+  return { start: ns, end: ne }
+}
+
+function zoomRangeOut(start: number, end: number, fullLen: number): { start: number; end: number } | null {
+  const w = end - start + 1
+  if (w >= fullLen) return null
+  const nw = Math.min(fullLen, Math.ceil(w * (1 + CHART_ZOOM_STEP)))
+  const center = (start + end) / 2
+  let ns = Math.round(center - nw / 2)
+  let ne = ns + nw - 1
+  if (ns < 0) {
+    ne -= ns
+    ns = 0
+  }
+  if (ne > fullLen - 1) {
+    ns -= ne - (fullLen - 1)
+    ne = fullLen - 1
+  }
+  ns = Math.max(0, ns)
+  ne = Math.min(fullLen - 1, ne)
+  if (ne - ns + 1 >= fullLen) return null
+  return { start: ns, end: ne }
+}
 
 type CandlePoint = {
   date: string
@@ -282,6 +329,46 @@ function formatFullAxisLabel(iso: string, timeframe: 'year' | 'month' | 'day' | 
   })
 }
 
+/** 줌으로 보이는 구간이 짧을수록 시·분·초까지 촘촘히 표시 */
+function formatAxisTickForZoom(
+  iso: string,
+  timeframe: 'year' | 'month' | 'day' | 'hour',
+  spanMs: number,
+  visibleBars: number,
+) {
+  const dt = new Date(iso)
+  if (spanMs > 0 && spanMs <= 2 * 60 * 60 * 1000) {
+    return dt.toLocaleString('ko-KR', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })
+  }
+  if (spanMs > 0 && spanMs <= 36 * 60 * 60 * 1000) {
+    return dt.toLocaleString('ko-KR', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+  }
+  if (spanMs > 0 && spanMs <= 7 * 24 * 60 * 60 * 1000 && visibleBars < 100) {
+    return dt.toLocaleString('ko-KR', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+  }
+  return formatFullAxisLabel(iso, timeframe)
+}
+
 function CandlestickSeries({ data }: { data: ChartRow[] }) {
   const xScale = useXAxisScale(0)
   const yScale = useYAxisScale('price')
@@ -529,6 +616,9 @@ export default function Dashboard() {
   const [chartShowCandles, setChartShowCandles] = useState(true)
   const [chartShowLines, setChartShowLines] = useState(true)
   const [chartShowBars, setChartShowBars] = useState(true)
+  /** null 이면 전체 구간, 아니면 chartData 인덱스 [start, end] 만 표시 (휠 줌) */
+  const [chartZoomRange, setChartZoomRange] = useState<{ start: number; end: number } | null>(null)
+  const chartWheelRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(symbolQuery), 200)
@@ -700,20 +790,62 @@ export default function Dashboard() {
     return result
   }, [stock, timeframe, nativeCurrency, priceCurrency, fxData?.rate])
 
+  const displayChartData = useMemo((): ChartRow[] => {
+    if (!chartData.length) return []
+    if (!chartZoomRange) return chartData
+    const { start, end } = chartZoomRange
+    if (start < 0 || end >= chartData.length || start > end) return chartData
+    return chartData.slice(start, end + 1)
+  }, [chartData, chartZoomRange])
+
+  const chartVisibleSpanMs = useMemo(() => {
+    if (displayChartData.length < 2) return 0
+    const t0 = new Date(displayChartData[0].xKey).getTime()
+    const t1 = new Date(displayChartData[displayChartData.length - 1].xKey).getTime()
+    return Math.abs(t1 - t0)
+  }, [displayChartData])
+
   const chartYDomain = useMemo((): [number, number] | undefined => {
-    if (!chartData.length) return undefined
-    const lows = chartData.map((d) => d.low)
-    const highs = chartData.map((d) => d.high)
+    if (!displayChartData.length) return undefined
+    const lows = displayChartData.map((d) => d.low)
+    const highs = displayChartData.map((d) => d.high)
     const min = Math.min(...lows)
     const max = Math.max(...highs)
     const pad = Math.max((max - min) * 0.03, Math.abs(max) * 0.001 || 0.01)
     return [min - pad, max + pad]
-  }, [chartData])
+  }, [displayChartData])
 
   const vbpLevels = useMemo(() => {
-    if (!chartData.length) return { support: null as number | null, resistance: null as number | null }
-    const latest = chartData[chartData.length - 1]
+    if (!displayChartData.length) return { support: null as number | null, resistance: null as number | null }
+    const latest = displayChartData[displayChartData.length - 1]
     return { support: latest.vbpSupport, resistance: latest.vbpResistance }
+  }, [displayChartData])
+
+  useEffect(() => {
+    setChartZoomRange(null)
+  }, [selectedSymbol, timeframe, yearRange, stock?.length])
+
+  useEffect(() => {
+    const el = chartWheelRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      if (!chartData.length || chartData.length <= CHART_ZOOM_MIN_BARS) return
+      e.preventDefault()
+      e.stopPropagation()
+      const len = chartData.length
+      setChartZoomRange((prev) => {
+        const s = prev?.start ?? 0
+        const ed = prev?.end ?? len - 1
+        if (e.deltaY < 0) {
+          const next = zoomRangeIn(s, ed, len)
+          return next.start === s && next.end === ed ? prev : next
+        }
+        const out = zoomRangeOut(s, ed, len)
+        return out === null ? null : out
+      })
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
   }, [chartData])
 
   const selectedSymbolInfo = useMemo(
@@ -1118,8 +1250,22 @@ export default function Dashboard() {
               />
               <span>막대 (거래량)</span>
             </label>
+            <span className="text-slate-500" title="차트 위에 마우스를 올린 뒤 휠로 확대·축소, 더블클릭으로 전체 구간">
+              휠: 확대/축소 · 더블클릭: 전체
+            </span>
+            {chartZoomRange && chartData.length > 0 && (
+              <span className="rounded-full bg-blue-900/50 px-2 py-0.5 text-[10px] text-blue-200">
+                확대 중 · {displayChartData.length}/{chartData.length}봉
+              </span>
+            )}
           </div>
-          <div className="h-80">
+          <div
+            ref={chartWheelRef}
+            className="h-80 overflow-hidden rounded-lg outline-none"
+            onDoubleClick={() => setChartZoomRange(null)}
+            role="presentation"
+            title="휠로 시간 구간 확대·축소, 더블클릭으로 전체"
+          >
             {stockLoading ? (
               <div className="flex h-full items-center justify-center text-slate-500">불러오는 중...</div>
             ) : stockError ? (
@@ -1132,17 +1278,19 @@ export default function Dashboard() {
               </div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={chartData} margin={{ top: 8, right: chartShowBars ? 48 : 8, bottom: 8, left: 8 }}>
+                <ComposedChart data={displayChartData} margin={{ top: 8, right: chartShowBars ? 48 : 8, bottom: 8, left: 8 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
                   <XAxis
                     dataKey="xKey"
                     tick={{ fill: '#cbd5f5', fontSize: 10 }}
                     interval="preserveStartEnd"
-                    minTickGap={8}
-                    angle={chartData.length > 24 ? -40 : 0}
-                    textAnchor={chartData.length > 24 ? 'end' : 'middle'}
-                    height={chartData.length > 24 ? 56 : 32}
-                    tickFormatter={(v: string) => formatFullAxisLabel(v, timeframe)}
+                    minTickGap={chartZoomRange ? 4 : 8}
+                    angle={displayChartData.length > 24 ? -40 : 0}
+                    textAnchor={displayChartData.length > 24 ? 'end' : 'middle'}
+                    height={displayChartData.length > 24 ? 56 : 32}
+                    tickFormatter={(v: string) =>
+                      formatAxisTickForZoom(v, timeframe, chartVisibleSpanMs, displayChartData.length)
+                    }
                   />
                   {(chartShowCandles || chartShowLines) && (
                     <YAxis
@@ -1179,13 +1327,13 @@ export default function Dashboard() {
                     <Bar
                       yAxisId="vol"
                       dataKey="volume"
-                      barSize={chartData.length > 120 ? 2 : chartData.length > 40 ? 4 : 8}
+                      barSize={displayChartData.length > 120 ? 2 : displayChartData.length > 40 ? 4 : 8}
                       radius={[1, 1, 0, 0]}
                       isAnimationActive={false}
                       fill="#475569"
                       fillOpacity={0.5}
                     >
-                      {chartData.map((entry) => (
+                      {displayChartData.map((entry) => (
                         <Cell
                           key={`vol-${entry.xKey}`}
                           fill={entry.close >= entry.open ? 'rgba(52, 211, 153, 0.45)' : 'rgba(251, 113, 133, 0.45)'}
@@ -1250,7 +1398,7 @@ export default function Dashboard() {
                       legendType="none"
                     />
                   )}
-                  {chartShowCandles && <CandlestickSeries data={chartData} />}
+                  {chartShowCandles && <CandlestickSeries data={displayChartData} />}
                   {(chartShowCandles || chartShowLines) && vbpLevels.support != null && (
                     <ReferenceLine
                       yAxisId="price"
@@ -1448,7 +1596,7 @@ export default function Dashboard() {
                 </div>
               </div>
               <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-                <p className="text-xs uppercase tracking-[0.2em] text-blue-300">기사 샘플 (클릭 이동)</p>
+                <p className="text-xs uppercase tracking-[0.2em] text-blue-300">기사 (클릭 이동)</p>
                 <div className="mt-2 max-h-56 space-y-2 overflow-y-auto">
                   {newsFeatures.articles?.length ? (
                     newsFeatures.articles.map((item) => (
