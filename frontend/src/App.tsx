@@ -41,7 +41,7 @@ function App() {
     <div className="flex min-h-screen bg-slate-950 text-slate-100">
       <Sidebar />
       <main className="flex-1 bg-gradient-to-b from-slate-950 via-slate-930 to-slate-900">
-        <div className="mx-auto max-w-6xl px-6 py-8">
+        <div className="mx-auto max-w-7xl px-6 py-8">
           <Suspense fallback={<div className="text-slate-400">불러오는 중...</div>}>
             <Routes>
               <Route path="/dashboard" element={<Dashboard />} />

@@ -30,49 +30,28 @@ const VBP_LABEL_LAYOUT = {
   dyResistance: 0,
 } as const
 
-/** 차트 휠 줌: 보이는 인덱스 구간 */
+/** 차트 휠 줌: 보이는 인덱스 구간 (항상 최신 봉 = 오른쪽 끝 고정) */
 const CHART_ZOOM_MIN_BARS = 12
 const CHART_ZOOM_STEP = 0.14
 
+/** 줌 인: 창 너비만 줄이고 end 는 항상 fullLen-1(최신)에 맞춤 → 확대해도 오늘/최신 봉 유지 */
 function zoomRangeIn(start: number, end: number, fullLen: number): { start: number; end: number } {
   const w = end - start + 1
   const nw = Math.max(CHART_ZOOM_MIN_BARS, Math.floor(w * (1 - CHART_ZOOM_STEP)))
-  const center = (start + end) / 2
-  let ns = Math.round(center - nw / 2)
-  let ne = ns + nw - 1
-  if (ns < 0) {
-    ne -= ns
-    ns = 0
-  }
-  if (ne > fullLen - 1) {
-    ns -= ne - (fullLen - 1)
-    ne = fullLen - 1
-  }
-  ns = Math.max(0, ns)
-  ne = Math.min(fullLen - 1, ne)
-  if (ne - ns + 1 < CHART_ZOOM_MIN_BARS) {
-    ne = Math.min(fullLen - 1, ns + CHART_ZOOM_MIN_BARS - 1)
-  }
+  const ne = fullLen - 1
+  let ns = ne - nw + 1
+  if (ns < 0) ns = 0
   return { start: ns, end: ne }
 }
 
+/** 줌 아웃: 왼쪽으로만 넓히고 end 는 최신에 고정 */
 function zoomRangeOut(start: number, end: number, fullLen: number): { start: number; end: number } | null {
   const w = end - start + 1
   if (w >= fullLen) return null
   const nw = Math.min(fullLen, Math.ceil(w * (1 + CHART_ZOOM_STEP)))
-  const center = (start + end) / 2
-  let ns = Math.round(center - nw / 2)
-  let ne = ns + nw - 1
-  if (ns < 0) {
-    ne -= ns
-    ns = 0
-  }
-  if (ne > fullLen - 1) {
-    ns -= ne - (fullLen - 1)
-    ne = fullLen - 1
-  }
+  const ne = fullLen - 1
+  let ns = ne - nw + 1
   ns = Math.max(0, ns)
-  ne = Math.min(fullLen - 1, ne)
   if (ne - ns + 1 >= fullLen) return null
   return { start: ns, end: ne }
 }
@@ -1292,16 +1271,22 @@ export default function Dashboard() {
               <span>막대 (거래량)</span>
             </label>
             <span
-              className="text-slate-500"
-              title="캔들·격자가 있는 플롯 영역에서만 휠로 확대·축소, 더블클릭으로 전체 구간"
+              className="min-w-0 flex-1 text-slate-500"
+              title="플롯에서 휠 시 최신 봉(오른쪽) 기준으로 확대·축소됩니다. 더블클릭으로 전체 구간"
             >
-              플롯에서 휠: 확대/축소 · 더블클릭: 전체
+              플롯에서 휠: 확대/축소(최신 고정) · 더블클릭: 전체
             </span>
-            {chartZoomRange && chartData.length > 0 && (
-              <span className="rounded-full bg-blue-900/50 px-2 py-0.5 text-[10px] text-blue-200">
-                확대 중 · {displayChartData.length}/{chartData.length}봉
-              </span>
-            )}
+            <div className="inline-flex h-[22px] w-[158px] flex-shrink-0 items-center justify-end">
+              {chartZoomRange && chartData.length > 0 ? (
+                <span className="rounded-full bg-blue-900/50 px-2 py-0.5 text-[10px] text-blue-200 tabular-nums">
+                  확대 중 · {displayChartData.length}/{chartData.length}봉
+                </span>
+              ) : (
+                <span className="invisible px-2 py-0.5 text-[10px] tabular-nums" aria-hidden>
+                  확대 중 · 000/000봉
+                </span>
+              )}
+            </div>
           </div>
           <div
             ref={chartWheelRef}
