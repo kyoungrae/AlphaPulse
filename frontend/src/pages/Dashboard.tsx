@@ -630,8 +630,6 @@ export default function Dashboard() {
     return { support: latest.vbpSupport, resistance: latest.vbpResistance }
   }, [chartData])
 
-  const latestHistory = history?.items?.[0] ?? null
-  const previousHistory = history?.items?.[1] ?? null
   const selectedSymbolInfo = useMemo(
     () => (symbols?.items ?? []).find((item) => item.symbol === selectedSymbol),
     [symbols, selectedSymbol],
@@ -1275,48 +1273,117 @@ export default function Dashboard() {
             <p className="mt-3 text-sm text-slate-400">뉴스 기반 피처 데이터가 없습니다.</p>
           )}
         </div>
-        <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
-          <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-white">{selectedDisplayName} 예측 이력 및 변동</h3>
-            {historyLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
-            {historyError && <span className="text-xs text-rose-400">오류: {historyError}</span>}
+        <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg">
+          <div className="mb-4 flex items-center justify-between">
+            <h3 className="text-lg font-bold text-white">{selectedDisplayName} 예측 VS 실측 결과</h3>
+            <div className="flex items-center gap-2">
+              {historyLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
+              {historyError && <span className="text-xs text-rose-400">오류: {historyError}</span>}
+            </div>
           </div>
-          <div className="mt-3 grid gap-3 lg:grid-cols-3">
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-              <p className="text-xs uppercase tracking-[0.2em] text-blue-300">최근 예측</p>
-              <p className="mt-2 text-sm text-slate-300">기준일: {latestHistory?.predictionDate ?? '-'}</p>
-              <p className="mt-1 text-sm text-slate-300">
-                방향: {latestHistory ? directionToKorean(latestHistory.predictedDirection) : '-'}
+
+          <div className="mb-5 flex flex-col items-start gap-4 md:flex-row md:items-center">
+            <div className="flex-shrink-0 rounded-xl border border-blue-800/50 bg-blue-900/30 px-5 py-3">
+              <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-blue-300">
+                최근 적중률 (결과 확정 기준)
               </p>
-              <p className="mt-1 text-sm text-slate-300">
-                상승확률: {latestHistory ? `${(latestHistory.probabilityUp * 100).toFixed(1)}%` : '-'}
-              </p>
-            </div>
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-              <p className="text-xs uppercase tracking-[0.2em] text-blue-300">전일 대비 변동</p>
-              <p className="mt-2 text-sm text-slate-300">
-                확률 변화:{' '}
-                {latestHistory?.probabilityDelta == null
-                  ? '-'
-                  : `${latestHistory.probabilityDelta > 0 ? '+' : ''}${(latestHistory.probabilityDelta * 100).toFixed(1)}%p`}
-              </p>
-              <p className="mt-1 text-sm text-slate-300">
-                방향 전환: {latestHistory?.directionChanged ? '예' : '아니오'}
-              </p>
-              <p className="mt-1 text-sm text-slate-400">
-                이전 기준일: {previousHistory?.predictionDate ?? '-'}
+              <p className="text-3xl font-black text-white">
+                {history?.items && history.items.filter((h) => h.isCorrect != null).length > 0
+                  ? `${(
+                      (history.items.filter((h) => h.isCorrect).length /
+                        history.items.filter((h) => h.isCorrect != null).length) *
+                      100
+                    ).toFixed(1)}%`
+                  : '-'}
               </p>
             </div>
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-              <p className="text-xs uppercase tracking-[0.2em] text-blue-300">실측 비교</p>
-              <p className="mt-2 text-sm text-slate-300">
-                실측 방향: {latestHistory?.actualDirection ? directionToKorean(latestHistory.actualDirection) : '대기 중'}
+            <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-3 text-[11px] leading-relaxed text-slate-400">
+              <p>
+                <strong>해석 가이드</strong>
               </p>
-              <p className="mt-1 text-sm text-slate-300">
-                결과: {latestHistory?.isCorrect == null ? '대기 중' : latestHistory.isCorrect ? '적중' : '미적중'}
+              <p>• 예측은 모델이 다음 날 시가를 기준으로 종가 상승/하락을 맞추는지 평가합니다.</p>
+              <p>
+                • 최근 예측이 실측(실제 종가)과 일치하면{' '}
+                <span className="font-bold text-emerald-400">적중</span>으로 기록됩니다.
               </p>
-              <p className="mt-1 text-sm text-slate-400">실측일: {latestHistory?.actualDate ?? '-'}</p>
+              <p>• 백테스트 엔진과 독립적으로, 매일 생성되는 실제 AI의 성적표입니다.</p>
             </div>
+          </div>
+
+          <div className="overflow-x-auto rounded-lg border border-slate-700">
+            <table className="w-full text-left text-sm whitespace-nowrap text-slate-300">
+              <thead className="border-b border-slate-700 bg-slate-800/80 text-[11px] uppercase tracking-wider text-slate-400">
+                <tr>
+                  <th className="px-4 py-3 font-semibold">예측 기준일</th>
+                  <th className="px-4 py-3 font-semibold">AI 예상 방향</th>
+                  <th className="px-4 py-3 font-semibold">상승 확률</th>
+                  <th className="px-4 py-3 font-semibold">확률 변동 (전일대비)</th>
+                  <th className="border-l border-slate-700 px-4 py-3 font-semibold">실측일</th>
+                  <th className="px-4 py-3 font-semibold">실제 종가 방향</th>
+                  <th className="px-4 py-3 text-center font-semibold">결과</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60 bg-slate-950/30">
+                {history?.items?.map((item) => (
+                  <tr key={item.predictionDate} className="transition-colors hover:bg-slate-800/40">
+                    <td className="px-4 py-3 text-slate-200">{item.predictionDate}</td>
+                    <td className="px-4 py-3 font-medium">
+                      <span
+                        className={item.predictedDirection === 'Up' ? 'text-emerald-400' : 'text-rose-400'}
+                      >
+                        {item.predictedDirection === 'Up' ? '▲ 상승' : '▼ 하락'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 font-semibold tabular-nums">{(item.probabilityUp * 100).toFixed(1)}%</td>
+                    <td className="px-4 py-3 text-xs tabular-nums">
+                      {item.probabilityDelta == null ? (
+                        <span className="text-slate-500">-</span>
+                      ) : item.probabilityDelta > 0 ? (
+                        <span className="text-emerald-400">+{(item.probabilityDelta * 100).toFixed(1)}%p</span>
+                      ) : item.probabilityDelta < 0 ? (
+                        <span className="text-rose-400">{(item.probabilityDelta * 100).toFixed(1)}%p</span>
+                      ) : (
+                        <span className="text-slate-400">0.0%p</span>
+                      )}
+                    </td>
+                    <td className="border-l border-slate-700 px-4 py-3 text-slate-400">
+                      {item.actualDate ?? '대기 중'}
+                    </td>
+                    <td className="px-4 py-3 font-medium">
+                      {item.actualDirection ? (
+                        <span
+                          className={item.actualDirection === 'Up' ? 'text-emerald-400' : 'text-rose-400'}
+                        >
+                          {item.actualDirection === 'Up' ? '▲ 상승' : '▼ 하락'}
+                        </span>
+                      ) : (
+                        <span className="text-slate-500">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-center">
+                      {item.isCorrect == null ? (
+                        <span className="rounded bg-slate-800 px-2 py-1 text-[10px] text-slate-400">결과 대기</span>
+                      ) : item.isCorrect ? (
+                        <span className="rounded border border-emerald-800/50 bg-emerald-900/60 px-2 py-1 text-[11px] font-bold text-emerald-400">
+                          적중
+                        </span>
+                      ) : (
+                        <span className="rounded border border-rose-800/50 bg-rose-900/60 px-2 py-1 text-[11px] font-bold text-rose-400">
+                          빗나감
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {(!history?.items || history.items.length === 0) && (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                      저장된 예측 이력이 없습니다. 일일 배치가 실행되면 여기에 누적됩니다.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
         <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">

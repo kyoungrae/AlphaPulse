@@ -25,7 +25,6 @@ const firestoreEnabled = process.env.FIRESTORE_ENABLED !== 'false'
 const DAILY_JOB_INTERVAL_MS = 1000 * 60 * 15
 const DAILY_JOB_CONCURRENCY = Math.max(1, Number(process.env.DAILY_JOB_CONCURRENCY ?? 6))
 const DAILY_JOB_SYMBOL_LIMIT = Math.max(1, Number(process.env.DAILY_JOB_SYMBOL_LIMIT ?? 500))
-const RECONCILE_BATCH_LIMIT = Math.max(50, Number(process.env.RECONCILE_BATCH_LIMIT ?? 250))
 const BACKTEST_CACHE_TTL_MS = 1000 * 60 * 60 * 6
 /** AI 예측 서버(10년 학습)와 맞추기 위한 백테스트·전략 요약 기본 조회 기간 */
 const BACKTEST_DEFAULT_LOOKBACK_YEARS = 10
@@ -712,17 +711,22 @@ async function loadProbabilityHistory(
   const db = getFirestore()
   if (db) {
     try {
-      let query = db.collection('predictions').where('ticker', '==', ticker)
-      if (fromDate) query = query.where('predictionDate', '>=', fromDate)
-      if (toDate) query = query.where('predictionDate', '<=', toDate)
-      const snap = await query.orderBy('predictionDate', 'asc').limit(PREDICTION_HISTORY_QUERY_LIMIT).get()
-      if (!snap.empty) {
-        return snap.docs
-          .map((d) => d.data() as PredictionRecord)
-          .map((row) => ({
+      const doc = await db.collection('predictions_v2').doc(ticker.toUpperCase()).get()
+      if (doc.exists) {
+        const data = doc.data() as Record<string, unknown>
+        let rows = Object.keys(data)
+          .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
+          .map((k) => data[k] as PredictionRecord)
+          .filter((row) => row?.predictionDate && typeof row.probabilityUp === 'number')
+        if (fromDate) rows = rows.filter((r) => r.predictionDate >= fromDate)
+        if (toDate) rows = rows.filter((r) => r.predictionDate <= toDate)
+        rows.sort((a, b) => a.predictionDate.localeCompare(b.predictionDate))
+        if (rows.length > 0) {
+          return rows.slice(0, PREDICTION_HISTORY_QUERY_LIMIT).map((row) => ({
             date: row.predictionDate,
             probabilityUp: row.probabilityUp,
           }))
+        }
       }
     } catch (err) {
       console.error('Firestore 확률 이력 조회 실패. 가격 기반 근사치 사용.', err)
@@ -947,56 +951,54 @@ async function runInBatches<T, R>(
   return results
 }
 
-async function reconcilePendingOutcomes(market: Market, bookmarkDocId: string | null) {
+async function reconcilePendingOutcomes(symbols: string[]) {
   const db = getFirestore()
   if (!db) {
-    return { resolvedCount: 0, correctCount: 0, processedCount: 0, nextBookmark: null as string | null }
+    return { resolvedCount: 0, correctCount: 0, processedCount: 0 }
   }
-  let query = db
-    .collection('predictions')
-    .where('market', '==', market)
-    .where('outcomeStatus', '==', 'pending')
-    .orderBy(admin.firestore.FieldPath.documentId())
-    .limit(RECONCILE_BATCH_LIMIT)
-  if (bookmarkDocId) {
-    query = query.startAfter(bookmarkDocId)
-  }
-  const snapshot = await query.get()
 
   let resolvedCount = 0
   let correctCount = 0
-  let lastDocId: string | null = null
-  for (const doc of snapshot.docs) {
-    lastDocId = doc.id
-    const data = doc.data() as PredictionRecord
+
+  await runInBatches(symbols, DAILY_JOB_CONCURRENCY, async (ticker) => {
     try {
-      const outcome = await resolveOutcomeForPrediction(data)
-      if (!outcome) continue
-      // 결과는 예측 문서에 바로 반영해 Firestore 추가 읽기/쓰기 비용을 줄입니다.
-      await doc.ref.set(
-        {
-          outcomeStatus: 'resolved',
-          actualDate: outcome.actualDate,
-          actualDirection: outcome.actualDirection,
-          actualClose: outcome.actualClose,
-          isCorrect: outcome.isCorrect,
-          resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      )
-      resolvedCount += 1
-      if (outcome.isCorrect) {
-        correctCount += 1
+      const docRef = db.collection('predictions_v2').doc(ticker.toUpperCase())
+      const doc = await docRef.get()
+      if (!doc.exists) return
+
+      const data = doc.data() as Record<string, unknown>
+      const updates: Record<string, unknown> = {}
+      let needsUpdate = false
+
+      for (const [date, record] of Object.entries(data)) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !record || typeof record !== 'object') continue
+        const row = record as PredictionRecord
+        if (row.outcomeStatus === 'pending') {
+          const outcome = await resolveOutcomeForPrediction(row)
+          if (outcome) {
+            updates[`${date}.outcomeStatus`] = 'resolved'
+            updates[`${date}.actualDate`] = outcome.actualDate
+            updates[`${date}.actualDirection`] = outcome.actualDirection
+            updates[`${date}.actualClose`] = outcome.actualClose
+            updates[`${date}.isCorrect`] = outcome.isCorrect
+            updates[`${date}.resolvedAt`] = admin.firestore.FieldValue.serverTimestamp()
+
+            resolvedCount += 1
+            if (outcome.isCorrect) correctCount += 1
+            needsUpdate = true
+          }
+        }
+      }
+
+      if (needsUpdate) {
+        await docRef.update(updates)
       }
     } catch (err) {
-      console.error(`실측 비교 실패: ${data.ticker}`, err)
+      console.error(`실측 비교 실패: ${ticker}`, err)
     }
-  }
-  const nextBookmark =
-    snapshot.size === RECONCILE_BATCH_LIMIT && lastDocId
-      ? lastDocId
-      : null
-  return { resolvedCount, correctCount, processedCount: snapshot.size, nextBookmark }
+  })
+
+  return { resolvedCount, correctCount, processedCount: symbols.length }
 }
 
 async function runDailyCloseJob(market: Market, force = false) {
@@ -1014,9 +1016,7 @@ async function runDailyCloseJob(market: Market, force = false) {
   try {
     const metaRef = db.collection('job_meta').doc(`daily_close_${market}`)
     const metaSnap = await metaRef.get()
-    const meta = (metaSnap.exists ? metaSnap.data() : null) as
-      | { lastRunDate?: string; pendingBookmark?: string | null }
-      | null
+    const meta = (metaSnap.exists ? metaSnap.data() : null) as { lastRunDate?: string } | null
     const lastRunDateFromDb = meta?.lastRunDate
     if (!force && lastRunDateFromDb === clock.date) {
       dailyJobLastRunDateByMarket[market] = clock.date
@@ -1046,26 +1046,26 @@ async function runDailyCloseJob(market: Market, force = false) {
           outcomeStatus: 'pending',
           source: 'daily-close-job',
         }
-        const docId = `${ticker}_${record.predictionDate}`
-        await db.collection('predictions').doc(docId).set(
-          {
-            ...record,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true },
-        )
+        await db
+          .collection('predictions_v2')
+          .doc(ticker.toUpperCase())
+          .set(
+            {
+              [record.predictionDate]: {
+                ...record,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+            },
+            { merge: true },
+          )
         predictions.push(record)
       } catch (err) {
         console.error(`일일 예측 저장 실패: ${ticker}`, err)
       }
     })
 
-    const pendingBookmark = typeof meta?.pendingBookmark === 'string' ? meta.pendingBookmark : null
-    const { resolvedCount, correctCount, processedCount, nextBookmark } = await reconcilePendingOutcomes(
-      market,
-      pendingBookmark,
-    )
+    const { resolvedCount, correctCount, processedCount } = await reconcilePendingOutcomes(symbols)
     await db.collection('analysis_daily').doc(`${market}_${clock.date}`).set(
       {
         date: clock.date,
@@ -1085,7 +1085,7 @@ async function runDailyCloseJob(market: Market, force = false) {
         generatedCount: predictions.length,
         resolvedCount,
         reconcileProcessed: processedCount,
-        pendingBookmark: nextBookmark,
+        pendingBookmark: null,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true },
@@ -1582,32 +1582,34 @@ app.get('/api/predictions/history/:ticker', async (req: Request, res: Response) 
     })
   }
   try {
-    const snap = await db
-      .collection('predictions')
-      .where('ticker', '==', ticker)
-      .orderBy('predictionDate', 'desc')
-      .limit(limit)
-      .get()
-    const records = snap.docs.map((doc) => {
-      const data = doc.data() as PredictionRecord
-      return {
-        ...data,
-        actualDirection: data.actualDirection ?? null,
-        actualDate: data.actualDate ?? null,
-        isCorrect: data.isCorrect ?? null,
-        actualClose: data.actualClose ?? null,
-      }
-    })
-    const sorted = records.sort((a, b) => a.predictionDate.localeCompare(b.predictionDate))
-    const withDelta = sorted.map((item, idx) => {
-      const prev = idx > 0 ? sorted[idx - 1] : null
+    const doc = await db.collection('predictions_v2').doc(ticker).get()
+    if (!doc.exists) {
+      return res.json({ ticker, items: [] })
+    }
+
+    const data = doc.data() as Record<string, unknown>
+    const records = Object.keys(data)
+      .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
+      .map((k) => data[k] as PredictionRecord)
+      .map((row) => ({
+        ...row,
+        actualDirection: row.actualDirection ?? null,
+        actualDate: row.actualDate ?? null,
+        isCorrect: row.isCorrect ?? null,
+        actualClose: row.actualClose ?? null,
+      }))
+
+    const sortedDesc = [...records].sort((a, b) => b.predictionDate.localeCompare(a.predictionDate)).slice(0, limit)
+    const chronological = sortedDesc.slice().reverse()
+    const withDelta = chronological.map((item, idx) => {
+      const prev = idx > 0 ? chronological[idx - 1] : null
       return {
         ...item,
         probabilityDelta: prev ? Number((item.probabilityUp - prev.probabilityUp).toFixed(4)) : null,
         directionChanged: prev ? item.predictedDirection !== prev.predictedDirection : false,
       }
     })
-    return res.json({ ticker, items: withDelta.reverse() })
+    return res.json({ ticker, items: withDelta.slice().reverse() })
   } catch (err) {
     console.error(err)
     return res.status(503).json({
