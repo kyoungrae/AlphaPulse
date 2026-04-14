@@ -7,6 +7,7 @@ import Parser from 'rss-parser'
 import YahooFinance from 'yahoo-finance2'
 import { z } from 'zod'
 import { resolveCostConfig, type Market } from './services/costModel'
+import { readServiceAccountCredential } from './firebaseCredential'
 import {
   runBacktest,
   type BacktestResult,
@@ -617,19 +618,20 @@ function getFirestore() {
   if (firestoreDisabledReason) return null
   if (firestoreDb) return firestoreDb
   try {
-    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+    const serviceAccount = readServiceAccountCredential()
     const hasProjectHint =
       Boolean(process.env.GOOGLE_CLOUD_PROJECT) ||
       Boolean(process.env.GCLOUD_PROJECT) ||
       Boolean(process.env.FIREBASE_CONFIG)
-    if (!serviceAccountJson && !hasProjectHint) {
+    if (!serviceAccount && !hasProjectHint) {
       firestoreDisabledReason = 'Firestore 설정이 없어 비활성화되었습니다.'
-      console.warn('[Firestore] FIREBASE_SERVICE_ACCOUNT_JSON 또는 프로젝트 환경변수가 없어 비활성화됩니다.')
+      console.warn(
+        '[Firestore] FIREBASE_SERVICE_ACCOUNT_JSON, GOOGLE_APPLICATION_CREDENTIALS(파일 경로), FIREBASE_SERVICE_ACCOUNT_KEY_PATH 또는 프로젝트 환경변수가 없어 비활성화됩니다.',
+      )
       return null
     }
     if (admin.apps.length === 0) {
-      if (serviceAccountJson) {
-        const serviceAccount = JSON.parse(serviceAccountJson)
+      if (serviceAccount) {
         admin.initializeApp({
           credential: admin.credential.cert(serviceAccount),
         })
