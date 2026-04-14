@@ -69,6 +69,8 @@ type CandlePoint = {
 
 type NewsItem = {
   title: string
+  link?: string
+  publishedAt?: string
   source?: string
   sentiment?: {
     label: string
@@ -575,6 +577,7 @@ export default function Dashboard() {
   const [chartShowCandles, setChartShowCandles] = useState(true)
   const [chartShowLines, setChartShowLines] = useState(true)
   const [chartShowBars, setChartShowBars] = useState(true)
+  const [articleModal, setArticleModal] = useState<{ title: string; url: string } | null>(null)
   /** null 이면 전체 구간, 아니면 chartData 인덱스 [start, end] 만 표시 (휠 줌) */
   const [chartZoomRange, setChartZoomRange] = useState<{ start: number; end: number } | null>(null)
   const chartWheelRef = useRef<HTMLDivElement>(null)
@@ -657,6 +660,37 @@ export default function Dashboard() {
     return apiUrl(`/api/predict/directions?symbols=${encodeURIComponent(topSymbolsCsv)}`)
   }, [topSymbolsCsv])
   const { data: directions } = useFetch<DirectionsResponse>(directionsUrl)
+
+  const openArticlePopup = (url: string) => {
+    window.open(
+      url,
+      'alphapulse_news_popup',
+      'popup=yes,width=1280,height=860,menubar=no,toolbar=no,location=yes,status=no,scrollbars=yes,resizable=yes',
+    )
+  }
+
+  const shouldUsePopupDirectly = (url: string) => {
+    // Some domains (e.g., Google News) block iframe embedding.
+    return /(^https?:\/\/)?news\.google\.com/i.test(url)
+  }
+
+  const openArticleModal = (title: string, url?: string) => {
+    if (!url) return
+    if (shouldUsePopupDirectly(url)) {
+      openArticlePopup(url)
+      return
+    }
+    setArticleModal({ title, url })
+  }
+
+  useEffect(() => {
+    if (!articleModal) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setArticleModal(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [articleModal])
 
   const chartData = useMemo((): ChartRow[] => {
     if (!stock || stock.length === 0) return []
@@ -1749,14 +1783,13 @@ export default function Dashboard() {
                     newsFeatures.articles.map((item) => (
                       <div key={`${item.publishedAt}-${item.title}`} className="rounded-lg border border-slate-800/70 bg-slate-900/40 px-2 py-1.5">
                         {item.link ? (
-                          <a
-                            href={item.link}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-sm text-blue-300 hover:underline"
+                          <button
+                            type="button"
+                            onClick={() => openArticleModal(item.title, item.link)}
+                            className="text-left text-sm text-blue-300 hover:underline"
                           >
                             {item.title}
-                          </a>
+                          </button>
                         ) : (
                           <p className="text-sm text-slate-200">{item.title}</p>
                         )}
@@ -1794,7 +1827,17 @@ export default function Dashboard() {
                   key={item.title}
                   className="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2"
                 >
-                  <p className="text-sm font-semibold text-white">{item.title}</p>
+                  {item.link ? (
+                    <button
+                      type="button"
+                      onClick={() => openArticleModal(item.title, item.link)}
+                      className="text-left text-sm font-semibold text-blue-300 hover:underline"
+                    >
+                      {item.title}
+                    </button>
+                  ) : (
+                    <p className="text-sm font-semibold text-white">{item.title}</p>
+                  )}
                   <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
                     <span>{item.source ?? '구글 뉴스'}</span>
                     {item.sentiment ? (
@@ -1811,6 +1854,43 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+      {articleModal && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/80 p-4"
+          onClick={() => setArticleModal(null)}
+        >
+          <div
+            className="flex h-[85vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-950"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
+              <p className="truncate pr-4 text-sm font-semibold text-white">{articleModal.title}</p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => openArticlePopup(articleModal.url)}
+                  className="rounded-md border border-blue-800/70 px-2 py-1 text-xs text-blue-200 hover:bg-blue-950/60"
+                >
+                  팝업으로 열기
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setArticleModal(null)}
+                  className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800"
+                >
+                  닫기
+                </button>
+              </div>
+            </div>
+            <iframe
+              title={articleModal.title}
+              src={articleModal.url}
+              className="h-full w-full bg-white"
+              referrerPolicy="no-referrer"
+            />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
