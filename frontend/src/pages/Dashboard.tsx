@@ -1224,6 +1224,19 @@ export default function Dashboard() {
                       />
                     </>
                   )}
+                  {chartShowCandles && !chartShowLines && (
+                    <Line
+                      yAxisId="price"
+                      type="monotone"
+                      dataKey="close"
+                      stroke="transparent"
+                      strokeWidth={0}
+                      dot={false}
+                      activeDot={false}
+                      isAnimationActive={false}
+                      legendType="none"
+                    />
+                  )}
                   {chartShowCandles && <CandlestickSeries data={chartData} />}
                   {(chartShowCandles || chartShowLines) && vbpLevels.support != null && (
                     <ReferenceLine
