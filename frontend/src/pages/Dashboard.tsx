@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Bar,
   BarChart,
@@ -825,9 +825,13 @@ export default function Dashboard() {
     setChartZoomRange(null)
   }, [selectedSymbol, timeframe, yearRange, stock?.length])
 
-  useEffect(() => {
-    const el = chartWheelRef.current
-    if (!el) return
+  /** 휠/더블클릭은 플롯 영역(.recharts-surface)에만 걸어 축·범례 영역과 분리 */
+  useLayoutEffect(() => {
+    const container = chartWheelRef.current
+    if (!container) return undefined
+
+    let surfaceEl: SVGElement | null = null
+
     const onWheel = (e: WheelEvent) => {
       if (!chartData.length || chartData.length <= CHART_ZOOM_MIN_BARS) return
       e.preventDefault()
@@ -844,9 +848,46 @@ export default function Dashboard() {
         return out === null ? null : out
       })
     }
-    el.addEventListener('wheel', onWheel, { passive: false })
-    return () => el.removeEventListener('wheel', onWheel)
-  }, [chartData])
+
+    const onDblClick = (e: MouseEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      setChartZoomRange(null)
+    }
+
+    const detach = () => {
+      if (!surfaceEl) return
+      surfaceEl.removeEventListener('wheel', onWheel)
+      surfaceEl.removeEventListener('dblclick', onDblClick)
+      surfaceEl = null
+    }
+
+    const attach = () => {
+      const next = container.querySelector<SVGElement>('.recharts-surface')
+      if (!next || next === surfaceEl) return
+      detach()
+      surfaceEl = next
+      surfaceEl.addEventListener('wheel', onWheel, { passive: false })
+      surfaceEl.addEventListener('dblclick', onDblClick)
+    }
+
+    attach()
+    let cancelled = false
+    const raf = requestAnimationFrame(() => {
+      if (cancelled) return
+      attach()
+      requestAnimationFrame(() => {
+        if (cancelled) return
+        attach()
+      })
+    })
+
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(raf)
+      detach()
+    }
+  }, [chartData, displayChartData.length, chartZoomRange, chartShowCandles, chartShowLines, chartShowBars])
 
   const selectedSymbolInfo = useMemo(
     () => (symbols?.items ?? []).find((item) => item.symbol === selectedSymbol),
@@ -1250,8 +1291,11 @@ export default function Dashboard() {
               />
               <span>막대 (거래량)</span>
             </label>
-            <span className="text-slate-500" title="차트 위에 마우스를 올린 뒤 휠로 확대·축소, 더블클릭으로 전체 구간">
-              휠: 확대/축소 · 더블클릭: 전체
+            <span
+              className="text-slate-500"
+              title="캔들·격자가 있는 플롯 영역에서만 휠로 확대·축소, 더블클릭으로 전체 구간"
+            >
+              플롯에서 휠: 확대/축소 · 더블클릭: 전체
             </span>
             {chartZoomRange && chartData.length > 0 && (
               <span className="rounded-full bg-blue-900/50 px-2 py-0.5 text-[10px] text-blue-200">
@@ -1261,10 +1305,9 @@ export default function Dashboard() {
           </div>
           <div
             ref={chartWheelRef}
-            className="h-80 overflow-hidden rounded-lg outline-none"
-            onDoubleClick={() => setChartZoomRange(null)}
+            className="chart-zoom-host h-80 overflow-hidden rounded-lg outline-none"
             role="presentation"
-            title="휠로 시간 구간 확대·축소, 더블클릭으로 전체"
+            title="그리드·캔들 영역에서 휠로 확대·축소, 더블클릭으로 전체"
           >
             {stockLoading ? (
               <div className="flex h-full items-center justify-center text-slate-500">불러오는 중...</div>
