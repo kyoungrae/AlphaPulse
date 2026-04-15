@@ -21,7 +21,7 @@ import {
 dotenv.config()
 
 const app = express()
-const port = process.env.PORT || 4000
+const port = process.env.PORT || 4001
 const predictBase = process.env.PREDICT_URL || 'http://localhost:8001'
 const yahooFinance = new YahooFinance()
 const firestoreEnabled = process.env.FIRESTORE_ENABLED !== 'false'

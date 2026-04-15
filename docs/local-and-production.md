@@ -4,7 +4,7 @@
 
 | 하고 싶은 것 | 설정 |
 |-------------|------|
-| **로컬에서 개발** (`npm run dev`) | 설정 없음. 백엔드는 `http://localhost:4000` 이 떠 있으면 됨. |
+| **로컬에서 개발** (`npm run dev`) | 설정 없음. 백엔드는 `http://localhost:4001` 이 떠 있으면 됨. |
 | **배포용 빌드 — 아직 운영 API 없음** | `frontend` 폴더에 `VITE_API_MODE=local` (또는 생략, 기본이 local) |
 | **배포용 빌드 — 운영 API 쓸 때** | `VITE_API_MODE=production` + `VITE_API_BASE_URL=백엔드 URL` |
 
@@ -54,7 +54,7 @@ Windows CMD 는 `set VITE_API_MODE=production&& set VITE_API_BASE_URL=...&& npm 
 
 ## 참고
 
-- **`npm run dev`** 는 항상 **로컬 모드**와 같이 동작합니다 (`vite.config` 의 `/api` → `localhost:4000` 프록시). `.env` 의 `VITE_API_MODE` 로 바꿀 수 없습니다.
+- **`npm run dev`** 는 항상 **로컬 모드**와 같이 동작합니다 (`vite.config` 의 `/api` → `localhost:4001` 프록시). `.env` 의 `VITE_API_MODE` 로 바꿀 수 없습니다.
 - 운영 모드로 빌드했는데 `VITE_API_BASE_URL` 을 빼먹으면, 콘솔에 경고가 나고 상대 경로로만 요청합니다 (의도와 다를 수 있음).
 
 ---

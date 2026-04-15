@@ -9,7 +9,7 @@ function resolveApiMode(): ApiMode {
 
 /**
  * API 요청 URL.
- * - 개발: 항상 `/api/...` (Vite proxy → localhost:4000).
+ * - 개발: 항상 `/api/...` (Vite proxy → localhost:4001).
  * - 프로덕션 빌드 + 로컬 모드: `/api/...` (같은 오리진·역프록시 등).
  * - 프로덕션 빌드 + 운영 모드: `VITE_API_BASE_URL` + `/api/...`.
  */
