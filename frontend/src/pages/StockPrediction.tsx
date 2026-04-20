@@ -369,6 +369,13 @@ export default function StockPrediction() {
           </div>
           {loading && <span className="text-xs text-slate-400">불러오는 중...</span>}
         </div>
+        {history?.sync && (
+          <p className="mb-2 text-[11px] text-slate-500">
+            동기화 상태: {history.sync.mode === 'api' ? '서버 동기화' : history.sync.mode === 'client' ? '브라우저 직조회' : '비활성'} ·
+            pending 점검 {history.sync.checkedPending}건 · 이번 조회 반영 {history.sync.resolvedNow}건 ·
+            {new Date(history.sync.syncedAt).toLocaleString('ko-KR')}
+          </p>
+        )}
         <div className="mb-3 flex flex-wrap items-center gap-1">
           {([
             { key: 'long_only', label: '롱' },

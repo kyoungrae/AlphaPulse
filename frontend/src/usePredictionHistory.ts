@@ -8,6 +8,12 @@ import {
 export type PredictionHistoryResponse = {
   ticker: string
   items: PredictionHistoryItem[]
+  sync?: {
+    mode: 'api' | 'client' | 'disabled'
+    checkedPending: number
+    resolvedNow: number
+    syncedAt: string
+  }
   warning?: string
   detail?: string
 }
@@ -44,7 +50,16 @@ export function usePredictionHistory(ticker: string, limit: number) {
       const fb = await fetchPredictionHistoryFromClientFirestore(ticker, limit)
       if (!mounted) return
       if (fb && fb.items.length > 0) {
-        setData({ ticker: fb.ticker, items: fb.items })
+        setData({
+          ticker: fb.ticker,
+          items: fb.items,
+          sync: {
+            mode: 'client',
+            checkedPending: 0,
+            resolvedNow: 0,
+            syncedAt: new Date().toISOString(),
+          },
+        })
         setLoading(false)
         return
       }
@@ -70,7 +85,16 @@ export function usePredictionHistory(ticker: string, limit: number) {
       } catch (e) {
         if (!mounted) return
         if (fb && fb.items.length > 0) {
-          setData({ ticker: fb.ticker, items: fb.items })
+          setData({
+            ticker: fb.ticker,
+            items: fb.items,
+            sync: {
+              mode: 'client',
+              checkedPending: 0,
+              resolvedNow: 0,
+              syncedAt: new Date().toISOString(),
+            },
+          })
           setLoading(false)
           return
         }

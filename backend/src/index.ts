@@ -76,6 +76,10 @@ type SentimentCacheValue = { label: NewsSentimentLabel; score: number; analyzedA
 const sentimentCache = new Map<string, SentimentCacheValue>()
 const SENTIMENT_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7
 const SENTIMENT_REDIS_TTL_SECONDS = Math.floor(SENTIMENT_CACHE_TTL_MS / 1000)
+const SENTIMENT_API_RETRY_COOLDOWN_MS = Math.max(
+  5000,
+  Number(process.env.SENTIMENT_API_RETRY_COOLDOWN_MS ?? 60_000),
+)
 const NEWS_FEATURE_DEFAULT_DAYS = Math.max(1, Number(process.env.NEWS_FEATURE_DEFAULT_DAYS ?? 14))
 const NEWS_FEATURE_MAX_LIMIT = Math.max(20, Number(process.env.NEWS_FEATURE_MAX_LIMIT ?? 200))
 const S_AND_P_500_CSV_URL = 'https://datahub.io/core/s-and-p-500-companies/r/constituents.csv'
@@ -224,6 +228,7 @@ const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
 const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
 let kisTokenPromise: Promise<string> | null = null
+let sentimentApiBackoffUntil = 0
 const redisClient = redisUrl ? createClient({ url: redisUrl }) : null
 if (redisClient) {
   redisClient.connect().catch((err: unknown) => {
@@ -589,25 +594,35 @@ function scoreSentimentFallback(title: string): SentimentCacheValue {
 async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map<string, SentimentCacheValue>> {
   const now = Date.now()
   const result = new Map<string, SentimentCacheValue>()
-  const uncachedTitles: string[] = []
-  for (const item of items) {
-    const cacheKey = `sentiment:${encodeURIComponent(item.title)}`
-    let cached = sentimentCache.get(item.title)
-    if (!cached) {
-      const redisCached = await getRedisJson<SentimentCacheValue>(cacheKey)
-      if (redisCached) {
-        cached = redisCached
-        sentimentCache.set(item.title, redisCached)
-      }
-    }
+  const uniqueTitles = Array.from(new Set(items.map((item) => item.title).filter((title) => title.length > 0)))
+  const missingTitles: string[] = []
+  for (const title of uniqueTitles) {
+    const cached = sentimentCache.get(title)
     if (cached && now - cached.analyzedAt < SENTIMENT_CACHE_TTL_MS) {
-      result.set(item.title, cached)
+      result.set(title, cached)
     } else {
-      uncachedTitles.push(item.title)
+      missingTitles.push(title)
+    }
+  }
+  if (missingTitles.length > 0) {
+    const redisLoaded = await Promise.all(
+      missingTitles.map(async (title) => {
+        const redisCached = await getRedisJson<SentimentCacheValue>(`sentiment:${encodeURIComponent(title)}`)
+        return { title, redisCached }
+      }),
+    )
+    for (const { title, redisCached } of redisLoaded) {
+      if (redisCached && now - redisCached.analyzedAt < SENTIMENT_CACHE_TTL_MS) {
+        sentimentCache.set(title, redisCached)
+        result.set(title, redisCached)
+      }
     }
   }
 
+  const uncachedTitles = uniqueTitles.filter((title) => !result.has(title))
   if (uncachedTitles.length === 0) return result
+  if (now < sentimentApiBackoffUntil) return result
+
   try {
     const response = await fetch(`${predictBase.replace(/\/+$/, '')}/api/sentiment/analyze`, {
       method: 'POST',
@@ -620,6 +635,7 @@ async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map
     const parsed = (await response.json()) as {
       data?: { title: string; label: string; score: number }[]
     }
+    const redisWrites: Promise<void>[] = []
     for (const d of parsed.data ?? []) {
       const normalized: SentimentCacheValue = {
         label: toKoreanSentimentLabel(d.label),
@@ -628,10 +644,15 @@ async function enrichNewsSentiment(items: Array<{ title: string }>): Promise<Map
       }
       sentimentCache.set(d.title, normalized)
       result.set(d.title, normalized)
-      await setRedisJson(`sentiment:${encodeURIComponent(d.title)}`, normalized, SENTIMENT_REDIS_TTL_SECONDS)
+      redisWrites.push(setRedisJson(`sentiment:${encodeURIComponent(d.title)}`, normalized, SENTIMENT_REDIS_TTL_SECONDS))
     }
+    if (redisWrites.length > 0) {
+      await Promise.all(redisWrites)
+    }
+    sentimentApiBackoffUntil = 0
   } catch (err) {
     console.error('FinBERT 연동 실패, 점수 fallback 사용', err)
+    sentimentApiBackoffUntil = Date.now() + SENTIMENT_API_RETRY_COOLDOWN_MS
     // fall through to caller fallback
   }
   return result
@@ -1884,7 +1905,7 @@ app.get('/api/backtest/summary/:ticker', async (req: Request, res: Response) => 
     const to = normalizeSingle(req.query.to as string | string[] | undefined)
     const initialCapital = Math.max(1000, Number(req.query.initialCapital ?? 100000))
     const strategies: StrategyMode[] = ['long_only', 'long_short', 'swing', 'intraday']
-    const summary = await Promise.all(
+    const settled = await Promise.allSettled(
       strategies.map(async (strategy) => {
         const result = await getBacktestResult({
           ticker,
@@ -1902,6 +1923,17 @@ app.get('/api/backtest/summary/:ticker', async (req: Request, res: Response) => 
         }
       }),
     )
+    const summary = settled
+      .filter(
+        (row): row is PromiseFulfilledResult<{ strategy: StrategyMode; metrics: BacktestResult['metrics']; latestSignal: BacktestResult['latestSignal'] }> =>
+          row.status === 'fulfilled',
+      )
+      .map((row) => row.value)
+    for (const row of settled) {
+      if (row.status === 'rejected') {
+        console.warn(`[backtest summary] strategy failed for ${ticker}`, row.reason)
+      }
+    }
     return res.json({
       ticker,
       market,
@@ -1927,17 +1959,72 @@ app.get('/api/predictions/history/:ticker', async (req: Request, res: Response) 
     return res.json({
       ticker,
       items: [],
+      sync: {
+        mode: 'disabled',
+        checkedPending: 0,
+        resolvedNow: 0,
+        syncedAt: new Date().toISOString(),
+      },
       warning: 'Firestore 미설정으로 예측 이력이 비어 있습니다.',
       detail: firestoreDisabledReason ?? 'FIREBASE_SERVICE_ACCOUNT_JSON 또는 GOOGLE_CLOUD_PROJECT 설정을 확인하세요.',
     })
   }
   try {
-    const doc = await db.collection('predictions_v2').doc(ticker).get()
+    const docRef = db.collection('predictions_v2').doc(ticker)
+    const doc = await docRef.get()
     if (!doc.exists) {
-      return res.json({ ticker, items: [] })
+      return res.json({
+        ticker,
+        items: [],
+        sync: {
+          mode: 'api',
+          checkedPending: 0,
+          resolvedNow: 0,
+          syncedAt: new Date().toISOString(),
+        },
+      })
     }
 
     const data = doc.data() as Record<string, unknown>
+    const candidateDates = Object.keys(data)
+      .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
+      .sort((a, b) => b.localeCompare(a))
+      .slice(0, Math.max(limit, 40))
+    const updates: Record<string, unknown> = {}
+    let hasOutcomeUpdate = false
+    let checkedPending = 0
+    let resolvedNow = 0
+    for (const date of candidateDates) {
+      const record = data[date]
+      if (!record || typeof record !== 'object') continue
+      const row = record as PredictionRecord
+      if (row.outcomeStatus !== 'pending') continue
+      checkedPending += 1
+      const outcome = await resolveOutcomeForPrediction(row)
+      if (!outcome) continue
+
+      updates[`${date}.outcomeStatus`] = 'resolved'
+      updates[`${date}.actualDate`] = outcome.actualDate
+      updates[`${date}.actualDirection`] = outcome.actualDirection
+      updates[`${date}.actualClose`] = outcome.actualClose
+      updates[`${date}.isCorrect`] = outcome.isCorrect
+      updates[`${date}.resolvedAt`] = admin.firestore.FieldValue.serverTimestamp()
+      hasOutcomeUpdate = true
+      resolvedNow += 1
+
+      data[date] = {
+        ...(data[date] as Record<string, unknown>),
+        outcomeStatus: 'resolved',
+        actualDate: outcome.actualDate,
+        actualDirection: outcome.actualDirection,
+        actualClose: outcome.actualClose,
+        isCorrect: outcome.isCorrect,
+      }
+    }
+    if (hasOutcomeUpdate) {
+      await docRef.update(updates)
+    }
+
     const records = Object.keys(data)
       .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
       .map((k) => data[k] as PredictionRecord)
@@ -1963,7 +2050,16 @@ app.get('/api/predictions/history/:ticker', async (req: Request, res: Response) 
         directionChanged: prev ? item.predictedDirection !== prev.predictedDirection : false,
       }
     })
-    return res.json({ ticker, items: withDelta.slice().reverse() })
+    return res.json({
+      ticker,
+      items: withDelta.slice().reverse(),
+      sync: {
+        mode: 'api',
+        checkedPending,
+        resolvedNow,
+        syncedAt: new Date().toISOString(),
+      },
+    })
   } catch (err) {
     console.error(err)
     return res.status(503).json({

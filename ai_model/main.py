@@ -97,6 +97,7 @@ PRELOAD_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "JPM
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:4001").rstrip("/")
 NEWS_FEATURE_TIMEOUT_SECONDS = float(os.getenv("NEWS_FEATURE_TIMEOUT_SECONDS", "8"))
 NEWS_FEATURES_ENABLED = os.getenv("NEWS_FEATURES_ENABLED", "true").lower() != "false"
+NEWS_FEATURE_RETRY_COOLDOWN_SECONDS = float(os.getenv("NEWS_FEATURE_RETRY_COOLDOWN_SECONDS", "120"))
 MACRO_CACHE_TTL_MINUTES = 60
 FINBERT_MODEL = os.getenv("FINBERT_MODEL", "ProsusAI/finbert")
 FINBERT_ENABLED = os.getenv("FINBERT_ENABLED", "true").lower() != "false"
@@ -120,6 +121,7 @@ PRICE_CACHE: Dict[Tuple[str, int], Tuple[pd.DataFrame, datetime]] = {}
 MACRO_CACHE: Dict[int, Tuple[pd.DataFrame, datetime]] = {}
 FINBERT_PIPELINE: Dict[str, object] = {}
 kis_token_cache: Dict[str, Optional[object]] = {"token": None, "expires_at": None}
+news_feature_backoff_until: Optional[datetime] = None
 
 
 def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.DataFrame:
@@ -236,7 +238,10 @@ def fetch_kis_ohlcv(ticker: str, period_years: int) -> pd.DataFrame:
 
 
 def load_news_feature_data(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
+  global news_feature_backoff_until
   if not NEWS_FEATURES_ENABLED:
+    return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
+  if news_feature_backoff_until and datetime.now() < news_feature_backoff_until:
     return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
   try:
     market = "kr" if ticker.upper().endswith((".KS", ".KQ")) else "us"
@@ -254,9 +259,11 @@ def load_news_feature_data(ticker: str, from_date: str, to_date: str) -> pd.Data
       logger.warning("News feature response missing columns: %s", missing)
       return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
     news_df["date"] = pd.to_datetime(news_df["date"]).dt.tz_localize(None)
+    news_feature_backoff_until = None
     return news_df.set_index("date")[["news_sentiment_score", "news_volume", "event_keyword_count"]]
   except Exception as err:
     logger.warning("News feature load failed for %s: %s", ticker, err)
+    news_feature_backoff_until = datetime.now() + timedelta(seconds=NEWS_FEATURE_RETRY_COOLDOWN_SECONDS)
     return pd.DataFrame(columns=["news_sentiment_score", "news_volume", "event_keyword_count"])
 
 
@@ -575,6 +582,8 @@ class SentimentAnalyzeResponse(BaseModel):
 def get_finbert_pipeline():
   if not FINBERT_ENABLED:
     raise RuntimeError("FINBERT_ENABLED=false")
+  if FINBERT_PIPELINE.get("disabled"):
+    raise RuntimeError("finbert_temporarily_disabled")
   if torch is None or AutoTokenizer is None or AutoModelForSequenceClassification is None:
     raise RuntimeError("transformers/torch 패키지가 설치되지 않았습니다.")
   if "tokenizer" in FINBERT_PIPELINE and "model" in FINBERT_PIPELINE and "device" in FINBERT_PIPELINE:
@@ -589,7 +598,27 @@ def get_finbert_pipeline():
   FINBERT_PIPELINE["tokenizer"] = tokenizer
   FINBERT_PIPELINE["model"] = model
   FINBERT_PIPELINE["device"] = device
+  FINBERT_PIPELINE["disabled"] = False
   return tokenizer, model, device
+
+
+def fallback_sentiment_from_title(title: str) -> Tuple[str, int]:
+  text = title.lower()
+  positive_keywords = ["beat", "surge", "rally", "strong", "growth", "상승", "호재", "실적 개선", "매수"]
+  negative_keywords = ["miss", "plunge", "drop", "weak", "risk", "하락", "악재", "소송", "경고"]
+  score = 0
+  for kw in positive_keywords:
+    if kw in text:
+      score += 18
+  for kw in negative_keywords:
+    if kw in text:
+      score -= 18
+  score = max(-100, min(100, score))
+  if score > 8:
+    return "positive", score
+  if score < -8:
+    return "negative", score
+  return "neutral", score
 
 
 @app.on_event("startup")
@@ -732,7 +761,14 @@ def analyze_sentiment_batch(payload: SentimentAnalyzeRequest):
     return SentimentAnalyzeResponse(data=results)
   except Exception as err:
     logger.error("FinBERT 분석 실패: %s", err)
-    raise HTTPException(status_code=500, detail="Internal NLP Error")
+    FINBERT_PIPELINE["disabled"] = True
+    fallback_items: List[SentimentAnalyzeItem] = []
+    for title in titles:
+      label, score = fallback_sentiment_from_title(title)
+      fallback_items.append(SentimentAnalyzeItem(title=title, label=label, score=score))
+    return SentimentAnalyzeResponse(
+      data=fallback_items
+    )
 
 
 @app.get("/health")

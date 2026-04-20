@@ -580,7 +580,7 @@ export default function Dashboard() {
   const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
   const [strategy, setStrategy] = useState<StrategyMode>('long_only')
-  const [horizon, setHorizon] = useState<1 | 3 | 5 | 10>(5)
+  const [horizon, setHorizon] = useState<1 | 3 | 5 | 10>(1)
   const [chartShowCandles, setChartShowCandles] = useState(true)
   const [chartShowLines, setChartShowLines] = useState(true)
   const [chartShowBars, setChartShowBars] = useState(true)
@@ -641,7 +641,9 @@ export default function Dashboard() {
   } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=${horizon}`))
   const { data: predictH1 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=1`))
   const { data: predictH3 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=3`))
-  const { data: predictH5 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=5`))
+  const predictH5Url =
+    horizon === 5 ? '' : apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=5`)
+  const { data: predictH5 } = useFetch<PredictResponse>(predictH5Url)
   const { data: predictH10 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=10`))
   const {
     data: history,
@@ -1113,6 +1115,13 @@ export default function Dashboard() {
               {historyError && <span className="text-xs text-rose-400">오류: {historyError}</span>}
             </div>
           </div>
+          {history?.sync && (
+            <p className="mb-3 text-[11px] text-slate-500">
+              동기화 상태: {history.sync.mode === 'api' ? '서버 동기화' : history.sync.mode === 'client' ? '브라우저 직조회' : '비활성'} ·
+              pending 점검 {history.sync.checkedPending}건 · 이번 조회에서 반영 {history.sync.resolvedNow}건 ·
+              {new Date(history.sync.syncedAt).toLocaleString('ko-KR')}
+            </p>
+          )}
           {history?.warning && (history.items?.length ?? 0) === 0 && (
             <div className="mb-4 rounded-lg border border-amber-800/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-100">
               <p className="font-medium">{history.warning}</p>
@@ -1335,7 +1344,7 @@ export default function Dashboard() {
                         probabilities: {
                           h1: predictH1?.probability_up,
                           h3: predictH3?.probability_up,
-                          h5: predictH5?.probability_up,
+                          h5: predictH5?.probability_up ?? (horizon === 5 ? predict.probability_up : undefined),
                           h10: predictH10?.probability_up,
                         },
                       },
