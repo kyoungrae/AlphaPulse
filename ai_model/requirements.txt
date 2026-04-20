@@ -1,0 +1,21 @@
+# Core inference server (see ai_model/main.py)
+fastapi>=0.115.0,<1
+uvicorn[standard]>=0.32.0,<1
+python-dotenv>=1.0.0,<2
+pydantic>=2.0.0,<3
+pandas>=2.0.0,<3
+numpy>=1.26.0,<3
+requests>=2.31.0,<3
+yfinance>=0.2.40,<1
+scikit-learn>=1.4.0,<2
+ta>=0.11.0,<1
+joblib>=1.3.0,<2
+
+# Optional: faster trees (falls back to RandomForest if missing)
+lightgbm>=4.3.0,<5
+
+# Optional: SHAP explanations (falls back to feature_importances_ if missing)
+shap>=0.45.0,<1
+
+# Optional: FinBERT sentiment (disabled in Docker by default — image size)
+# To enable, set FINBERT_ENABLED=true and add torch + transformers to a custom image.

@@ -1,0 +1,41 @@
+# AlphaPulse — run on a LAN machine (e.g. Windows Docker Desktop at 192.168.0.232)
+#
+# Usage (repo root):
+#   docker compose build
+#   docker compose up -d
+# Open from another PC on the same LAN:
+#   http://192.168.0.232:4001
+#
+# Optional: copy backend/.env.example → backend/.env and set secrets, then:
+#   docker compose --env-file backend/.env up -d
+
+services:
+  predict:
+    build:
+      context: ./ai_model
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      BACKEND_BASE_URL: http://api:4001
+      FINBERT_ENABLED: "false"
+    ports:
+      - "8001:8001"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - predict
+    environment:
+      NODE_ENV: production
+      PORT: "4001"
+      PREDICT_URL: http://predict:8001
+      FRONTEND_DIST: /app/frontend/dist
+      # Optional: mount a service account JSON (see volumes below)
+      # GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-adminsdk.json
+    ports:
+      - "0.0.0.0:4001:4001"
+    # volumes:
+    #   - C:/path/to/your-firebase-adminsdk.json:/run/secrets/firebase-adminsdk.json:ro
