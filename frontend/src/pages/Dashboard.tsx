@@ -616,10 +616,10 @@ export default function Dashboard() {
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [market, setMarket] = useState<'us' | 'kr'>('us')
   /** true면 검색 API 대신 즐겨찾기 목록만 표시 */
-  const [favoritesOnly, setFavoritesOnly] = useState(false)
+  const [favoritesOnly, setFavoritesOnly] = useState(true)
   const [watchlist, setWatchlist] = useState<WatchlistEntry[]>(() => loadWatchlistFromStorage())
   const [selectedSymbol, setSelectedSymbol] = useState('AAPL')
-  const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('month')
+  const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('day')
   const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
   const [strategy, setStrategy] = useState<StrategyMode>('long_only')
