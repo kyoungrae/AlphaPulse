@@ -104,6 +104,46 @@ type SymbolResponse = {
   items: SymbolItem[]
 }
 
+/** 즐겨찾기 칩: 시장 정보 포함 (미국·한국 동시 표시용) */
+type FavoriteSymbolChip = SymbolItem & { wlMarket: 'us' | 'kr' }
+
+/** 로컬 즐겨찾기 (localStorage `alphapulse_watchlist_v1`) */
+type WatchlistEntry = {
+  symbol: string
+  market: 'us' | 'kr'
+  /** 표시용 이름 (미국: 영문, 한국: 한글 등) */
+  name: string
+}
+
+const WATCHLIST_STORAGE_KEY = 'alphapulse_watchlist_v1'
+
+function loadWatchlistFromStorage(): WatchlistEntry[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(WATCHLIST_STORAGE_KEY)
+    if (!raw) return []
+    const p = JSON.parse(raw) as unknown
+    if (!Array.isArray(p)) return []
+    const out: WatchlistEntry[] = []
+    const seen = new Set<string>()
+    for (const x of p) {
+      if (!x || typeof x !== 'object') continue
+      const o = x as Record<string, unknown>
+      const sym = typeof o.symbol === 'string' ? o.symbol.trim() : ''
+      const mkt = o.market === 'kr' ? 'kr' : o.market === 'us' ? 'us' : null
+      if (!sym || !mkt) continue
+      const dedupeKey = `${mkt}:${sym}`
+      if (seen.has(dedupeKey)) continue
+      seen.add(dedupeKey)
+      const name = typeof o.name === 'string' && o.name.trim() ? o.name.trim() : sym
+      out.push({ symbol: sym, market: mkt, name })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
 type FxResponse = {
   base: string
   quote: string
@@ -575,6 +615,9 @@ export default function Dashboard() {
   const [symbolQuery, setSymbolQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [market, setMarket] = useState<'us' | 'kr'>('us')
+  /** true면 검색 API 대신 즐겨찾기 목록만 표시 */
+  const [favoritesOnly, setFavoritesOnly] = useState(false)
+  const [watchlist, setWatchlist] = useState<WatchlistEntry[]>(() => loadWatchlistFromStorage())
   const [selectedSymbol, setSelectedSymbol] = useState('AAPL')
   const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('month')
   const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
@@ -599,14 +642,19 @@ export default function Dashboard() {
     return () => clearTimeout(timer)
   }, [symbolQuery])
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlist))
+    } catch {
+      /* ignore quota */
+    }
+  }, [watchlist])
+
   const symbolsUrl = useMemo(() => {
+    if (favoritesOnly) return ''
     const q = encodeURIComponent(debouncedQuery.trim())
     return apiUrl(`/api/symbols?market=${market}&q=${q}&limit=40`)
-  }, [debouncedQuery, market])
-
-  useEffect(() => {
-    setSelectedSymbol(market === 'kr' ? '005930.KS' : 'AAPL')
-  }, [market])
+  }, [debouncedQuery, market, favoritesOnly])
 
   useEffect(() => {
     setPriceCurrency(market === 'kr' ? 'krw' : 'usd')
@@ -619,6 +667,27 @@ export default function Dashboard() {
     loading: symbolsLoading,
     error: symbolsError,
   } = useFetch<SymbolResponse>(symbolsUrl)
+
+  /** 즐겨찾기 전용 모드: 미국·한국 구분 없이 전체 목록 표시 */
+  const favoriteSymbolItems = useMemo((): FavoriteSymbolChip[] => {
+    const q = debouncedQuery.trim().toLowerCase()
+    let rows = watchlist
+    if (q) {
+      rows = rows.filter(
+        (w) => w.symbol.toLowerCase().includes(q) || w.name.toLowerCase().includes(q),
+      )
+    }
+    return rows.map((w) => ({
+      symbol: w.symbol,
+      name: w.name,
+      nameKr: w.market === 'kr' ? w.name : undefined,
+      wlMarket: w.market,
+    }))
+  }, [watchlist, debouncedQuery])
+
+  const displaySymbolItems: SymbolItem[] | FavoriteSymbolChip[] = favoritesOnly
+    ? favoriteSymbolItems
+    : (symbols?.items ?? [])
 
   const {
     data: stock,
@@ -667,11 +736,11 @@ export default function Dashboard() {
   const { data: fxData } = useFetch<FxResponse>(apiUrl('/api/fx/usd-krw'))
   const topSymbolsCsv = useMemo(
     () =>
-      (symbols?.items ?? [])
+      displaySymbolItems
         .slice(0, 40)
         .map((item) => item.symbol)
         .join(','),
-    [symbols],
+    [displaySymbolItems],
   )
   const directionsUrl = useMemo(() => {
     if (!topSymbolsCsv) return ''
@@ -902,10 +971,36 @@ export default function Dashboard() {
     }
   }, [chartData, displayChartData.length, chartZoomRange, chartShowCandles, chartShowLines, chartShowBars])
 
-  const selectedSymbolInfo = useMemo(
-    () => (symbols?.items ?? []).find((item) => item.symbol === selectedSymbol),
-    [symbols, selectedSymbol],
+  const selectedSymbolInfo = useMemo(() => {
+    const fromApi = (symbols?.items ?? []).find((item) => item.symbol === selectedSymbol)
+    if (fromApi) return fromApi
+    const fromWl = watchlist.find((w) => w.symbol === selectedSymbol && w.market === market)
+    if (fromWl) {
+      return {
+        symbol: fromWl.symbol,
+        name: fromWl.name,
+        nameKr: market === 'kr' ? fromWl.name : undefined,
+      } satisfies SymbolItem
+    }
+    return undefined
+  }, [symbols, selectedSymbol, watchlist, market])
+
+  const selectedIsFavorite = useMemo(
+    () => watchlist.some((w) => w.symbol === selectedSymbol && w.market === market),
+    [watchlist, selectedSymbol, market],
   )
+
+  const toggleFavoriteForSelection = () => {
+    setWatchlist((prev) => {
+      const idx = prev.findIndex((w) => w.symbol === selectedSymbol && w.market === market)
+      if (idx >= 0) {
+        return prev.filter((_, i) => i !== idx)
+      }
+      const label =
+        selectedSymbolInfo?.nameKr ?? selectedSymbolInfo?.name ?? selectedSymbol
+      return [...prev, { symbol: selectedSymbol, market, name: label }]
+    })
+  }
   const selectedDisplayName = selectedSymbolInfo?.nameKr ?? selectedSymbolInfo?.name ?? selectedSymbol
   const displayPredictClose = useMemo(() => {
     if (!predict) return null
@@ -1022,26 +1117,53 @@ export default function Dashboard() {
       <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
         <div className="grid gap-3 lg:grid-cols-[2fr_1fr]">
           <div>
-            <div className="mb-2 flex items-center justify-between">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <label className="block text-xs uppercase tracking-[0.2em] text-blue-300">종목 검색</label>
-              <div className="flex items-center gap-1 rounded-full bg-slate-950/80 p-1">
+              <div className="flex flex-wrap items-center gap-1 rounded-full bg-slate-950/80 p-1">
                 <button
                   type="button"
-                  onClick={() => setMarket('us')}
+                  onClick={() => {
+                    setMarket('us')
+                    setFavoritesOnly(false)
+                    setSelectedSymbol('AAPL')
+                  }}
                   className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
-                    market === 'us' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-800'
+                    market === 'us' && !favoritesOnly ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-800'
                   }`}
                 >
                   미국
                 </button>
                 <button
                   type="button"
-                  onClick={() => setMarket('kr')}
+                  onClick={() => {
+                    setMarket('kr')
+                    setFavoritesOnly(false)
+                    setSelectedSymbol('005930.KS')
+                  }}
                   className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
-                    market === 'kr' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-800'
+                    market === 'kr' && !favoritesOnly ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-800'
                   }`}
                 >
                   한국
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFavoritesOnly((v) => {
+                      const next = !v
+                      if (next) {
+                        setSymbolQuery('')
+                        setDebouncedQuery('')
+                      }
+                      return next
+                    })
+                  }}
+                  className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
+                    favoritesOnly ? 'bg-amber-500 text-slate-900' : 'text-amber-200/90 hover:bg-slate-800'
+                  }`}
+                  title="저장된 미국·한국 즐겨찾기 전체 표시"
+                >
+                  ★ 즐겨찾기
                 </button>
               </div>
             </div>
@@ -1051,35 +1173,87 @@ export default function Dashboard() {
               placeholder={market === 'kr' ? '종목코드 또는 기업명 입력 (예: 005930.KS, 삼성전자)' : '티커 또는 기업명 입력 (예: AAPL, Microsoft)'}
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-blue-400"
             />
-            <div className="mt-2 flex max-h-36 flex-wrap gap-2 overflow-y-auto pr-1">
-              {(symbols?.items ?? []).map((item) => (
-                <button
-                  key={item.symbol}
-                  type="button"
-                  onClick={() => setSelectedSymbol(item.symbol)}
-                  data-direction={directionMap.get(item.symbol) ?? 'none'}
-                  className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                    selectedSymbol === item.symbol
-                      ? 'bg-blue-600 text-white'
-                      : directionMap.get(item.symbol) === 'Up'
-                        ? 'bg-emerald-900/50 text-emerald-300 hover:bg-emerald-800/60'
-                        : directionMap.get(item.symbol) === 'Down'
-                          ? 'bg-rose-900/50 text-rose-300 hover:bg-rose-800/60'
-                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                  }`}
-                  title={item.symbol}
-                >
-                  {item.nameKr ?? item.name}
-                </button>
-              ))}
-              {symbolsLoading && <span className="text-xs text-slate-500">목록 불러오는 중...</span>}
-              {symbolsError && <span className="text-xs text-rose-400">오류: {symbolsError}</span>}
+            <div
+              className={`mt-2 flex flex-wrap gap-2 overflow-y-auto pr-1 ${favoritesOnly ? 'max-h-64' : 'max-h-36'}`}
+            >
+              {displaySymbolItems.map((item, chipIdx) => {
+                const rowMarket = 'wlMarket' in item ? item.wlMarket : market
+                const inWatchlist = watchlist.some((w) => w.symbol === item.symbol && w.market === rowMarket)
+                return (
+                  <button
+                    key={
+                      'wlMarket' in item
+                        ? `fav-${item.wlMarket}-${item.symbol}-${chipIdx}`
+                        : item.symbol
+                    }
+                    type="button"
+                    onClick={() => {
+                      if ('wlMarket' in item) {
+                        const m = item.wlMarket
+                        setMarket(m === 'kr' ? 'kr' : 'us')
+                        setSelectedSymbol(item.symbol)
+                      } else {
+                        setSelectedSymbol(item.symbol)
+                      }
+                    }}
+                    data-direction={directionMap.get(item.symbol) ?? 'none'}
+                    className={`inline-flex max-w-full items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${
+                      selectedSymbol === item.symbol && market === rowMarket
+                        ? 'bg-blue-600 text-white'
+                        : directionMap.get(item.symbol) === 'Up'
+                          ? 'bg-emerald-900/50 text-emerald-300 hover:bg-emerald-800/60'
+                          : directionMap.get(item.symbol) === 'Down'
+                            ? 'bg-rose-900/50 text-rose-300 hover:bg-rose-800/60'
+                            : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                    }`}
+                    title={item.symbol}
+                  >
+                    {inWatchlist && (
+                      <span className="shrink-0 text-[10px] text-amber-300" aria-hidden>
+                        ★
+                      </span>
+                    )}
+                    {'wlMarket' in item && (
+                      <span className="shrink-0 rounded bg-slate-700/90 px-1 py-0 text-[9px] font-medium text-slate-300">
+                        {item.wlMarket === 'us' ? '미국' : '한국'}
+                      </span>
+                    )}
+                    <span className="truncate">{item.nameKr ?? item.name}</span>
+                  </button>
+                )
+              })}
+              {!favoritesOnly && symbolsLoading && (
+                <span className="text-xs text-slate-500">목록 불러오는 중...</span>
+              )}
+              {!favoritesOnly && symbolsError && <span className="text-xs text-rose-400">오류: {symbolsError}</span>}
+              {favoritesOnly && watchlist.length === 0 && (
+                <span className="text-xs text-slate-500">즐겨찾기가 없습니다. 아래 「현재 선택」에서 ★로 추가하세요.</span>
+              )}
+              {favoritesOnly && watchlist.length > 0 && favoriteSymbolItems.length === 0 && (
+                <span className="text-xs text-slate-500">검색어와 일치하는 즐겨찾기가 없습니다.</span>
+              )}
             </div>
           </div>
           <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-sm text-slate-300">
-            <p className="text-xs uppercase tracking-[0.2em] text-blue-300">현재 선택</p>
-            <p className="mt-1 text-xl font-bold text-white">{selectedDisplayName}</p>
-            <p className="mt-1 text-xs text-slate-500">{selectedSymbol}</p>
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0 flex-1">
+                <p className="text-xs uppercase tracking-[0.2em] text-blue-300">현재 선택</p>
+                <p className="mt-1 truncate text-xl font-bold text-white">{selectedDisplayName}</p>
+                <p className="mt-1 text-xs text-slate-500">{selectedSymbol}</p>
+              </div>
+              <button
+                type="button"
+                onClick={toggleFavoriteForSelection}
+                className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                  selectedIsFavorite
+                    ? 'border-amber-500/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
+                    : 'border-slate-600 bg-slate-800/80 text-slate-300 hover:border-amber-600/50 hover:text-amber-200'
+                }`}
+                title={selectedIsFavorite ? '즐겨찾기에서 제거' : '즐겨찾기에 추가'}
+              >
+                {selectedIsFavorite ? '★ 즐겨찾기 해제' : '☆ 즐겨찾기 추가'}
+              </button>
+            </div>
             <div className="mt-3">
               <p className="text-[11px] uppercase tracking-[0.2em] text-blue-300">예측 기간</p>
               <div className="mt-1.5 flex flex-wrap gap-1">
@@ -1098,7 +1272,10 @@ export default function Dashboard() {
               </div>
             </div>
             <p className="mt-2 text-xs text-slate-400">
-              목록 크기: {symbols?.total ?? 0}개 (상세 데이터는 선택 종목만 조회)
+              {favoritesOnly
+                ? `즐겨찾기 ${favoriteSymbolItems.length}개 표시`
+                : `목록 크기: ${symbols?.total ?? 0}개`}{' '}
+              (상세 데이터는 선택 종목만 조회)
             </p>
           </div>
         </div>
