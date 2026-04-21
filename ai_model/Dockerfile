@@ -1,20 +1,29 @@
-# Inference API (FastAPI). Default: no FinBERT to keep image smaller.
-FROM python:3.11-slim-bookworm
-
+# syntax=docker/dockerfile:1
+# Inference API (FastAPI). Multi-stage: compiler toolchain stays out of the final image.
+FROM python:3.11-slim-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-COPY main.py ./
+COPY requirements-docker.txt .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements-docker.txt
 
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 ENV BACKEND_BASE_URL=http://api:4001
 ENV FINBERT_ENABLED=false
+
+COPY main.py ./
 
 EXPOSE 8001
 

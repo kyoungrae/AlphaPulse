@@ -6,8 +6,8 @@
 # Open from another PC on the same LAN:
 #   http://192.168.0.232:4001
 #
-# Optional: copy backend/.env.example → backend/.env and set secrets, then:
-#   docker compose --env-file backend/.env up -d
+# Optional: copy backend/.env.example → backend/.env and set secrets.
+# The api service loads ./backend/.env automatically (see env_file below).
 
 services:
   predict:
@@ -32,14 +32,24 @@ services:
     restart: unless-stopped
     depends_on:
       - predict
+    # Optional: copy Mac `backend/.env` here so Firebase etc. apply without extra `docker run` flags.
+    # `required: false` needs Docker Compose v2.24+ (Docker Desktop 2024+).
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
       NODE_ENV: production
       PORT: "4001"
       PREDICT_URL: http://predict:8001
       FRONTEND_DIST: /app/frontend/dist
-      # Optional: mount a service account JSON (see volumes below)
+      # Optional overrides; most values come from backend/.env via env_file above.
+      # If .env uses a file path for GOOGLE_APPLICATION_CREDENTIALS, that path must exist
+      # inside the container — mount your JSON (see volumes) or use FIREBASE_SERVICE_ACCOUNT_JSON in .env.
       # GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-adminsdk.json
     ports:
       - "0.0.0.0:4001:4001"
+    # Firestore: `backend/.env` alone is not enough if GOOGLE_APPLICATION_CREDENTIALS points to a Mac path
+    # or a file that is not inside the image. Put the JSON next to `.env` under `backend/`, uncomment below,
+    # and set in `backend/.env`: GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase.json
     # volumes:
-    #   - C:/path/to/your-firebase-adminsdk.json:/run/secrets/firebase-adminsdk.json:ro
+    #   - ./backend/your-service-account.json:/run/secrets/firebase.json:ro

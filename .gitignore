@@ -42,3 +42,7 @@ __pycache__/
 venv/
 /ai_model/.env
 
+# Docker image exports — never commit (GitHub 100MB limit; use USB/scp instead)
+*.tar
+alphapulse-*.tar
+

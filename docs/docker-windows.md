@@ -78,16 +78,12 @@ docker compose up -d
 | `ai_model/requirements.txt` | 예측 서버 pip 의존성 |
 | `.dockerignore` | 이미지에 넣지 않을 경로 제외 |
 
-## 7. 환경 변수 (선택)
+## 7. 환경 변수
 
-백엔드 전용 설정은 `backend/.env`에 두고, Compose에서 읽게 하려면 `docker-compose.yml`의 `api`에 다음을 추가할 수 있습니다.
+`docker-compose.yml`의 `api` 서비스는 **`./backend/.env`를 자동으로 불러옵니다** (`env_file`). 로컬과 같은 Firebase·기타 설정을 넣어 두면 컨테이너에 주입됩니다.
 
-```yaml
-    env_file:
-      - ./backend/.env
-```
-
-`backend/.env`가 없으면 Compose가 실패할 수 있으므로, 파일을 만들기 전에는 `env_file` 줄을 두지 않거나, 빈 파일을 두지 마세요.
+- `backend/.env`가 없으면 Compose가 실패할 수 있으므로, `backend/.env.example`을 복사해 만듭니다.
+- `GOOGLE_APPLICATION_CREDENTIALS`가 **파일 경로**를 가리키면, 그 파일이 **컨테이너 안 경로에 있어야** 합니다. `backend/` 아래 JSON을 쓰는 경우 `docker-compose.yml`의 `volumes` 예시(주석)로 마운트하거나, `.env`에 **`FIREBASE_SERVICE_ACCOUNT_JSON`**(JSON 본문 또는 경로) 방식을 쓰면 마운트 없이 동작할 수 있습니다 (`backend/src/firebaseCredential.ts` 참고).
 
 ## 8. 자주 겪는 이슈
 
@@ -188,9 +184,9 @@ docker compose up -d --no-build
 
 ---
 
-## 11. Blueprint Lab 스타일: 맥에서 개별 빌드 → tar 전송 → Podman으로 교체
+## 11. Blueprint Lab 스타일: 맥에서 개별 빌드 → tar 전송 → docker으로 교체
 
-다른 프로젝트에서 쓰던 것처럼 **`docker build`를 이미지마다 명시**하고, **tar로 저장한 뒤 `scp`로 올리고**, 운영 서버에서 **`podman load` + `podman run`** 으로 컨테이너만 갈아끼우는 방식으로도 동일하게 할 수 있습니다.
+다른 프로젝트에서 쓰던 것처럼 **`docker build`를 이미지마다 명시**하고, **tar로 저장한 뒤** 운영 PC로 옮긴 뒤, **`docker load` → `docker compose up -d --no-build`** 한 번으로 띄우는 방식을 권장합니다(아래 §11.3). 긴 `docker run` 두 줄을 수동으로 칠 필요가 없습니다.
 
 ### AlphaPulse와 Blueprint의 차이(한 줄)
 
@@ -209,92 +205,112 @@ docker compose up -d --no-build
 cd ~/Documents/coding/AlphaPulse   # 본인 경로로 변경
 
 # predict (컨텍스트는 ai_model/)
-docker build --platform linux/amd64 \
-  -t alphapulse/predict:local \
-  -f ai_model/Dockerfile ./ai_model
+docker build --platform linux/amd64 -t alphapulse/predict:local -f ai_model/Dockerfile ./ai_model
 
 # api (프론트 빌드 포함, 루트 Dockerfile)
-docker build --platform linux/amd64 \
-  -t alphapulse/api:local \
-  -f Dockerfile .
+docker build --platform linux/amd64 -t alphapulse/api:local -f Dockerfile .
 
 # .tar 로 저장 (Blueprint처럼 파일을 나눠도 됨)
 docker save -o alphapulse-predict.tar alphapulse/predict:local
 docker save -o alphapulse-api.tar alphapulse/api:local
+
 ```
 
 한 파일로 묶고 싶으면:
 
 ```bash
-docker save -o alphapulse-images.tar \
-  alphapulse/predict:local \
-  alphapulse/api:local
+# docker save -o alphapulse-images.tar alphapulse/predict:local alphapulse/api:local
+
 ```
 
 ### 11.2 2단계: 운영 서버로 전송
 
+**이미지 tar 두 개**와 함께, 같은 폴더에서 Compose를 쓰려면 **`docker-compose.yml` 파일 하나**도 같이 복사하세요(저장소 루트에 있음, 용량 매우 작음).  
+Firestore 등을 쓰려면 맥의 **`backend/.env`** 도 같은 구조로 두면 됩니다(`./backend/.env`).
+
 예시(포트·사용자·호스트·원격 경로는 환경에 맞게 바꿉니다).
 
 ```bash
-scp -P 22222 \
-  alphapulse-predict.tar alphapulse-api.tar \
-  vims@192.168.0.141:~/projects/alphapulse/
+scp -P 22 alphapulse-predict.tar alphapulse-api.tar docker-compose.yml test@192.168.0.232:~/project/alphapulse/
+# (선택) scp ... backend/.env test@192.168.0.232:~/project/alphapulse/backend/
+
 ```
 
-### 11.3 3단계: 서버(Podman)에서 기존 컨테이너 교체
+### 11.3 3단계: 서버(docker)에서 기존 컨테이너 교체
 
-**사용자 정의 네트워크**를 쓰면 컨테이너 이름으로 서로 통신할 수 있습니다(`PREDICT_URL`, `BACKEND_BASE_URL`).
+**권장:** `docker-compose.yml`이 있는 디렉터리에서 **`docker load` 후 `docker compose up -d --no-build`** 만 실행합니다. 포트·`PREDICT_URL`·`env_file` 등은 YAML에 이미 정의되어 있습니다.
+
+예전에 **수동 `docker run`으로** `alphapulse-predict` / `alphapulse-api` 이름을 썼다면, 한 번 지운 뒤 Compose로 올립니다.
 
 ```bash
-ssh -p 22222 vims@192.168.0.141
-cd ~/projects/alphapulse
+cd ~/projects/alphapulse   # tar + docker-compose.yml 이 있는 폴더
 
-# 네트워크(최초 1회)
-podman network create alphapulse-network 2>/dev/null || true
+docker rm -f alphapulse-predict alphapulse-api
 
-# 기존 앱 컨테이너만 중지·삭제 (DB 등 다른 스택은 그대로 두는 식으로 조정)
-podman rm -f alphapulse-predict alphapulse-api
+docker load -i alphapulse-predict.tar
+docker load -i alphapulse-api.tar
 
-# 신규 이미지 로드
-podman load < alphapulse-predict.tar
-podman load < alphapulse-api.tar
+docker compose up -d --no-build
 ```
 
-실행 순서는 `docker-compose.yml`과 같이 **predict → api** 로 두면 됩니다(백엔드가 예측 서비스에 의존).
+- `--no-build`: 방금 `load`한 이미지만 쓰고, Dockerfile로 다시 빌드하지 않습니다.
+- **`backend/.env` 없이**도 기동할 수 있게 두었습니다(`env_file` optional). Firestore를 쓰려면 맥에서 복사한 `backend/.env`를 두면 자동 주입됩니다.
+- 서비스 이름은 Compose 기준 **`predict` / `api`** 입니다(예전 수동 이름 `alphapulse-*`와 다를 수 있음).
+
+**대안(Compose 없이):** tar만 있는 PC에서는 예전처럼 긴 `docker run` 두 줄을 쓸 수 있지만, 유지보수가 불편하므로 **`docker-compose.yml`을 같이 두는 방식**을 권장합니다.
 
 ```bash
-podman run -d --name alphapulse-predict \
-  --network alphapulse-network \
-  -p 8001:8001 \
-  -e BACKEND_BASE_URL=http://alphapulse-api:4001 \
-  -e FINBERT_ENABLED=false \
-  --restart unless-stopped \
-  alphapulse/predict:local
+docker run -d --name alphapulse-predict --network alphapulse-network -p 8001:8001 -e BACKEND_BASE_URL=http://alphapulse-api:4001 -e FINBERT_ENABLED=false --restart unless-stopped alphapulse/predict:local
 
-podman run -d --name alphapulse-api \
-  --network alphapulse-network \
-  -p 4001:4001 \
-  -e NODE_ENV=production \
-  -e PORT=4001 \
-  -e PREDICT_URL=http://alphapulse-predict:8001 \
-  -e FRONTEND_DIST=/app/frontend/dist \
-  --restart unless-stopped \
-  alphapulse/api:local
+docker run -d --name alphapulse-api --network alphapulse-network -p 4001:4001 -e NODE_ENV=production -e PORT=4001 -e PREDICT_URL=http://alphapulse-predict:8001 -e FRONTEND_DIST=/app/frontend/dist --restart unless-stopped alphapulse/api:local
 ```
 
-- **공인 IP·방화벽 앞에서 포트만 열려 있으면** `-p 4001:4001` 만으로 UI+API 접속이 됩니다. 예측 서버는 내부 전용으로 두려면 `-p 127.0.0.1:8001:8001` 처럼 바인딩을 조이면 됩니다.
-- **Firebase·Redis·기타 비밀**은 Blueprint에서 하던 것처럼 `-e ...`, `--env-file`, `-v ...json:ro` 를 `alphapulse-api` `podman run` 줄에 추가하면 됩니다. (`docker-compose.yml` §5 참고.)
+(위 `docker run`은 **사용자 정의 네트워크 `alphapulse-network`가 이미 있을 때**이며, Compose를 쓰면 네트워크 생성까지 포함되므로 일반적으로는 위 § 권장 절차만 쓰면 됩니다.)
+
+- **공인 IP·방화벽**에서는 TCP **4001** (필요 시 **8001**)을 열면 됩니다.
+- **Firebase JSON 파일 경로**를 `.env`에 쓰는 경우, 컨테이너 안 경로와 `docker-compose.yml`의 `volumes` 주석을 맞추세요(§5·§7).
+
+### 11.3.1 여전히 「Firestore 미설정」「예측 이력이 비어 있습니다」가 뜰 때
+
+`docker compose up`까지 했는데도 뜨는 경우는 거의 항상 **백엔드가 Firestore Admin에 못 붙는 것**입니다. 아래를 순서대로 확인하세요.
+
+1. **Windows에 `backend/.env`가 실제로 있는지**  
+   `docker-compose.yml`과 **같은 프로젝트 루트** 아래 `backend\.env` (경로 오타 없음).
+
+2. **`.env` 안의 경로가 “맥 전용”이 아닌지**  
+   `GOOGLE_APPLICATION_CREDENTIALS=/Users/.../xxx.json` 처럼 **맥 절대 경로**면 컨테이너 안에는 그 파일이 없습니다.  
+   → Windows에서 쓰는 JSON을 `backend\` 아래에 두고, 아래 3번처럼 **컨테이너 경로 + 마운트**로 맞춥니다.
+
+3. **JSON 파일을 컨테이너에 넣기 (가장 흔한 해결)**  
+   - 맥에서 받은 **서비스 계정 JSON**을 Windows 프로젝트의 `backend\` 폴더에 복사합니다 (예: `backend\alphapulse-firebase-adminsdk.json`).  
+   - `backend\.env`에 한 줄을 **컨테이너 기준 경로**로 맞춥니다:  
+     `GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase.json`  
+   - `docker-compose.yml`의 `api` 서비스에서 **주석 처리된 `volumes` 두 줄을 해제**하고, 왼쪽 파일명을 방금 둔 파일 이름으로 바꿉니다.  
+     예: `./backend/alphapulse-firebase-adminsdk.json:/run/secrets/firebase.json:ro`  
+   - 저장 후 재기동:  
+     `docker compose up -d --no-build --force-recreate api`
+
+4. **로그로 확인** (PowerShell):  
+   `docker compose logs api` 에서 `[Firestore]` 경고가 사라졌는지 봅니다.
+
+5. **대안**  
+   `backend/.env`에 **`FIREBASE_SERVICE_ACCOUNT_JSON`** 으로 JSON **본문**을 넣는 방식이면 파일 마운트 없이도 될 수 있습니다(값이 길고 따옴표 이스케이프 주의). 동작은 `backend/src/firebaseCredential.ts` 참고.
+
+브라우저 쪽 「Firestore 규칙」 안내는 **클라이언트 SDK로 직접 읽을 때** 추가로 필요할 수 있습니다. Admin만 붙으면 API 경로로 이력이 채워지는 경우가 많습니다.
 
 ### 11.4 Docker Desktop(Windows)에서도 동일한가?
 
-가능합니다. `podman` 대신 `docker`만 쓰면 됩니다.
+가능합니다. **tar 두 개 + `docker-compose.yml`을 같은 폴더에 두고** PowerShell에서:
 
 ```powershell
-docker network create alphapulse-network 2>$null
-docker rm -f alphapulse-predict alphapulse-api
+cd C:\Users\TEST\project\alphapulse
+
+docker rm -f alphapulse-predict alphapulse-api 2>$null
+
 docker load -i alphapulse-predict.tar
 docker load -i alphapulse-api.tar
-# 이후 podman run 과 동일 인자로 docker run ...
+
+docker compose up -d --no-build
 ```
 
-또는 tar만 로드해 둔 뒤 **`docker compose up -d --no-build`**(같은 폴더에 `docker-compose.yml` 유지)가 더 단순할 수 있습니다(§10).
+`env_file`의 `path` / `required: false` 형식은 **Docker Compose v2.24+**(최근 Docker Desktop)에서 지원됩니다. 오류가 나면 저장소의 `docker-compose.yml`을 받은 최신본인지 확인하세요.

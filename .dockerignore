@@ -1,4 +1,6 @@
 .git
+ai_model
+docs
 **/node_modules
 **/dist
 **/.env

@@ -2197,7 +2197,8 @@ app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
 const frontendDist = process.env.FRONTEND_DIST || path.join(process.cwd(), 'frontend', 'dist')
 if (process.env.NODE_ENV === 'production' && fs.existsSync(frontendDist)) {
   app.use(express.static(frontendDist))
-  app.get('*', (req, res, next) => {
+  // Express 5 / path-to-regexp v8: bare '*' is invalid; use a named catch-all.
+  app.get('/{*path}', (req, res, next) => {
     if (req.path.startsWith('/api')) return next()
     res.sendFile(path.join(frontendDist, 'index.html'))
   })
