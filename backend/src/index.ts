@@ -173,6 +173,13 @@ const fallbackSymbols: SymbolItem[] = [
 ]
 const koreaSymbols: SymbolItem[] = [
   { symbol: '005930.KS', name: '삼성전자' },
+  { symbol: '^KS200', name: 'KOSPI 200' },
+  { symbol: '^KS11', name: 'KOSPI' },
+  { symbol: '114800.KS', name: 'KODEX 인버스' },
+  { symbol: '252670.KS', name: 'KODEX 200선물인버스2X' },
+  { symbol: '252710.KS', name: 'TIGER 200선물인버스2X' },
+  { symbol: '251340.KS', name: 'KODEX 코스닥150선물인버스' },
+  { symbol: '250780.KS', name: 'TIGER 코스닥150선물인버스' },
   { symbol: '000660.KS', name: 'SK하이닉스' },
   { symbol: '035420.KS', name: 'NAVER' },
   { symbol: '005380.KS', name: '현대차' },
@@ -951,6 +958,51 @@ function isKoreanTicker(ticker: string): boolean {
   return /\.(KS|KQ)$/i.test(ticker)
 }
 
+/** KIS 일봉 API(6자리 종목코드) — 지수(^KS200)·비표준 .KS 심볼은 야후만 사용 */
+function isKoreanSixDigitEquity(ticker: string): boolean {
+  return /^\d{6}\.(KS|KQ)$/i.test(ticker)
+}
+
+const CHART_ANCHOR_YEAR_MIN = 2016
+
+function chartMarketTimezone(ticker: string): string {
+  const u = ticker.toUpperCase()
+  if (u.endsWith('.KS') || u.endsWith('.KQ')) return 'Asia/Seoul'
+  if (u.startsWith('^KS') || u.startsWith('^KQ')) return 'Asia/Seoul'
+  return 'America/New_York'
+}
+
+/** 거래소 타임존 기준 YYYY-MM-DD */
+function ymdInTimeZoneLabel(isoOrNow: Date, tz: string): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(isoOrNow)
+  const y = parts.find((p) => p.type === 'year')?.value ?? '1970'
+  const m = parts.find((p) => p.type === 'month')?.value ?? '01'
+  const d = parts.find((p) => p.type === 'day')?.value ?? '01'
+  return `${y}-${m}-${d}`
+}
+
+function padChart2(n: number): string {
+  return n < 10 ? `0${n}` : String(n)
+}
+
+/** 해당 타임존에서 자정 기준 분 (정규장 필터용) */
+function minutesSinceMidnightInTz(iso: string, tz: string): number {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(iso))
+  const h = Number(parts.find((p) => p.type === 'hour')?.value ?? '0')
+  const m = Number(parts.find((p) => p.type === 'minute')?.value ?? '0')
+  return h * 60 + m
+}
+
 function ymdToCompact(ymd: string): string {
   return ymd.replace(/-/g, '')
 }
@@ -1006,11 +1058,21 @@ async function getKisAccessToken(): Promise<string> {
   return kisTokenPromise
 }
 
-async function fetchKisDailyCloses(
+type KisDailyRow = { date: string; open: number; high: number; low: number; close: number; volume: number }
+
+/** KIS 일봉 차트는 한 번에 최대 약 100건 근처만 반환 → 긴 구간은 쪼개서 병합 */
+function addCalendarDaysYmd(ymd: string, days: number): string {
+  const [y, m, d] = ymd.split('-').map(Number)
+  const dt = new Date(Date.UTC(y, m - 1, d))
+  dt.setUTCDate(dt.getUTCDate() + days)
+  return dt.toISOString().slice(0, 10)
+}
+
+async function fetchKisDailyClosesOnce(
   ticker: string,
   fromYmd: string,
   toYmd: string,
-): Promise<Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>> {
+): Promise<KisDailyRow[]> {
   let lastError: Error | null = null
   for (let attempt = 1; attempt <= KIS_RETRY_MAX_ATTEMPTS; attempt += 1) {
     try {
@@ -1022,7 +1084,8 @@ async function fetchKisDailyCloses(
         FID_INPUT_DATE_1: ymdToCompact(fromYmd),
         FID_INPUT_DATE_2: ymdToCompact(toYmd),
         FID_PERIOD_DIV_CODE: 'D',
-        FID_ORG_ADJ_PRC: '1',
+        /** 0=수정주가(분할·배당 반영), 1=원주가 — 차트는 시계열 비교를 위해 수정주가 사용 */
+        FID_ORG_ADJ_PRC: '0',
       })
       const response = await fetch(
         `${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice?${params.toString()}`,
@@ -1075,6 +1138,26 @@ async function fetchKisDailyCloses(
     }
   }
   throw lastError ?? new Error('KIS price failed: unknown')
+}
+
+async function fetchKisDailyCloses(ticker: string, fromYmd: string, toYmd: string): Promise<KisDailyRow[]> {
+  if (fromYmd > toYmd) return []
+  /** ~80일씩 요청 시 거래일 수가 100건 제한 아래에 머무르는 경우가 많음 */
+  const CHUNK_CAL_DAYS = 80
+  const merged = new Map<string, KisDailyRow>()
+  let chunkStart = fromYmd
+  let guard = 0
+  while (chunkStart <= toYmd && guard < 64) {
+    guard += 1
+    const chunkEndCandidate = addCalendarDaysYmd(chunkStart, CHUNK_CAL_DAYS - 1)
+    const chunkEnd = chunkEndCandidate > toYmd ? toYmd : chunkEndCandidate
+    const rows = await fetchKisDailyClosesOnce(ticker, chunkStart, chunkEnd)
+    for (const r of rows) {
+      merged.set(r.date, r)
+    }
+    chunkStart = addCalendarDaysYmd(chunkEnd, 1)
+  }
+  return [...merged.values()].sort((a, b) => a.date.localeCompare(b.date))
 }
 
 async function fetchYahooDailyCloses(ticker: string, period1: Date, period2: Date): Promise<Array<{ date: string; close: number }>> {
@@ -1504,7 +1587,7 @@ async function loadHistoricalCandles(
       return p.toISOString().slice(0, 10)
     })()
 
-  if (isKoreanTicker(ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
+  if (isKoreanSixDigitEquity(ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
     try {
       const kisData = await fetchKisDailyCloses(ticker, fromStr, toStr)
       return kisData.map((q) => ({
@@ -1739,7 +1822,7 @@ async function resolveOutcomeForPrediction(record: PredictionRecord): Promise<{
   const period1 = new Date(baseDate)
   period1.setUTCDate(period1.getUTCDate() - 3)
   let normalized: Array<{ date: string; close: number }> = []
-  if (isKoreanTicker(record.ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
+  if (isKoreanSixDigitEquity(record.ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
     try {
       normalized = await fetchKisDailyCloses(record.ticker, period1.toISOString().slice(0, 10), today.toISOString().slice(0, 10))
     } catch (err) {
@@ -2050,9 +2133,80 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
     return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
   }
   const timeframe = (normalizeSingle(req.query.timeframe as string | string[] | undefined) ?? 'month').toLowerCase()
-  const yearsRaw = Number(normalizeSingle(req.query.years as string | string[] | undefined) ?? 1)
-  const years = Number.isFinite(yearsRaw) ? Math.min(Math.max(Math.floor(yearsRaw), 1), 30) : 1
-  const stockCacheKey = `${ticker}:${timeframe}:${years}:ohlc-v1`
+  const tz = chartMarketTimezone(ticker)
+  const todayYmd = ymdInTimeZoneLabel(new Date(), tz)
+  const ty = Number(todayYmd.slice(0, 4))
+  const tm = Number(todayYmd.slice(5, 7))
+
+  const calYearRaw = normalizeSingle(req.query.calYear as string | string[] | undefined)
+  const calMonthRaw = normalizeSingle(req.query.calMonth as string | string[] | undefined)
+  const calDateRaw = normalizeSingle(req.query.calDate as string | string[] | undefined)
+
+  let calYear = calYearRaw != null && calYearRaw !== '' ? Number(calYearRaw) : ty
+  if (!Number.isFinite(calYear)) calYear = ty
+  let calMonth = calMonthRaw != null && calMonthRaw !== '' ? Number(calMonthRaw) : tm
+  if (!Number.isFinite(calMonth) || calMonth < 1 || calMonth > 12) calMonth = tm
+
+  let calDate =
+    calDateRaw && /^\d{4}-\d{2}-\d{2}$/.test(calDateRaw) ? calDateRaw : todayYmd
+  if (calDate > todayYmd) calDate = todayYmd
+
+  type StockInterval = '1d' | '5m'
+  let interval: StockInterval = '1d'
+  let period1: Date
+  let period2: Date
+  let kisFrom: string | null = null
+  let kisTo: string | null = null
+
+  if (timeframe === 'year') {
+    interval = '1d'
+    kisFrom = `${CHART_ANCHOR_YEAR_MIN}-01-01`
+    kisTo = todayYmd
+    period1 = new Date(`${kisFrom}T00:00:00.000Z`)
+    period2 = new Date()
+  } else if (timeframe === 'month') {
+    interval = '1d'
+    const yM = Math.min(Math.max(calYear, CHART_ANCHOR_YEAR_MIN), ty)
+    const endYm = yM < ty ? `${yM}-12-31` : todayYmd
+    kisFrom = `${yM}-01-01`
+    kisTo = endYm
+    period1 = new Date(`${kisFrom}T00:00:00.000Z`)
+    period2 = new Date(`${kisTo}T23:59:59.999Z`)
+  } else if (timeframe === 'day') {
+    interval = '1d'
+    let yD = Math.min(Math.max(calYear, CHART_ANCHOR_YEAR_MIN), ty)
+    let mD = Math.min(Math.max(calMonth, 1), 12)
+    if (yD === ty && mD > tm) {
+      mD = tm
+    }
+    const ld = new Date(yD, mD, 0).getDate()
+    const startM = `${yD}-${padChart2(mD)}-01`
+    const endMRaw = `${yD}-${padChart2(mD)}-${padChart2(ld)}`
+    let endM = endMRaw
+    if (yD === ty && mD === tm) {
+      endM = todayYmd < endMRaw ? todayYmd : endMRaw
+    }
+    kisFrom = startM
+    kisTo = endM
+    period1 = new Date(`${kisFrom}T00:00:00.000Z`)
+    period2 = new Date(`${kisTo}T23:59:59.999Z`)
+  } else if (timeframe === 'hour') {
+    interval = '5m'
+    kisFrom = null
+    kisTo = null
+    const base = new Date(`${calDate}T12:00:00.000Z`)
+    period1 = new Date(base.getTime() - 2 * 24 * 60 * 60 * 1000)
+    period2 = new Date(base.getTime() + 2 * 24 * 60 * 60 * 1000)
+  } else {
+    interval = '1d'
+    const yM = Math.min(Math.max(calYear, CHART_ANCHOR_YEAR_MIN), ty)
+    kisFrom = `${yM}-01-01`
+    kisTo = todayYmd
+    period1 = new Date(`${kisFrom}T00:00:00.000Z`)
+    period2 = new Date(`${kisTo}T23:59:59.999Z`)
+  }
+
+  const stockCacheKey = `${ticker}:${timeframe}:y${calYear}:m${calMonth}:d${calDate}:${interval}:ohlc-v5`
   const redisStockKey = `stock:${stockCacheKey}`
   const redisStock = await getRedisJson<{ date: string; open: number; high: number; low: number; close: number; volume: number }[]>(
     redisStockKey,
@@ -2067,23 +2221,11 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
   }
 
   try {
-    const rangeByTimeframe: Record<
-      string,
-      { interval: '1d' | '1wk' | '1h' | '15m' | '5m'; daysBack: number }
-    > = {
-      year: { interval: '1d', daysBack: years * 365 },
-      month: { interval: '1d', daysBack: 31 },
-      day: { interval: '15m', daysBack: 5 },
-      hour: { interval: '5m', daysBack: 1 },
-    }
-    const selected = rangeByTimeframe[timeframe] ?? rangeByTimeframe.month
     let result: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }> = []
 
-    if (selected.interval === '1d' && isKoreanTicker(ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
-      const toDate = new Date().toISOString().slice(0, 10)
-      const fromDate = new Date(Date.now() - selected.daysBack * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    if (interval === '1d' && kisFrom && kisTo && isKoreanSixDigitEquity(ticker) && KIS_APP_KEY && KIS_APP_SECRET) {
       try {
-        const kisData = await fetchKisDailyCloses(ticker, fromDate, toDate)
+        const kisData = await fetchKisDailyCloses(ticker, kisFrom, kisTo)
         result = kisData.map((q) => ({
           date: `${q.date}T00:00:00.000Z`,
           open: q.open,
@@ -2098,13 +2240,10 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
     }
 
     if (result.length === 0) {
-      const period2 = new Date()
-      const period1 = new Date(period2)
-      period1.setDate(period2.getDate() - selected.daysBack)
       const candles = await yahooFinance.chart(ticker, {
         period1,
         period2,
-        interval: selected.interval,
+        interval,
       })
 
       result =
@@ -2115,8 +2254,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
               q.date != null &&
               q.open != null &&
               q.high != null &&
-              q.low != null &&
-              q.volume != null,
+              q.low != null,
           )
           .map((q) =>
             CandleSchema.parse({
@@ -2125,7 +2263,7 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
               high: q.high!,
               low: q.low!,
               close: q.close!,
-              volume: q.volume!,
+              volume: q.volume ?? 0,
             }),
           )
           .map((q) => ({
@@ -2136,6 +2274,19 @@ app.get('/api/stock/:ticker', async (req: Request, res: Response) => {
             close: q.close,
             volume: q.volume,
           })) ?? []
+    }
+
+    if (timeframe === 'hour' && result.length > 0) {
+      const dH = calDate
+      result = result.filter((q) => ymdInTimeZoneLabel(new Date(q.date), tz) === dH)
+      const isKrSession = chartMarketTimezone(ticker) === 'Asia/Seoul'
+      const openMin = isKrSession ? 9 * 60 : 9 * 60 + 30
+      const closeMin = isKrSession ? 15 * 60 + 30 : 16 * 60
+      result = result.filter((q) => {
+        const mins = minutesSinceMidnightInTz(q.date, tz)
+        return mins >= openMin && mins <= closeMin
+      })
+      result.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
     }
 
     stockCache.set(stockCacheKey, { data: result, cachedAt: Date.now() })

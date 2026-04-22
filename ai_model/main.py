@@ -212,7 +212,7 @@ def fetch_kis_ohlcv(ticker: str, period_years: int) -> pd.DataFrame:
     "FID_INPUT_DATE_1": start_date.strftime("%Y%m%d"),
     "FID_INPUT_DATE_2": end_date.strftime("%Y%m%d"),
     "FID_PERIOD_DIV_CODE": "D",
-    "FID_ORG_ADJ_PRC": "1",
+    "FID_ORG_ADJ_PRC": "0",
   }
   res = requests.get(
     f"{KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",

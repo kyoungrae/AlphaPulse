@@ -75,6 +75,84 @@ type CandlePoint = {
   volume?: number
 }
 
+const CHART_YEAR_MIN = 2016
+
+function ymdInMarketTz(market: 'us' | 'kr', when: Date = new Date()): string {
+  const tz = market === 'kr' ? 'Asia/Seoul' : 'America/New_York'
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(when)
+  const y = parts.find((p) => p.type === 'year')?.value ?? '1970'
+  const m = parts.find((p) => p.type === 'month')?.value ?? '01'
+  const d = parts.find((p) => p.type === 'day')?.value ?? '01'
+  return `${y}-${m}-${d}`
+}
+
+function isoDateKey(date: string): string {
+  const s = typeof date === 'string' ? date : new Date(date).toISOString()
+  return s.slice(0, 10)
+}
+
+function aggregateYearlyCandles(dailies: CandlePoint[], minYear: number, todayYmd: string): CandlePoint[] {
+  const cy = Number(todayYmd.slice(0, 4))
+  const sorted = [...dailies].sort((a, b) => isoDateKey(a.date).localeCompare(isoDateKey(b.date)))
+  const byYear = new Map<number, CandlePoint[]>()
+  for (const c of sorted) {
+    const y = Number(isoDateKey(c.date).slice(0, 4))
+    if (y < minYear || y > cy) continue
+    if (!byYear.has(y)) byYear.set(y, [])
+    byYear.get(y)!.push(c)
+  }
+  const years = [...byYear.keys()].sort((a, b) => a - b)
+  return years.map((y) => {
+    const pts = byYear.get(y)!
+    const first = pts[0]
+    const last = pts[pts.length - 1]
+    return {
+      date: last.date,
+      open: first.open,
+      high: Math.max(...pts.map((p) => p.high)),
+      low: Math.min(...pts.map((p) => p.low)),
+      close: last.close,
+      volume: pts.reduce((s, p) => s + Number(p.volume ?? 0), 0),
+    }
+  })
+}
+
+function aggregateMonthlyCandles(dailies: CandlePoint[], targetYear: number, todayYmd: string): CandlePoint[] {
+  const ty = Number(todayYmd.slice(0, 4))
+  const tm = Number(todayYmd.slice(5, 7))
+  const sorted = [...dailies].sort((a, b) => isoDateKey(a.date).localeCompare(isoDateKey(b.date)))
+  const inYear = sorted.filter((c) => Number(isoDateKey(c.date).slice(0, 4)) === targetYear)
+  const byMonth = new Map<number, CandlePoint[]>()
+  for (const c of inYear) {
+    const m = Number(isoDateKey(c.date).slice(5, 7))
+    if (!byMonth.has(m)) byMonth.set(m, [])
+    byMonth.get(m)!.push(c)
+  }
+  const maxMonth = targetYear < ty ? 12 : targetYear > ty ? 0 : tm
+  if (maxMonth <= 0) return []
+  const out: CandlePoint[] = []
+  for (let m = 1; m <= maxMonth; m += 1) {
+    const pts = byMonth.get(m)
+    if (!pts?.length) continue
+    const first = pts[0]
+    const last = pts[pts.length - 1]
+    out.push({
+      date: last.date,
+      open: first.open,
+      high: Math.max(...pts.map((p) => p.high)),
+      low: Math.min(...pts.map((p) => p.low)),
+      close: last.close,
+      volume: pts.reduce((s, p) => s + Number(p.volume ?? 0), 0),
+    })
+  }
+  return out
+}
+
 type NewsItem = {
   title: string
   link?: string
@@ -328,6 +406,12 @@ type ChartRow = {
 
 function formatFullAxisLabel(iso: string, timeframe: 'year' | 'month' | 'day' | 'hour') {
   const dt = new Date(iso)
+  if (timeframe === 'year') {
+    return `${isoDateKey(iso).slice(0, 4)}년`
+  }
+  if (timeframe === 'month') {
+    return dt.toLocaleString('ko-KR', { year: 'numeric', month: 'long' })
+  }
   return dt.toLocaleString('ko-KR', {
     year: 'numeric',
     month: '2-digit',
@@ -623,7 +707,12 @@ export default function Dashboard() {
   const [watchlist, setWatchlist] = useState<WatchlistEntry[]>(() => loadWatchlistFromStorage())
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('day')
-  const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
+  const [chartCalYear, setChartCalYear] = useState(() => new Date().getFullYear())
+  const [chartCalMonth, setChartCalMonth] = useState(() => new Date().getMonth() + 1)
+  const [chartCalDate, setChartCalDate] = useState(() => {
+    const d = new Date()
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  })
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
   const [strategy, setStrategy] = useState<StrategyMode>('long_only')
   const [horizon, setHorizon] = useState<1 | 3 | 5 | 10>(1)
@@ -743,7 +832,24 @@ export default function Dashboard() {
     setPriceCurrency(market === 'kr' ? 'krw' : 'usd')
   }, [market])
 
+  useEffect(() => {
+    const ymd = ymdInMarketTz(market)
+    setChartCalYear(Number(ymd.slice(0, 4)))
+    setChartCalMonth(Number(ymd.slice(5, 7)))
+    setChartCalDate(ymd)
+  }, [market])
+
   const nativeCurrency: NativeCurrency = market === 'kr' ? 'krw' : 'usd'
+  const todayYmdMarket = useMemo(() => ymdInMarketTz(market), [market])
+  const maxChartYear = Number(todayYmdMarket.slice(0, 4))
+  const maxChartMonth = Number(todayYmdMarket.slice(5, 7))
+
+  useEffect(() => {
+    if (timeframe !== 'day') return
+    if (chartCalYear === maxChartYear && chartCalMonth > maxChartMonth) {
+      setChartCalMonth(maxChartMonth)
+    }
+  }, [timeframe, chartCalYear, chartCalMonth, maxChartYear, maxChartMonth])
 
   const {
     data: symbols,
@@ -781,17 +887,31 @@ export default function Dashboard() {
     return true
   }, [favoritesOnly, watchlist, selectedSymbol, market])
 
+  const stockApiUrl = useMemo(() => {
+    if (!detailSelectionReady) return ''
+    const p = new URLSearchParams()
+    p.set('timeframe', timeframe)
+    if (timeframe === 'month') p.set('calYear', String(chartCalYear))
+    if (timeframe === 'day') {
+      p.set('calYear', String(chartCalYear))
+      p.set('calMonth', String(chartCalMonth))
+    }
+    if (timeframe === 'hour') p.set('calDate', chartCalDate)
+    return apiUrl(`/api/stock/${encodeURIComponent(selectedSymbol)}?${p.toString()}`)
+  }, [detailSelectionReady, selectedSymbol, timeframe, chartCalYear, chartCalMonth, chartCalDate])
+
   const {
     data: stock,
     loading: stockLoading,
     error: stockError,
-  } = useFetch<CandlePoint[]>(
-    detailSelectionReady
-      ? apiUrl(
-          `/api/stock/${encodeURIComponent(selectedSymbol)}?timeframe=${encodeURIComponent(timeframe)}&years=${yearRange}`,
-        )
-      : '',
-  )
+  } = useFetch<CandlePoint[]>(stockApiUrl)
+
+  const candlesForChart = useMemo(() => {
+    if (!stock?.length) return []
+    if (timeframe === 'year') return aggregateYearlyCandles(stock, CHART_YEAR_MIN, todayYmdMarket)
+    if (timeframe === 'month') return aggregateMonthlyCandles(stock, chartCalYear, todayYmdMarket)
+    return stock
+  }, [stock, timeframe, chartCalYear, todayYmdMarket])
   const {
     data: news,
     loading: newsLoading,
@@ -888,13 +1008,13 @@ export default function Dashboard() {
   }, [articleModal])
 
   const chartData = useMemo((): ChartRow[] => {
-    if (!stock || stock.length === 0) return []
+    if (!candlesForChart || candlesForChart.length === 0) return []
 
     const rate = fxData?.rate
     const toDisplay = (v: number) => convertPrice(v, nativeCurrency, priceCurrency, rate)
 
-    const closes = stock.map((s) => s.close)
-    const result = stock.map((pt, idx) => {
+    const closes = candlesForChart.map((s) => s.close)
+    const result = candlesForChart.map((pt, idx) => {
       const iso = typeof pt.date === 'string' ? pt.date : new Date(pt.date).toISOString()
       const tooltipLabel = formatFullAxisLabel(iso, timeframe)
       const close = pt.close
@@ -922,8 +1042,8 @@ export default function Dashboard() {
         const lookback = 180
         const binCount = 24
         const start = Math.max(0, idx - lookback + 1)
-        const windowPrices = stock.slice(start, idx + 1).map((item) => toDisplay(item.close))
-        const windowVolumes = stock.slice(start, idx + 1).map((item) => Number(item.volume ?? 0))
+        const windowPrices = candlesForChart.slice(start, idx + 1).map((item) => toDisplay(item.close))
+        const windowVolumes = candlesForChart.slice(start, idx + 1).map((item) => Number(item.volume ?? 0))
         const pMin = Math.min(...windowPrices)
         const pMax = Math.max(...windowPrices)
         const current = toDisplay(pt.close)
@@ -978,7 +1098,7 @@ export default function Dashboard() {
       }
     })
     return result
-  }, [stock, timeframe, nativeCurrency, priceCurrency, fxData?.rate])
+  }, [candlesForChart, timeframe, nativeCurrency, priceCurrency, fxData?.rate])
 
   const displayChartData = useMemo((): ChartRow[] => {
     if (!chartData.length) return []
@@ -1013,7 +1133,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     setChartZoomRange(null)
-  }, [selectedSymbol, timeframe, yearRange, stock?.length])
+  }, [selectedSymbol, timeframe, chartCalYear, chartCalMonth, chartCalDate, stock?.length])
 
   /** 휠/더블클릭은 플롯 영역(.recharts-surface)에만 걸어 축·범례 영역과 분리 */
   useLayoutEffect(() => {
@@ -1736,7 +1856,7 @@ export default function Dashboard() {
                   ₩
                 </button>
               </div>
-              <div className="flex items-center gap-2 rounded-full bg-slate-950/60 px-2 py-1">
+              <div className="flex flex-wrap items-center gap-2 rounded-full bg-slate-950/60 px-2 py-1">
                 {([
                   { key: 'year', label: '년' },
                   { key: 'month', label: '월' },
@@ -1757,28 +1877,83 @@ export default function Dashboard() {
                   </button>
                 ))}
               </div>
-              {timeframe === 'year' && (
-                <div className="flex items-center gap-0.5 rounded-full bg-slate-950/80 p-0.5">
-                  {([
-                    { key: 1, label: '1Y' },
-                    { key: 3, label: '3Y' },
-                    { key: 5, label: '5Y' },
-                    { key: 10, label: '10Y' },
-                    { key: 20, label: 'MAX' },
-                  ] as const).map((item) => (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onClick={() => setYearRange(item.key)}
-                      className={`rounded-full px-2 py-1 text-xs ${
-                        yearRange === item.key
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                      }`}
+              {timeframe === 'month' && (
+                <label className="flex items-center gap-1.5 text-xs text-slate-400">
+                  <span className="whitespace-nowrap">연도</span>
+                  <select
+                    value={chartCalYear}
+                    onChange={(e) => setChartCalYear(Number(e.target.value))}
+                    className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-slate-200"
+                  >
+                    {Array.from({ length: maxChartYear - CHART_YEAR_MIN + 1 }, (_, i) => CHART_YEAR_MIN + i)
+                      .reverse()
+                      .map((y) => (
+                        <option key={y} value={y}>
+                          {y}년
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              )}
+              {timeframe === 'day' && (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                  <label className="flex items-center gap-1.5">
+                    <span className="whitespace-nowrap">연도</span>
+                    <select
+                      value={chartCalYear}
+                      onChange={(e) => {
+                        const y = Number(e.target.value)
+                        setChartCalYear(y)
+                        if (y === maxChartYear && chartCalMonth > maxChartMonth) {
+                          setChartCalMonth(maxChartMonth)
+                        }
+                      }}
+                      className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-slate-200"
                     >
-                      {item.label}
-                    </button>
-                  ))}
+                      {Array.from({ length: maxChartYear - CHART_YEAR_MIN + 1 }, (_, i) => CHART_YEAR_MIN + i)
+                        .reverse()
+                        .map((y) => (
+                          <option key={y} value={y}>
+                            {y}년
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    <span className="whitespace-nowrap">월</span>
+                    <select
+                      value={chartCalMonth}
+                      onChange={(e) => setChartCalMonth(Number(e.target.value))}
+                      className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-slate-200"
+                    >
+                      {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => {
+                        const disabled = chartCalYear === maxChartYear && m > maxChartMonth
+                        return (
+                          <option key={m} value={m} disabled={disabled}>
+                            {m}월
+                          </option>
+                        )
+                      })}
+                    </select>
+                  </label>
+                </div>
+              )}
+              {timeframe === 'hour' && (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                  <label className="flex items-center gap-1.5">
+                    <span className="whitespace-nowrap">날짜</span>
+                    <input
+                      type="date"
+                      value={chartCalDate}
+                      min={`${CHART_YEAR_MIN}-01-01`}
+                      max={todayYmdMarket}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        if (v) setChartCalDate(v)
+                      }}
+                      className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-slate-200"
+                    />
+                  </label>
                 </div>
               )}
             </div>

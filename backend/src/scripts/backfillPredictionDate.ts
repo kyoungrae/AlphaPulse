@@ -121,7 +121,7 @@ async function fetchKisDailyCloses(ticker: string, fromYmd: string, toYmd: strin
         FID_INPUT_DATE_1: ymdToCompact(fromYmd),
         FID_INPUT_DATE_2: ymdToCompact(toYmd),
         FID_PERIOD_DIV_CODE: 'D',
-        FID_ORG_ADJ_PRC: '1',
+        FID_ORG_ADJ_PRC: '0',
       })
       const response = await fetch(
         `${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice?${params.toString()}`,
