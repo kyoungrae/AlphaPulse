@@ -1412,14 +1412,26 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
   try {
     const predict = await fetchPredict(aiTicker, undefined, 1)
     const probUp = Number(predict.probability_up) * 100
+    const probDown = 100 - probUp
     const threshold = Math.max(50, Math.min(99, Number(autoTradingConfig.threshold) || 60))
-    console.log(`[AutoTrade] ${aiTicker} 상승 확률: ${probUp.toFixed(1)}% (기준: ${threshold}%)`)
+    const aiDecision = probUp >= threshold ? '상승' : probDown >= threshold ? '하락' : '관망'
+    const aiResultStr = `AI: ${aiDecision} (상승 ${probUp.toFixed(1)}% / 하락 ${probDown.toFixed(1)}%)`
+    console.log(`[AutoTrade] ${aiTicker} ${aiResultStr} (기준: ${threshold}%)`)
 
     let targetSymbol: string | null = null
     if (probUp >= threshold) targetSymbol = upSymbol
-    else if (100 - probUp >= threshold) targetSymbol = downSymbol
+    else if (probDown >= threshold) targetSymbol = downSymbol
     if (!targetSymbol) {
       console.log(`[AutoTrade] 확률이 기준치(${threshold}%)를 넘지 않아 관망(Hold)합니다.`)
+      pushAutoTradeLog({
+        time: nowKstYmdHm().iso,
+        action: 'analyze',
+        symbol: aiTicker,
+        name: `AI 예측: 관망 (${probUp.toFixed(1)}%)`,
+        qty: 0,
+        price: 0,
+        status: `미달 (기준:${threshold}%)`,
+      })
       return
     }
 
@@ -1436,7 +1448,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
             time: nowIso,
             action: 'sell',
             symbol: heldSymbol,
-            name: '반대 포지션 청산',
+            name: `방향 전환 청산 (${aiResultStr})`,
             qty,
             price: 0,
             status: 'DRY_RUN',
@@ -1447,7 +1459,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
             time: nowIso,
             action: 'sell',
             symbol: heldSymbol,
-            name: '반대 포지션 청산',
+            name: `방향 전환 청산 (${aiResultStr})`,
             qty,
             price: 0,
             status: String(sellRes.msg1 ?? sellRes.rt_cd ?? '매도 전송'),
@@ -1478,7 +1490,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
         time: nowIso,
         action: 'buy_fail',
         symbol: targetSymbol,
-        name: '잔고 부족으로 매수 스킵',
+        name: `잔고 부족으로 매수 스킵 (${aiResultStr})`,
         qty: 0,
         price: currentPrice,
         status: '예수금/설정금액 부족',
@@ -1491,7 +1503,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
         time: nowIso,
         action: 'buy',
         symbol: targetSymbol,
-        name: `${aiTicker} 시그널`,
+        name: `AI 시그널 진입 (${aiResultStr})`,
         qty: buyQty,
         price: currentPrice,
         status: 'DRY_RUN',
@@ -1502,7 +1514,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
         time: nowIso,
         action: 'buy',
         symbol: targetSymbol,
-        name: `${aiTicker} 시그널`,
+        name: `AI 시그널 진입 (${aiResultStr})`,
         qty: buyQty,
         price: currentPrice,
         status: String(buyRes.msg1 ?? buyRes.rt_cd ?? '매수 전송'),
