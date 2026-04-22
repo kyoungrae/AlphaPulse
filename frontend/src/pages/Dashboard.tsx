@@ -75,6 +75,18 @@ type CandlePoint = {
   volume?: number
 }
 
+type QuoteLive = {
+  symbol: string
+  regularMarketPrice: number | null
+  asOf: string
+}
+
+function normalizeTickerForQuoteApi(sel: string, mkt: 'us' | 'kr'): string {
+  const t = sel.trim().toUpperCase()
+  if (mkt === 'kr' && /^\d{6}$/.test(t)) return `${t}.KS`
+  return t
+}
+
 const CHART_YEAR_MIN = 2016
 
 function ymdInMarketTz(market: 'us' | 'kr', when: Date = new Date()): string {
@@ -906,12 +918,101 @@ export default function Dashboard() {
     error: stockError,
   } = useFetch<CandlePoint[]>(stockApiUrl)
 
+  const [dynamicCandles, setDynamicCandles] = useState<CandlePoint[]>([])
+  const [liveQuote, setLiveQuote] = useState<QuoteLive | null>(null)
+
+  useEffect(() => {
+    setDynamicCandles(stock ?? [])
+  }, [stock])
+
+  const isToday = chartCalDate === todayYmdMarket
+  const shouldPollQuote = detailSelectionReady && timeframe === 'hour' && isToday
+
+  useEffect(() => {
+    if (!shouldPollQuote) return
+
+    let isCancelled = false
+    let timerId: number | undefined
+    let inFlightController: AbortController | null = null
+
+    const pollQuote = async () => {
+      if (isCancelled) return
+      try {
+        const tickerForApi = normalizeTickerForQuoteApi(selectedSymbol, market)
+        const ac = new AbortController()
+        inFlightController = ac
+        const res = await fetch(apiUrl(`/api/quote/${encodeURIComponent(tickerForApi)}`), { signal: ac.signal })
+        if (res.ok) {
+          const data = (await res.json()) as QuoteLive
+          if (!isCancelled) setLiveQuote(data)
+        }
+      } catch {
+        // ignore polling errors; next tick will retry
+      } finally {
+        if (!isCancelled) {
+          timerId = window.setTimeout(() => {
+            void pollQuote()
+          }, 1000)
+        }
+      }
+    }
+
+    void pollQuote()
+
+    return () => {
+      isCancelled = true
+      if (timerId) window.clearTimeout(timerId)
+      inFlightController?.abort()
+    }
+  }, [shouldPollQuote, selectedSymbol, market])
+
+  useEffect(() => {
+    if (!liveQuote || liveQuote.regularMarketPrice == null || !liveQuote.asOf) return
+    setDynamicCandles((prev) => {
+      if (prev.length === 0) return prev
+
+      const price = liveQuote.regularMarketPrice
+      const asOfDate = new Date(liveQuote.asOf)
+      asOfDate.setSeconds(0, 0)
+      const bucketIso = asOfDate.toISOString()
+
+      const next = [...prev]
+      const lastIdx = next.length - 1
+      const last = next[lastIdx]
+      const lastDate = new Date(last.date)
+      lastDate.setSeconds(0, 0)
+      const lastBucketIso = lastDate.toISOString()
+
+      if (bucketIso > lastBucketIso) {
+        next.push({
+          date: bucketIso,
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+          volume: 0,
+        })
+        return next
+      }
+      if (bucketIso === lastBucketIso) {
+        next[lastIdx] = {
+          ...last,
+          high: Math.max(last.high, price),
+          low: Math.min(last.low, price),
+          close: price,
+        }
+        return next
+      }
+      return prev
+    })
+  }, [liveQuote])
+
   const candlesForChart = useMemo(() => {
-    if (!stock?.length) return []
-    if (timeframe === 'year') return aggregateYearlyCandles(stock, CHART_YEAR_MIN, todayYmdMarket)
-    if (timeframe === 'month') return aggregateMonthlyCandles(stock, chartCalYear, todayYmdMarket)
-    return stock
-  }, [stock, timeframe, chartCalYear, todayYmdMarket])
+    if (!dynamicCandles?.length) return []
+    if (timeframe === 'year') return aggregateYearlyCandles(dynamicCandles, CHART_YEAR_MIN, todayYmdMarket)
+    if (timeframe === 'month') return aggregateMonthlyCandles(dynamicCandles, chartCalYear, todayYmdMarket)
+    return dynamicCandles
+  }, [dynamicCandles, timeframe, chartCalYear, todayYmdMarket])
   const {
     data: news,
     loading: newsLoading,
