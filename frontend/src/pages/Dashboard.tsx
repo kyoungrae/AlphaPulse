@@ -621,7 +621,7 @@ export default function Dashboard() {
   /** true면 검색 API 대신 즐겨찾기 목록만 표시 */
   const [favoritesOnly, setFavoritesOnly] = useState(true)
   const [watchlist, setWatchlist] = useState<WatchlistEntry[]>(() => loadWatchlistFromStorage())
-  const [selectedSymbol, setSelectedSymbol] = useState('AAPL')
+  const [selectedSymbol, setSelectedSymbol] = useState('')
   const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('day')
   const [yearRange, setYearRange] = useState<1 | 3 | 5 | 10 | 20>(1)
   const [priceCurrency, setPriceCurrency] = useState<DisplayCurrency>('usd')
@@ -710,6 +710,29 @@ export default function Dashboard() {
     return () => window.clearTimeout(timer)
   }, [watchlist])
 
+  /** 즐겨찾기 모드: 목록이 있으면 첫 종목을 선택, 비면 선택 해제 */
+  useEffect(() => {
+    if (!favoritesOnly) return
+    if (watchlist.length === 0) {
+      if (selectedSymbol !== '') setSelectedSymbol('')
+      return
+    }
+    const inList = watchlist.some((w) => w.symbol === selectedSymbol && w.market === market)
+    if (!inList) {
+      const first = watchlist[0]
+      setMarket(first.market)
+      setSelectedSymbol(first.symbol)
+    }
+  }, [favoritesOnly, watchlist, selectedSymbol, market])
+
+  /** 검색 모드: 선택이 비어 있으면 시장별 기본 티커 */
+  useEffect(() => {
+    if (favoritesOnly) return
+    if (!selectedSymbol.trim()) {
+      setSelectedSymbol(market === 'kr' ? '005930.KS' : 'AAPL')
+    }
+  }, [favoritesOnly, market, selectedSymbol])
+
   const symbolsUrl = useMemo(() => {
     if (favoritesOnly) return ''
     const q = encodeURIComponent(debouncedQuery.trim())
@@ -749,14 +772,25 @@ export default function Dashboard() {
     ? favoriteSymbolItems
     : (symbols?.items ?? [])
 
+  const detailSelectionReady = useMemo(() => {
+    if (!selectedSymbol.trim()) return false
+    if (favoritesOnly) {
+      if (watchlist.length === 0) return false
+      return watchlist.some((w) => w.symbol === selectedSymbol && w.market === market)
+    }
+    return true
+  }, [favoritesOnly, watchlist, selectedSymbol, market])
+
   const {
     data: stock,
     loading: stockLoading,
     error: stockError,
   } = useFetch<CandlePoint[]>(
-    apiUrl(
-      `/api/stock/${encodeURIComponent(selectedSymbol)}?timeframe=${encodeURIComponent(timeframe)}&years=${yearRange}`,
-    ),
+    detailSelectionReady
+      ? apiUrl(
+          `/api/stock/${encodeURIComponent(selectedSymbol)}?timeframe=${encodeURIComponent(timeframe)}&years=${yearRange}`,
+        )
+      : '',
   )
   const {
     data: news,
@@ -767,31 +801,45 @@ export default function Dashboard() {
     data: predict,
     loading: predictLoading,
     error: predictError,
-  } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=${horizon}`))
-  const { data: predictH1 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=1`))
-  const { data: predictH3 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=3`))
+  } = useFetch<PredictResponse>(
+    detailSelectionReady ? apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=${horizon}`) : '',
+  )
+  const { data: predictH1 } = useFetch<PredictResponse>(
+    detailSelectionReady ? apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=1`) : '',
+  )
+  const { data: predictH3 } = useFetch<PredictResponse>(
+    detailSelectionReady ? apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=3`) : '',
+  )
   const predictH5Url =
-    horizon === 5 ? '' : apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=5`)
+    !detailSelectionReady || horizon === 5
+      ? ''
+      : apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=5`)
   const { data: predictH5 } = useFetch<PredictResponse>(predictH5Url)
-  const { data: predictH10 } = useFetch<PredictResponse>(apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=10`))
+  const { data: predictH10 } = useFetch<PredictResponse>(
+    detailSelectionReady ? apiUrl(`/api/predict/${encodeURIComponent(selectedSymbol)}?horizon=10`) : '',
+  )
   const {
     data: history,
     loading: historyLoading,
     error: historyError,
-  } = usePredictionHistory(selectedSymbol, 10)
+  } = usePredictionHistory(detailSelectionReady ? selectedSymbol : '', 10)
   const {
     data: backtest,
     loading: backtestLoading,
     error: backtestError,
   } = useFetch<BacktestResult>(
-    apiUrl(`/api/backtest/${encodeURIComponent(selectedSymbol)}?market=${market}&strategy=${strategy}`),
+    detailSelectionReady
+      ? apiUrl(`/api/backtest/${encodeURIComponent(selectedSymbol)}?market=${market}&strategy=${strategy}`)
+      : '',
   )
   const {
     data: newsFeatures,
     loading: newsFeaturesLoading,
     error: newsFeaturesError,
   } = useFetch<NewsFeatureResponse>(
-    apiUrl(`/api/features/news/${encodeURIComponent(selectedSymbol)}?market=${market}&limit=100`),
+    detailSelectionReady
+      ? apiUrl(`/api/features/news/${encodeURIComponent(selectedSymbol)}?market=${market}&limit=100`)
+      : '',
   )
   const { data: fxData } = useFetch<FxResponse>(apiUrl('/api/fx/usd-krw'))
   const topSymbolsCsv = useMemo(
@@ -1051,6 +1099,7 @@ export default function Dashboard() {
   )
 
   const toggleFavoriteForSelection = () => {
+    if (!selectedSymbol.trim()) return
     setWatchlist((prev) => {
       const idx = prev.findIndex((w) => w.symbol === selectedSymbol && w.market === market)
       if (idx >= 0) {
@@ -1071,6 +1120,16 @@ export default function Dashboard() {
     [directions],
   )
   const aiBriefing = useMemo(() => {
+    if (!detailSelectionReady) {
+      return (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 shadow-lg">
+          <p className="text-sm leading-relaxed text-slate-400">
+            즐겨찾기에 종목이 없으면 ★로 추가하거나 위 칩에서 종목을 눌러 선택해 주세요. 미국·한국 탭에서는 검색 후 종목을
+            고르면 AI 분석이 표시됩니다.
+          </p>
+        </div>
+      )
+    }
     if (predictLoading || backtestLoading) {
       return (
         <div className="rounded-2xl border border-blue-900/40 bg-blue-950/20 p-4 shadow-lg">
@@ -1165,6 +1224,7 @@ export default function Dashboard() {
     priceCurrency,
     selectedDisplayName,
     horizon,
+    detailSelectionReady,
   ])
   return (
     <div className="space-y-6">
@@ -1298,13 +1358,22 @@ export default function Dashboard() {
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0 flex-1">
                 <p className="text-xs uppercase tracking-[0.2em] text-blue-300">현재 선택</p>
-                <p className="mt-1 truncate text-xl font-bold text-white">{selectedDisplayName}</p>
-                <p className="mt-1 text-xs text-slate-500">{selectedSymbol}</p>
+                <p className="mt-1 truncate text-xl font-bold text-white">
+                  {detailSelectionReady ? selectedDisplayName : '종목을 선택해 주세요'}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  {detailSelectionReady
+                    ? selectedSymbol
+                    : favoritesOnly && watchlist.length === 0
+                      ? '즐겨찾기에 종목을 추가하거나 위 칩에서 선택하세요.'
+                      : '즐겨찾기 칩을 눌러 종목을 고르세요.'}
+                </p>
               </div>
               <button
                 type="button"
                 onClick={toggleFavoriteForSelection}
-                className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                disabled={!selectedSymbol.trim()}
+                className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                   selectedIsFavorite
                     ? 'border-amber-500/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
                     : 'border-slate-600 bg-slate-800/80 text-slate-300 hover:border-amber-600/50 hover:text-amber-200'
@@ -1346,12 +1415,24 @@ export default function Dashboard() {
       <div className="grid gap-6 lg:grid-cols-3">
       <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg">
           <div className="mb-4 flex items-center justify-between">
-            <h3 className="text-lg font-bold text-white">{selectedDisplayName} 예측 VS 실측 결과</h3>
+            <h3 className="text-lg font-bold text-white">
+              {detailSelectionReady ? `${selectedDisplayName} 예측 VS 실측 결과` : '예측 VS 실측 결과'}
+            </h3>
             <div className="flex items-center gap-2">
-              {historyLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
-              {historyError && <span className="text-xs text-rose-400">오류: {historyError}</span>}
+              {detailSelectionReady && historyLoading && (
+                <span className="text-xs text-slate-400">불러오는 중...</span>
+              )}
+              {detailSelectionReady && historyError && (
+                <span className="text-xs text-rose-400">오류: {historyError}</span>
+              )}
             </div>
           </div>
+          {!detailSelectionReady ? (
+            <p className="py-14 text-center text-sm text-slate-400">
+              종목을 선택하면 예측·실측 비교 표가 표시됩니다.
+            </p>
+          ) : (
+            <>
           {history?.sync && (
             <p className="mb-3 text-[11px] text-slate-500">
               동기화 상태: {history.sync.mode === 'api' ? '서버 동기화' : history.sync.mode === 'client' ? '브라우저 직조회' : '비활성'} ·
@@ -1499,19 +1580,25 @@ export default function Dashboard() {
               </table>
             </div>
           </div>
+            </>
+          )}
         </div>
         <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="flex items-center justify-between">
             <div>
               <p className="text-xs uppercase tracking-[0.2em] text-blue-300">AI 예측</p>
-              <p className="text-sm font-semibold text-white">{selectedDisplayName} 예측</p>
+              <p className="text-sm font-semibold text-white">
+                {detailSelectionReady ? `${selectedDisplayName} 예측` : '종목 선택 대기'}
+              </p>
             </div>
-            {predictLoading && (
+            {detailSelectionReady && predictLoading && (
               <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-600 border-t-transparent" />
             )}
-            {predictError && <span className="text-xs text-rose-400">오류</span>}
+            {detailSelectionReady && predictError && <span className="text-xs text-rose-400">오류</span>}
           </div>
-          {predictLoading ? (
+          {!detailSelectionReady ? (
+            <p className="mt-4 text-center text-sm text-slate-400">종목을 고르면 AI 예측이 표시됩니다.</p>
+          ) : predictLoading ? (
             <div className="mt-4 h-24 rounded-xl bg-slate-800/60 animate-pulse" />
           ) : predict ? (
             <div className="mt-4 space-y-2">
@@ -1619,8 +1706,10 @@ export default function Dashboard() {
         <div className="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <h3 className="text-lg font-semibold text-white">{selectedDisplayName} 종가 + 지표</h3>
-              {stockLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
+              <h3 className="text-lg font-semibold text-white">
+                {detailSelectionReady ? `${selectedDisplayName} 종가 + 지표` : '종가 + 지표 (종목 대기)'}
+              </h3>
+              {detailSelectionReady && stockLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <div className="flex items-center gap-0.5 rounded-full bg-slate-950/80 p-0.5">
@@ -1768,7 +1857,11 @@ export default function Dashboard() {
             role="presentation"
             title="그리드·캔들 영역에서 휠로 확대·축소, 더블클릭으로 전체"
           >
-            {stockLoading ? (
+            {!detailSelectionReady ? (
+              <div className="flex h-full items-center justify-center px-4 text-center text-sm text-slate-400">
+                종목을 선택하면 차트가 표시됩니다.
+              </div>
+            ) : stockLoading ? (
               <div className="flex h-full items-center justify-center text-slate-500">불러오는 중...</div>
             ) : stockError ? (
               <div className="flex h-full items-center justify-center text-slate-500">차트 데이터 없음</div>
@@ -1929,9 +2022,16 @@ export default function Dashboard() {
         </div>
         <div className="lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-white">{selectedDisplayName} 전략/근거 요약</h3>
+            <h3 className="text-lg font-semibold text-white">
+              {detailSelectionReady ? `${selectedDisplayName} 전략/근거 요약` : '전략/근거 요약'}
+            </h3>
             <p className="text-xs text-slate-500">백테스트 요약 + 예측 근거</p>
           </div>
+          {!detailSelectionReady ? (
+            <p className="py-10 text-center text-sm text-slate-400">
+              종목을 고르면 백테스트·AI 근거 요약이 표시됩니다.
+            </p>
+          ) : (
           <div className="mt-1 grid grid-cols-1 gap-3 lg:grid-cols-2 lg:items-start">
             <div className="min-w-0 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
                 <div className="mb-2 flex flex-wrap items-center gap-1">
@@ -2035,15 +2135,24 @@ export default function Dashboard() {
               <p className="mt-2 text-slate-400">{predict?.reason_summary ?? '예측 데이터가 없습니다.'}</p>
             </div>
           </div>
+          )}
         </div>
         
         <div className="w-full lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-white">{selectedDisplayName} 뉴스 기반 피처 요약</h3>
-            {newsFeaturesLoading && <span className="text-xs text-slate-400">불러오는 중...</span>}
-            {newsFeaturesError && <span className="text-xs text-rose-400">오류: {newsFeaturesError}</span>}
+            <h3 className="text-lg font-semibold text-white">
+              {detailSelectionReady ? `${selectedDisplayName} 뉴스 기반 피처 요약` : '뉴스 기반 피처 요약'}
+            </h3>
+            {detailSelectionReady && newsFeaturesLoading && (
+              <span className="text-xs text-slate-400">불러오는 중...</span>
+            )}
+            {detailSelectionReady && newsFeaturesError && (
+              <span className="text-xs text-rose-400">오류: {newsFeaturesError}</span>
+            )}
           </div>
-          {newsFeaturesLoading ? (
+          {!detailSelectionReady ? (
+            <p className="mt-3 text-center text-sm text-slate-400">종목을 선택하면 뉴스 기반 피처가 표시됩니다.</p>
+          ) : newsFeaturesLoading ? (
             <div className="mt-3 h-20 animate-pulse rounded-xl bg-slate-800/60" />
           ) : newsFeatures ? (
             <>
