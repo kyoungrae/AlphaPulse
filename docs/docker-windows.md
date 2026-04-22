@@ -1,4 +1,4 @@
-# Docker로 AlphaPulse 실행하기 (Windows / LAN)
+<!-- # Docker로 AlphaPulse 실행하기 (Windows / LAN)
 
 LAN에 있는 Windows PC(예: `192.168.0.232`)에 Docker Desktop이 설치되어 있다고 가정합니다.
 
@@ -182,7 +182,7 @@ docker compose up -d --no-build
 
 이미지를 옮기기 부담되면, **저장소 폴더 전체**만 Windows로 복사한 뒤 그 PC에서 `docker compose build && docker compose up -d` 하는 방식이 가장 단순합니다(맥에서 빌드는 하지 않음).
 
----
+--- -->
 
 ## 11. Blueprint Lab 스타일: 맥에서 개별 빌드 → tar 전송 → docker으로 교체
 
