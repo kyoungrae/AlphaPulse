@@ -8,6 +8,7 @@ import { auth } from './firebase'
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const GlobalMacro = lazy(() => import('./pages/GlobalMacro'))
 const StockPrediction = lazy(() => import('./pages/StockPrediction'))
+const AutoTrading = lazy(() => import('./pages/AutoTrading'))
 const Login = lazy(() => import('./pages/Login'))
 
 export type AuthOutletContext = { user: User }
@@ -17,6 +18,7 @@ function Sidebar() {
     { to: '/dashboard', label: '대시보드' },
     { to: '/macro', label: '글로벌 매크로' },
     { to: '/stocks', label: '종목 실시간 현황' },
+    { to: '/trading', label: '자동 매매 설정' },
   ]
 
   return (
@@ -107,6 +109,7 @@ function App() {
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="macro" element={<GlobalMacro />} />
           <Route path="stocks" element={<StockPrediction />} />
+          <Route path="trading" element={<AutoTrading />} />
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>

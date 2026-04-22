@@ -55,11 +55,20 @@ const redisUrl = process.env.REDIS_URL
 const KIS_APP_KEY = process.env.KIS_APP_KEY
 const KIS_APP_SECRET = process.env.KIS_APP_SECRET
 const KIS_URL_BASE = (process.env.KIS_URL_BASE || 'https://openapi.koreainvestment.com:9443').replace(/\/+$/, '')
+const KIS_ACCOUNT_NUMBER = (process.env.KIS_ACCOUNT_NUMBER || '').trim()
+const KIS_TRADE_PASSWORD = (process.env.KIS_TRADE_PASSWORD || '').trim()
 const KIS_TIMEOUT_MS = Math.max(2000, Number(process.env.KIS_TIMEOUT_MS ?? 10000))
 const KIS_RETRY_MAX_ATTEMPTS = Math.min(5, Math.max(1, Number(process.env.KIS_RETRY_MAX_ATTEMPTS ?? 3)))
 const KIS_RETRY_BASE_MS = Math.max(100, Number(process.env.KIS_RETRY_BASE_MS ?? 350))
 /** KIS 데이터 REST 호출 최소 간격(ms). 기본 220ms ~= 초당 4~5건 */
 const KIS_DATA_MIN_INTERVAL_MS = Math.max(120, Number(process.env.KIS_DATA_MIN_INTERVAL_MS ?? 220))
+const AUTO_TRADING_ENABLED = process.env.AUTO_TRADING_ENABLED === 'true'
+/** 안전장치: 기본 true(실주문 차단). 실주문은 명시적으로 false 설정 필요 */
+const AUTO_TRADING_DRY_RUN = process.env.AUTO_TRADING_DRY_RUN !== 'false'
+const AUTO_TRADING_CHECK_MS = Math.max(15_000, Number(process.env.AUTO_TRADING_CHECK_MS ?? 60_000))
+const AUTO_TRADING_RUN_HOUR_KST = Math.max(0, Math.min(23, Number(process.env.AUTO_TRADING_RUN_HOUR_KST ?? 9)))
+const AUTO_TRADING_RUN_MINUTE_KST = Math.max(0, Math.min(59, Number(process.env.AUTO_TRADING_RUN_MINUTE_KST ?? 1)))
+const IS_KIS_PAPER = /openapivts|vts/i.test(KIS_URL_BASE)
 
 app.use(cors())
 app.use(express.json())
@@ -829,6 +838,57 @@ let kisDataRequestQueue: Promise<void> = Promise.resolve()
 let kisDataLastRequestAtMs = 0
 let sentimentApiBackoffUntil = 0
 const redisClient = redisUrl ? createClient({ url: redisUrl }) : null
+
+type TradingAction = 'buy' | 'sell' | 'analyze' | 'buy_fail'
+type AutoTradeLog = {
+  id: number
+  time: string
+  action: TradingAction
+  symbol: string
+  name: string
+  qty: number
+  price: number
+  status: string
+}
+type AutoTradingConfig = {
+  isActive: boolean
+  aiTicker: string
+  upSymbol: string
+  downSymbol: string
+  threshold: number
+  tradeAmount: number
+}
+
+let autoTradingConfig: AutoTradingConfig = {
+  isActive: false,
+  aiTicker: '^KS200',
+  upSymbol: '122630.KS',
+  downSymbol: '252710.KS',
+  threshold: 60,
+  tradeAmount: 1_000_000,
+}
+let autoTradingLastRunDate = ''
+const autoTradeLogs: AutoTradeLog[] = []
+let autoTradeLogSeq = 1
+
+async function loadAutoTradingConfig(): Promise<void> {
+  const db = getFirestore()
+  if (!db) return
+  try {
+    const doc = await db.collection('system_config').doc('auto_trading').get()
+    if (!doc.exists) return
+    const data = (doc.data() ?? {}) as Partial<AutoTradingConfig>
+    autoTradingConfig = {
+      ...autoTradingConfig,
+      ...data,
+      threshold: Math.max(50, Math.min(99, Number(data.threshold ?? autoTradingConfig.threshold))),
+      tradeAmount: Math.max(1, Number(data.tradeAmount ?? autoTradingConfig.tradeAmount)),
+    }
+    console.log('[AutoTrade] Firestore에서 설정을 불러왔습니다.', autoTradingConfig)
+  } catch (err) {
+    console.error('[AutoTrade] 설정 로드 실패:', err)
+  }
+}
 if (redisClient) {
   redisClient.connect().catch((err: unknown) => {
     console.error('Redis 연결 실패. 메모리 캐시로 계속 동작합니다.', err)
@@ -1192,6 +1252,256 @@ async function getKisAccessToken(): Promise<string> {
     }
   })()
   return kisTokenPromise
+}
+
+function parseKisAccountNumber(): { cano: string; acntPrdtCd: string } {
+  const [rawCano, rawCode] = KIS_ACCOUNT_NUMBER.split('-')
+  const cano = (rawCano || '').trim()
+  const acntPrdtCd = (rawCode || '01').trim()
+  if (!cano) {
+    throw new Error('KIS_ACCOUNT_NUMBER 환경 변수가 필요합니다. 예: 12345678-01')
+  }
+  return { cano, acntPrdtCd }
+}
+
+/** KIS 국내주식 잔고 조회 */
+async function fetchKisBalance(): Promise<{ cash: number; holdings: Array<Record<string, unknown>> }> {
+  const token = await getKisAccessToken()
+  const { cano, acntPrdtCd } = parseKisAccountNumber()
+  const params = new URLSearchParams({
+    CANO: cano,
+    ACNT_PRDT_CD: acntPrdtCd,
+    AFHR_FLG: 'N',
+    OFL_YN: '',
+    INQR_DVSN: '02',
+    UNPR_DVSN: '01',
+    FUND_STTL_ICLD_YN: 'N',
+    FUTS_ICLD_YN: 'N',
+  })
+  const response = await fetchKisDataWithRetry(
+    `${KIS_URL_BASE}/uapi/domestic-stock/v1/trading/inquire-balance?${params.toString()}`,
+    {
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        authorization: `Bearer ${token}`,
+        appkey: KIS_APP_KEY || '',
+        appsecret: KIS_APP_SECRET || '',
+        tr_id: IS_KIS_PAPER ? 'VTTC8434R' : 'TTTC8434R',
+      },
+      signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+    },
+    'KIS inquire-balance',
+  )
+  const data = (await response.json()) as {
+    rt_cd?: string
+    msg1?: string
+    output1?: Array<Record<string, unknown>>
+    output2?: Array<Record<string, unknown>>
+  }
+  if (data.rt_cd !== '0') {
+    throw new Error(`KIS inquire-balance: ${data.msg1 ?? 'unknown'}`)
+  }
+  const cashRaw = data.output2?.[0]?.dnca_tot_amt
+  const cash = Number(String(cashRaw ?? 0).replace(/,/g, ''))
+  return {
+    cash: Number.isFinite(cash) ? cash : 0,
+    holdings: Array.isArray(data.output1) ? data.output1 : [],
+  }
+}
+
+/** KIS 국내주식 주문 (시장가) */
+async function placeKisOrder(side: 'buy' | 'sell', ticker: string, qty: number): Promise<Record<string, unknown>> {
+  if (!KIS_TRADE_PASSWORD) {
+    throw new Error('KIS_TRADE_PASSWORD 환경 변수가 필요합니다.')
+  }
+  const token = await getKisAccessToken()
+  const { cano, acntPrdtCd } = parseKisAccountNumber()
+  const pdno = ticker.toUpperCase().replace(/\.(KS|KQ)$/i, '')
+  const body = {
+    CANO: cano,
+    ACNT_PRDT_CD: acntPrdtCd,
+    PDNO: pdno,
+    ORD_DVSN: '01',
+    ORD_QTY: String(Math.max(1, Math.floor(qty))),
+    ORD_UNPR: '0',
+    ORD_PSWD: KIS_TRADE_PASSWORD,
+  }
+  const trId = IS_KIS_PAPER
+    ? side === 'buy'
+      ? 'VTTC0802U'
+      : 'VTTC0801U'
+    : side === 'buy'
+      ? 'TTTC0802U'
+      : 'TTTC0801U'
+  const response = await fetchKisDataWithRetry(
+    `${KIS_URL_BASE}/uapi/domestic-stock/v1/trading/order-cash`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        authorization: `Bearer ${token}`,
+        appkey: KIS_APP_KEY || '',
+        appsecret: KIS_APP_SECRET || '',
+        tr_id: trId,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+    },
+    `KIS order-${side}`,
+  )
+  return (await response.json()) as Record<string, unknown>
+}
+
+function getHoldingQty(holdings: Array<Record<string, unknown>>, ticker: string): number {
+  const pdno = ticker.toUpperCase().replace(/\.(KS|KQ)$/i, '')
+  const found = holdings.find((h) => String(h.pdno ?? '').trim() === pdno)
+  if (!found) return 0
+  const qty = Number(String(found.hldg_qty ?? found.hold_qty ?? 0).replace(/,/g, ''))
+  return Number.isFinite(qty) ? qty : 0
+}
+
+function pushAutoTradeLog(log: Omit<AutoTradeLog, 'id'>): void {
+  autoTradeLogs.unshift({ id: autoTradeLogSeq++, ...log })
+  if (autoTradeLogs.length > 300) autoTradeLogs.length = 300
+}
+
+function nowKstYmdHm(): { ymd: string; hour: number; minute: number; iso: string } {
+  const now = new Date()
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(now)
+  const y = parts.find((p) => p.type === 'year')?.value ?? '1970'
+  const m = parts.find((p) => p.type === 'month')?.value ?? '01'
+  const d = parts.find((p) => p.type === 'day')?.value ?? '01'
+  const hh = Number(parts.find((p) => p.type === 'hour')?.value ?? '0')
+  const mm = Number(parts.find((p) => p.type === 'minute')?.value ?? '0')
+  return { ymd: `${y}-${m}-${d}`, hour: hh, minute: mm, iso: now.toISOString() }
+}
+
+async function executeAutoTrading(clockDate: string, force = false): Promise<void> {
+  if (!autoTradingConfig.isActive && !force) return
+  const isDryRun = AUTO_TRADING_DRY_RUN
+  const aiTicker = autoTradingConfig.aiTicker.trim()
+  const upSymbol = autoTradingConfig.upSymbol.trim().toUpperCase()
+  const downSymbol = autoTradingConfig.downSymbol.trim().toUpperCase()
+  if (!aiTicker || !upSymbol || !downSymbol) {
+    console.error('[AutoTrade] 설정 누락: aiTicker/upSymbol/downSymbol 을 확인하세요.')
+    return
+  }
+
+  console.log(`\n========== [AutoTrade] 자동 매매 프로세스 시작 (${clockDate}) ==========`)
+  console.log(`모드: ${isDryRun ? 'DRY_RUN (모의 테스트, 실제 주문 X)' : 'LIVE (실제 주문 실행!)'}`)
+
+  try {
+    const predict = await fetchPredict(aiTicker, undefined, 1)
+    const probUp = Number(predict.probability_up) * 100
+    const threshold = Math.max(50, Math.min(99, Number(autoTradingConfig.threshold) || 60))
+    console.log(`[AutoTrade] ${aiTicker} 상승 확률: ${probUp.toFixed(1)}% (기준: ${threshold}%)`)
+
+    let targetSymbol: string | null = null
+    if (probUp >= threshold) targetSymbol = upSymbol
+    else if (100 - probUp >= threshold) targetSymbol = downSymbol
+    if (!targetSymbol) {
+      console.log(`[AutoTrade] 확률이 기준치(${threshold}%)를 넘지 않아 관망(Hold)합니다.`)
+      return
+    }
+
+    const { cash, holdings } = await fetchKisBalance()
+    const nowIso = nowKstYmdHm().iso
+
+    for (const item of holdings) {
+      const heldSymbol = `${String(item.pdno ?? '').trim()}.KS`
+      const qty = Number(item.hldg_qty ?? item.hold_qty ?? 0)
+      if (qty > 0 && heldSymbol !== targetSymbol && (heldSymbol === upSymbol || heldSymbol === downSymbol)) {
+        console.log(`[AutoTrade] 반대 포지션 청산: ${heldSymbol} ${qty}주 시장가 매도`)
+        if (isDryRun) {
+          pushAutoTradeLog({
+            time: nowIso,
+            action: 'sell',
+            symbol: heldSymbol,
+            name: '반대 포지션 청산',
+            qty,
+            price: 0,
+            status: 'DRY_RUN',
+          })
+        } else {
+          const sellRes = await placeKisOrder('sell', heldSymbol, qty)
+          pushAutoTradeLog({
+            time: nowIso,
+            action: 'sell',
+            symbol: heldSymbol,
+            name: '반대 포지션 청산',
+            qty,
+            price: 0,
+            status: String(sellRes.msg1 ?? sellRes.rt_cd ?? '매도 전송'),
+          })
+          await sleep(2000)
+        }
+      }
+    }
+
+    const alreadyHeld = holdings.find((h) => `${String(h.pdno ?? '').trim()}.KS` === targetSymbol)
+    if (alreadyHeld && Number(alreadyHeld.hldg_qty ?? alreadyHeld.hold_qty ?? 0) > 0) {
+      console.log(`[AutoTrade] 이미 타겟 종목(${targetSymbol})을 보유 중이므로 매수 생략합니다.`)
+      return
+    }
+
+    const targetPriceData = await fetchKisDomesticInquirePriceOutput(targetSymbol.replace('.KS', ''))
+    const currentPrice = Number(targetPriceData.stck_prpr)
+    if (!(currentPrice > 0)) {
+      console.log(`[AutoTrade] 현재가 조회 실패로 매수 생략 (${targetSymbol})`)
+      return
+    }
+    const investAmount = Math.min(cash, Math.max(1, Number(autoTradingConfig.tradeAmount)))
+    const buyQty = Math.floor(investAmount / currentPrice)
+    if (buyQty <= 0) {
+      const reason = `잔고 부족 (현재가: ${currentPrice.toLocaleString()}원, 가용금액: ${investAmount.toLocaleString()}원)`
+      console.log(`[AutoTrade] 매수 실패: ${reason}`)
+      pushAutoTradeLog({
+        time: nowIso,
+        action: 'buy_fail',
+        symbol: targetSymbol,
+        name: '잔고 부족으로 매수 스킵',
+        qty: 0,
+        price: currentPrice,
+        status: '예수금/설정금액 부족',
+      })
+      return
+    }
+    console.log(`[AutoTrade] 신규 포지션 진입: ${targetSymbol} ${buyQty}주 시장가 매수 (예상단가: ${currentPrice})`)
+    if (isDryRun) {
+      pushAutoTradeLog({
+        time: nowIso,
+        action: 'buy',
+        symbol: targetSymbol,
+        name: `${aiTicker} 시그널`,
+        qty: buyQty,
+        price: currentPrice,
+        status: 'DRY_RUN',
+      })
+    } else {
+      const buyRes = await placeKisOrder('buy', targetSymbol, buyQty)
+      pushAutoTradeLog({
+        time: nowIso,
+        action: 'buy',
+        symbol: targetSymbol,
+        name: `${aiTicker} 시그널`,
+        qty: buyQty,
+        price: currentPrice,
+        status: String(buyRes.msg1 ?? buyRes.rt_cd ?? '매수 전송'),
+      })
+    }
+  } catch (err) {
+    console.error('[AutoTrade] 실행 중 오류 발생:', err)
+  } finally {
+    console.log('=================================================================\n')
+  }
 }
 
 type KisDailyRow = { date: string; open: number; high: number; low: number; close: number; volume: number }
@@ -3732,6 +4042,56 @@ app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
   }
 })
 
+app.get('/api/trading/status', async (_req: Request, res: Response) => {
+  try {
+    const balance = await fetchKisBalance()
+    return res.json({
+      config: autoTradingConfig,
+      dryRun: AUTO_TRADING_DRY_RUN,
+      enabled: AUTO_TRADING_ENABLED,
+      balance,
+      logs: autoTradeLogs.slice(0, 50),
+    })
+  } catch (err) {
+    console.error('[Trading] status', err)
+    return res.status(500).json({ error: '계좌 정보를 가져오지 못했습니다.' })
+  }
+})
+
+app.post('/api/trading/config', async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as Partial<AutoTradingConfig>
+    autoTradingConfig = {
+      ...autoTradingConfig,
+      ...body,
+      threshold: Math.max(50, Math.min(99, Number(body.threshold ?? autoTradingConfig.threshold))),
+      tradeAmount: Math.max(1, Number(body.tradeAmount ?? autoTradingConfig.tradeAmount)),
+    }
+    const db = getFirestore()
+    if (db) {
+      await db.collection('system_config').doc('auto_trading').set(autoTradingConfig, { merge: true })
+    }
+    return res.json({ ok: true, config: autoTradingConfig, dryRun: AUTO_TRADING_DRY_RUN, enabled: AUTO_TRADING_ENABLED })
+  } catch (err) {
+    console.error('[Trading] config save', err)
+    return res.status(500).json({ error: '설정 저장에 실패했습니다.' })
+  }
+})
+
+app.post('/api/trading/run-now', async (_req: Request, res: Response) => {
+  try {
+    const clockDate = getSeoulClock().date
+    void executeAutoTrading(clockDate, true)
+    return res.json({
+      ok: true,
+      message: '수동 매매 프로세스를 백그라운드에서 시작했습니다. 터미널 로그를 확인하세요.',
+    })
+  } catch (err) {
+    console.error('[Trading] run-now', err)
+    return res.status(500).json({ error: '수동 실행 호출 실패' })
+  }
+})
+
 /** 프로덕션: 같은 오리진에서 프론트(Vite 빌드) + /api 제공. `npm run build` 후 저장소 루트에서 서버 실행 시 `frontend/dist` 사용. */
 const frontendDist = process.env.FRONTEND_DIST || path.join(process.cwd(), 'frontend', 'dist')
 if (process.env.NODE_ENV === 'production' && fs.existsSync(frontendDist)) {
@@ -3749,6 +4109,7 @@ app.listen(port, () => {
     `[일일 마감 배치] 한국·미국 각각 '해당 시장 정규장 마감 이후'에만 Firestore 반영, 시장별 하루 1회(job_meta). 조건 검사 주기 ${DAILY_CLOSE_SCHEDULER_MS / 1000}s (환경변수 DAILY_CLOSE_SCHEDULER_MS 로 변경 가능)`,
   )
   setImmediate(() => {
+    void loadAutoTradingConfig()
     scheduleSp500BackgroundRefresh()
     void runStartupDailyCloseCatchUp()
   })
@@ -3756,4 +4117,15 @@ app.listen(port, () => {
     void runDailyCloseJob('us', false)
     void runDailyCloseJob('kr', false)
   }, DAILY_CLOSE_SCHEDULER_MS)
+  setInterval(() => {
+    if (!AUTO_TRADING_ENABLED) return
+    const clock = getSeoulClock()
+    if (clock.weekday === 'Sat' || clock.weekday === 'Sun') return
+    if (clock.hour === AUTO_TRADING_RUN_HOUR_KST && clock.minute === AUTO_TRADING_RUN_MINUTE_KST) {
+      if (autoTradingLastRunDate !== clock.date) {
+        autoTradingLastRunDate = clock.date
+        void executeAutoTrading(clock.date)
+      }
+    }
+  }, AUTO_TRADING_CHECK_MS)
 })
