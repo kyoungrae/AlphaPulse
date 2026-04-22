@@ -855,6 +855,7 @@ type AutoTradingConfig = {
   aiTicker: string
   upSymbol: string
   downSymbol: string
+  symbolsLocked: boolean
   threshold: number
   tradeAmount: number
 }
@@ -864,6 +865,7 @@ let autoTradingConfig: AutoTradingConfig = {
   aiTicker: '^KS200',
   upSymbol: '122630.KS',
   downSymbol: '252710.KS',
+  symbolsLocked: true,
   threshold: 60,
   tradeAmount: 1_000_000,
 }
@@ -2371,6 +2373,19 @@ function symbolItemMatchesQuery(item: SymbolItem, queryRaw: string): boolean {
   if (item.symbol.toUpperCase().includes(qUpper)) return true
   if (item.name.toLowerCase().includes(qLower)) return true
   if (item.nameKr && item.nameKr.includes(q)) return true
+
+  /**
+   * 검색 보정:
+   * - 공백/특수문자 차이 무시 (예: "tiger200 인버스x2")
+   * - 레버리지/인버스 접미의 2X/X2 순서 차이 허용
+   */
+  const compact = (s: string) => s.toLowerCase().replace(/[^a-z0-9가-힣]/g, '')
+  const qCompact = compact(q)
+  if (!qCompact) return true
+  const namesCompact = [item.symbol, item.name, item.nameKr ?? ''].map(compact)
+  if (namesCompact.some((v) => v.includes(qCompact))) return true
+  const qSwap = qCompact.replace(/2x/g, '__x2__').replace(/x2/g, '2x').replace(/__x2__/g, 'x2')
+  if (qSwap !== qCompact && namesCompact.some((v) => v.includes(qSwap))) return true
   return false
 }
 

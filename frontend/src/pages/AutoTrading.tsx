@@ -1,11 +1,34 @@
 import { type ChangeEvent, useEffect, useState } from 'react'
 import { apiUrl } from '../apiBase'
 
+function formatAmountWithKoreanUnit(amount: number): string {
+  const n = Math.max(0, Math.floor(amount))
+  if (n === 0) return '0원'
+  const eok = Math.floor(n / 100_000_000)
+  const man = Math.floor((n % 100_000_000) / 10_000)
+  const rest = n % 10_000
+  const parts: string[] = []
+  if (eok > 0) parts.push(`${eok.toLocaleString('ko-KR')}억`)
+  if (man > 0) parts.push(`${man.toLocaleString('ko-KR')}만`)
+  if (rest > 0) parts.push(`${rest.toLocaleString('ko-KR')}`)
+  return `${parts.join(' ')}원`
+}
+
 export default function AutoTrading() {
+  const tradableSymbolOptions = [
+    { symbol: '122630.KS', label: 'KODEX 레버리지 (122630.KS)' },
+    { symbol: '252710.KS', label: 'TIGER 200선물인버스2X (252710.KS)' },
+    { symbol: '360750.KS', label: 'TIGER 미국S&P500 (360750.KS)' },
+    { symbol: '214980.KS', label: 'KODEX 미국S&P500선물인버스(H) (214980.KS)' },
+    { symbol: '069500.KS', label: 'KODEX 200 (069500.KS)' },
+    { symbol: '114800.KS', label: 'KODEX 인버스 (114800.KS)' },
+    { symbol: '005930.KS', label: '삼성전자 (005930.KS)' },
+  ]
   const [isActive, setIsActive] = useState(false)
   const [aiTicker, setAiTicker] = useState('^KS200')
   const [upSymbol, setUpSymbol] = useState('122630.KS')
   const [downSymbol, setDownSymbol] = useState('252710.KS')
+  const [symbolsLocked, setSymbolsLocked] = useState(true)
   const [threshold, setThreshold] = useState(60)
   const [tradeAmount, setTradeAmount] = useState(1_000_000)
 
@@ -17,6 +40,16 @@ export default function AutoTrading() {
     error: null as string | null,
   })
   const [configSaving, setConfigSaving] = useState(false)
+
+  const aiTickerNameMap: Record<string, string> = {
+    '^KS200': '코스피 200',
+    '^KS11': '코스피',
+    '^GSPC': 'S&P 500',
+    '^IXIC': '나스닥 종합',
+    '^DJI': '다우존스',
+  }
+  const aiTickerOptions = Object.entries(aiTickerNameMap).map(([value, label]) => ({ value, label }))
+  const aiTickerLabel = aiTickerNameMap[aiTicker.trim().toUpperCase()] ?? '직접 입력 티커'
 
   const currentSignal = {
     date: '2026-04-22',
@@ -69,6 +102,7 @@ export default function AutoTrading() {
             aiTicker?: string
             upSymbol?: string
             downSymbol?: string
+            symbolsLocked?: boolean
             threshold?: number
             tradeAmount?: number
           }
@@ -89,6 +123,7 @@ export default function AutoTrading() {
         setAiTicker(data.config?.aiTicker ?? '^KS200')
         setUpSymbol(data.config?.upSymbol ?? '122630.KS')
         setDownSymbol(data.config?.downSymbol ?? '252710.KS')
+        setSymbolsLocked(data.config?.symbolsLocked ?? true)
         setThreshold(Math.max(50, Math.min(99, Number(data.config?.threshold ?? 60))))
         setTradeAmount(Math.max(1, Number(data.config?.tradeAmount ?? 1_000_000)))
       } catch (err) {
@@ -113,6 +148,7 @@ export default function AutoTrading() {
       aiTicker: string
       upSymbol: string
       downSymbol: string
+      symbolsLocked: boolean
       threshold: number
       tradeAmount: number
     }>,
@@ -124,6 +160,7 @@ export default function AutoTrading() {
         aiTicker,
         upSymbol,
         downSymbol,
+        symbolsLocked,
         threshold,
         tradeAmount,
         ...(patch ?? {}),
@@ -154,13 +191,25 @@ export default function AutoTrading() {
   const handleThresholdChange = (e: ChangeEvent<HTMLInputElement>) => {
     const val = Number(e.target.value)
     setThreshold(val)
-    void updateConfig({ threshold: val })
   }
 
   const handleTradeAmountChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const val = Number(e.target.value)
-    setTradeAmount(val)
-    void updateConfig({ tradeAmount: val })
+    const digits = e.target.value.replace(/[^\d]/g, '')
+    const val = Number(digits)
+    setTradeAmount(Number.isFinite(val) ? val : 0)
+  }
+
+  const handleToggleSymbolsLock = () => {
+    const next = !symbolsLocked
+    setSymbolsLocked(next)
+    void updateConfig({
+      symbolsLocked: next,
+      aiTicker,
+      upSymbol,
+      downSymbol,
+      threshold,
+      tradeAmount,
+    })
   }
 
   const handleManualRun = async () => {
@@ -252,17 +301,41 @@ export default function AutoTrading() {
           {/* 전략 설정 카드 */}
           <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg">
             <h3 className="mb-4 text-lg font-semibold text-white">매매 전략 파라미터</h3>
+            <div className="mb-4 flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
+              <p className="text-xs text-slate-400">AI 예측 티커 / 상승·하락 매수 / 진입 확률 잠금</p>
+              <button
+                type="button"
+                onClick={handleToggleSymbolsLock}
+                className={`rounded px-2.5 py-1 text-[11px] font-semibold ${
+                  symbolsLocked
+                    ? 'border border-amber-500/50 bg-amber-500/15 text-amber-300'
+                    : 'border border-slate-600 bg-slate-800 text-slate-300'
+                }`}
+              >
+                {symbolsLocked ? '잠금됨' : '잠금 해제'}
+              </button>
+            </div>
             <div className="grid md:grid-cols-2" style={{ gap: '25px' }}>
               <div className="space-y-1">
                 <label className="text-xs font-semibold text-slate-400">AI 예측 티커 (Yahoo)</label>
-                <input
-                  type="text"
+                <select
                   value={aiTicker}
-                  onChange={(e) => setAiTicker(e.target.value)}
-                  onBlur={() => void updateConfig({ aiTicker })}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500"
-                  placeholder="예: ^KS200"
-                />
+                  disabled={symbolsLocked}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    setAiTicker(val)
+                  }}
+                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500 ${
+                    symbolsLocked ? 'cursor-not-allowed opacity-60' : ''
+                  }`}
+                >
+                  {aiTickerOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label} ({opt.value})
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[10px] text-slate-500">현재 해석: {aiTickerLabel}</p>
               </div>
 
               <div className="space-y-1">
@@ -275,9 +348,10 @@ export default function AutoTrading() {
                     step="1"
                     value={threshold}
                     onChange={handleThresholdChange}
+                    disabled={symbolsLocked}
                     className="flex-1 accent-blue-500"
                   />
-                  <span className="w-12 text-right text-sm font-semibold text-blue-300">{threshold}%</span>
+                  <span className="w-14 text-right text-sm font-semibold tabular-nums text-blue-300">{threshold}%</span>
                 </div>
                 <p className="text-[10px] text-slate-500">AI 예측 확률이 이 수치 이상일 때만 매수(이하는 현금 관망)</p>
               </div>
@@ -285,33 +359,57 @@ export default function AutoTrading() {
               <div className="space-y-1">
                 <label className="text-xs font-semibold text-slate-400">회당 투자 금액</label>
                 <input
-                  type="number"
-                  value={tradeAmount}
+                  type="text"
+                  inputMode="numeric"
+                  value={tradeAmount.toLocaleString('ko-KR')}
                   onChange={handleTradeAmountChange}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500"
+                  disabled={symbolsLocked}
+                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500 ${
+                    symbolsLocked ? 'cursor-not-allowed opacity-60' : ''
+                  }`}
                 />
-                <p className="text-[10px] text-slate-500">예수금이 부족할 경우 전액 매수합니다.</p>
+                <p className="text-[10px] text-slate-500">
+                  {formatAmountWithKoreanUnit(tradeAmount)} · 예수금이 부족할 경우 전액 매수합니다.
+                </p>
               </div>
 
               <div className="space-y-1">
                 <label className="text-xs font-semibold text-emerald-400">상승 시 매수 (UP)</label>
-                <input
-                  type="text"
+                <select
                   value={upSymbol}
-                  onChange={(e) => setUpSymbol(e.target.value)}
-                  onBlur={() => void updateConfig({ upSymbol })}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500"
-                  placeholder="예: 122630.KS"
-                />
+                  disabled={symbolsLocked}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    setUpSymbol(val)
+                  }}
+                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500 ${
+                    symbolsLocked ? 'cursor-not-allowed opacity-60' : ''
+                  }`}
+                >
+                  {tradableSymbolOptions.map((opt) => (
+                    <option key={`up-${opt.symbol}`} value={opt.symbol}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
                 <label className="mt-2 block text-xs font-semibold text-rose-400">하락 시 매수 (DOWN)</label>
-                <input
-                  type="text"
+                <select
                   value={downSymbol}
-                  onChange={(e) => setDownSymbol(e.target.value)}
-                  onBlur={() => void updateConfig({ downSymbol })}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500"
-                  placeholder="예: 252710.KS"
-                />
+                  disabled={symbolsLocked}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    setDownSymbol(val)
+                  }}
+                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500 ${
+                    symbolsLocked ? 'cursor-not-allowed opacity-60' : ''
+                  }`}
+                >
+                  {tradableSymbolOptions.map((opt) => (
+                    <option key={`down-${opt.symbol}`} value={opt.symbol}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
           </div>
@@ -321,7 +419,7 @@ export default function AutoTrading() {
             <div>
               <p className="text-xs font-semibold text-blue-300">내일 장 시작 시 실행 예정 시그널</p>
               <p className="mt-1 text-sm text-slate-200">
-                {currentSignal.date} 기준 {aiTicker}{' '}
+                {currentSignal.date} 기준 {aiTickerLabel} ({aiTicker}){' '}
                 <span className="font-bold text-emerald-400">
                   {currentSignal.direction === 'Up' ? '상승' : '하락'} 확률 {currentSignal.probability}%
                 </span>
