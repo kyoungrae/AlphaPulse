@@ -79,12 +79,23 @@ type QuoteLive = {
   symbol: string
   regularMarketPrice: number | null
   asOf: string
+  marketState: string | null
 }
 
 function normalizeTickerForQuoteApi(sel: string, mkt: 'us' | 'kr'): string {
   const t = sel.trim().toUpperCase()
   if (mkt === 'kr' && /^\d{6}$/.test(t)) return `${t}.KS`
   return t
+}
+
+function marketStateLabel(state: string | null): string {
+  if (!state || state === 'REGULAR') return ''
+  const map: Record<string, string> = {
+    PRE: '장전',
+    POST: '장후',
+    CLOSED: '장마감',
+  }
+  return map[state] ?? state
 }
 
 function formatUpdatedDateTime(iso: string | null | undefined): string {
@@ -950,6 +961,7 @@ export default function Dashboard() {
 
     const pollQuote = async () => {
       if (isCancelled) return
+      let nextMs = 5_000
       try {
         const tickerForApi = normalizeTickerForQuoteApi(selectedSymbol, market)
         const ac = new AbortController()
@@ -957,7 +969,10 @@ export default function Dashboard() {
         const res = await fetch(apiUrl(`/api/quote/${encodeURIComponent(tickerForApi)}`), { signal: ac.signal })
         if (res.ok) {
           const data = (await res.json()) as QuoteLive
-          if (!isCancelled) setLiveQuote(data)
+          if (!isCancelled) {
+            setLiveQuote(data)
+            nextMs = data.marketState === 'CLOSED' ? 60_000 : data.marketState === 'REGULAR' ? 1_000 : 5_000
+          }
         }
       } catch {
         // ignore polling errors; next tick will retry
@@ -965,7 +980,7 @@ export default function Dashboard() {
         if (!isCancelled) {
           timerId = window.setTimeout(() => {
             void pollQuote()
-          }, 1000)
+          }, nextMs)
         }
       }
     }
@@ -2093,6 +2108,16 @@ export default function Dashboard() {
                   label={`매물대 저항: ${formatMoney(vbpLevels.resistance, priceCurrency)}`}
                   tip="최근 가격-거래량 분포에서 거래가 많이 누적된 상단 구간입니다. 현재가가 이 값에 가까우면 매도 압력 가능성을 점검하세요."
                 />
+              )}
+              {liveQuote?.marketState === 'CLOSED' && (
+                <span className="rounded border border-rose-900/40 bg-rose-950/20 px-1.5 py-0.5 text-[10px] font-bold text-rose-400">
+                  장 마감
+                </span>
+              )}
+              {liveQuote?.marketState && liveQuote.marketState !== 'CLOSED' && marketStateLabel(liveQuote.marketState) && (
+                <span className="rounded border border-emerald-900/40 bg-emerald-950/20 px-1.5 py-0.5 text-[10px] font-bold text-emerald-400">
+                  {marketStateLabel(liveQuote.marketState)}
+                </span>
               )}
               <span className="ml-auto whitespace-nowrap text-slate-500">갱신: {chartUpdatedAtLabel}</span>
             </div>

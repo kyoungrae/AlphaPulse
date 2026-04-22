@@ -509,6 +509,7 @@ export default function StockPrediction() {
       if (cancelled) return
       const ac = new AbortController()
       inFlightController = ac
+      let nextMs = QUOTE_POLL_MS
       const showSpin = quoteFirstLoadSpinRef.current
       setQuotePollBusy(true)
       if (showSpin) setQuoteLoading(true)
@@ -520,6 +521,7 @@ export default function StockPrediction() {
         const data = JSON.parse(text) as QuoteLive
         if (selectedRef.current !== requestedKey || !symbolMatchesWantOrUnknown(data.symbol, requestedKey, market)) return
         setQuote(data)
+        nextMs = data.marketState === 'CLOSED' ? 60_000 : QUOTE_POLL_MS
       } catch (e) {
         if (cancelled || (e instanceof Error && e.name === 'AbortError')) return
         if (selectedRef.current !== requestedKey) return
@@ -532,7 +534,7 @@ export default function StockPrediction() {
         if (showSpin) quoteFirstLoadSpinRef.current = false
         timerId = window.setTimeout(() => {
           void pollQuote()
-        }, QUOTE_POLL_MS)
+        }, nextMs)
       }
     }
 
@@ -557,6 +559,7 @@ export default function StockPrediction() {
       if (cancelled) return
       const ac = new AbortController()
       inFlightController = ac
+      let nextMs = INTRADAY_POLL_MS
       const showSpin = intradayFirstLoadSpinRef.current
       if (showSpin) setIntradayLoading(true)
       setIntradayError(null)
@@ -567,6 +570,7 @@ export default function StockPrediction() {
         const data = JSON.parse(text) as IntradayResponse
         if (selectedRef.current !== requestedKey || !symbolMatchesWantOrUnknown(data.symbol, requestedKey, market)) return
         setIntraday(data)
+        nextMs = quote?.marketState === 'CLOSED' ? 60_000 : INTRADAY_POLL_MS
       } catch (e) {
         if (cancelled || (e instanceof Error && e.name === 'AbortError')) return
         if (selectedRef.current !== requestedKey) return
@@ -578,7 +582,7 @@ export default function StockPrediction() {
         if (showSpin) intradayFirstLoadSpinRef.current = false
         timerId = window.setTimeout(() => {
           void pollIntraday()
-        }, INTRADAY_POLL_MS)
+        }, nextMs)
       }
     }
 
@@ -588,7 +592,7 @@ export default function StockPrediction() {
       if (timerId) window.clearTimeout(timerId)
       inFlightController?.abort()
     }
-  }, [selected, market, detailSelectionReady])
+  }, [selected, market, detailSelectionReady, quote?.marketState])
 
   const selectedSymbolInfo = useMemo(() => {
     const fromApi = (symbols?.items ?? []).find((item) => item.symbol === selected)
@@ -835,19 +839,35 @@ export default function StockPrediction() {
             </button>
             <div className="flex min-h-[2.75rem] flex-col items-end justify-end text-right text-xs text-slate-500">
               {detailSelectionReady ? (
-                <p
-                  className="mt-1 flex min-h-[1.25rem] items-center justify-end gap-1.5 tabular-nums"
-                  {...(quotePollBusy && !quote?.asOf ? { role: 'status', 'aria-live': 'polite' as const } : {})}
-                >
-                  {quotePollBusy && !quote?.asOf && <QuoteRefreshSpinner />}
-                  <span className={!quote?.asOf && !quotePollBusy ? 'invisible' : ''}>
-                    {quote?.asOf
-                      ? `기준: ${formatAsOfWithSeconds(quote.asOf)}`
-                      : quotePollBusy
-                        ? '시세 불러오는 중'
-                        : '\u00a0'}
+                <>
+                  <span
+                    className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-bold ${
+                      quote?.marketState === 'CLOSED'
+                        ? 'border-rose-900/50 bg-rose-950/20 text-rose-400'
+                        : 'border-emerald-900/40 bg-emerald-950/20 text-emerald-400'
+                    }`}
+                  >
+                    <span
+                      className={`h-1 w-1 rounded-full ${
+                        quote?.marketState === 'CLOSED' ? 'bg-rose-500' : 'animate-pulse bg-emerald-500'
+                      }`}
+                    />
+                    {quote?.marketState === 'CLOSED' ? '장 마감됨' : '실시간 연결됨'}
                   </span>
-                </p>
+                  <p
+                    className="mt-1 flex min-h-[1.25rem] items-center justify-end gap-1.5 tabular-nums"
+                    {...(quotePollBusy && !quote?.asOf ? { role: 'status', 'aria-live': 'polite' as const } : {})}
+                  >
+                    {quotePollBusy && !quote?.asOf && <QuoteRefreshSpinner />}
+                    <span className={!quote?.asOf && !quotePollBusy ? 'invisible' : ''}>
+                      {quote?.asOf
+                        ? `기준: ${formatAsOfWithSeconds(quote.asOf)}`
+                        : quotePollBusy
+                          ? '시세 불러오는 중'
+                          : '\u00a0'}
+                    </span>
+                  </p>
+                </>
               ) : (
                 <p className="mt-1 min-h-[1.25rem]" aria-hidden>
                   {'\u00a0'}
