@@ -178,7 +178,7 @@ export default function StockPrediction() {
   const symbolsUrl = useMemo(
     () =>
       apiUrl(
-        `/api/symbols?market=${market}&q=${encodeURIComponent(debouncedSearch.trim())}&limit=30`,
+        `/api/symbols?market=${market}&q=${encodeURIComponent(debouncedSearch.trim())}&limit=200`,
       ),
     [debouncedSearch, market],
   )

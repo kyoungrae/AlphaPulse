@@ -736,7 +736,7 @@ export default function Dashboard() {
   const symbolsUrl = useMemo(() => {
     if (favoritesOnly) return ''
     const q = encodeURIComponent(debouncedQuery.trim())
-    return apiUrl(`/api/symbols?market=${market}&q=${q}&limit=40`)
+    return apiUrl(`/api/symbols?market=${market}&q=${q}&limit=200`)
   }, [debouncedQuery, market, favoritesOnly])
 
   useEffect(() => {
