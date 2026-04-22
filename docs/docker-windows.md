@@ -300,6 +300,30 @@ docker run -d --name alphapulse-api --network alphapulse-network -p 4001:4001 -e
 
 브라우저 쪽 「Firestore 규칙」 안내는 **클라이언트 SDK로 직접 읽을 때** 추가로 필요할 수 있습니다. Admin만 붙으면 API 경로로 이력이 채워지는 경우가 많습니다.
 
+### 11.3.2 재배포할 때마다 다시 설정해야 하나?
+
+**코드/이미지는 매번 바꿔도, Firestore 설정 파일은 서버에 "계속" 있어야 합니다.**  
+즉, 매 배포마다 수동으로 다시 입력하는 게 아니라 아래처럼 **고정 위치에 유지**하면 됩니다.
+
+체크리스트:
+
+1. `docker-compose.yml`이 있는 루트를 고정  
+   예: `~/projects/alphapulse`
+
+2. 아래 파일을 같은 루트 구조로 **항상 유지**
+   - `~/projects/alphapulse/backend/.env`
+   - (파일 마운트 방식이면) `~/projects/alphapulse/backend/<firebase-json>.json`
+
+3. 재배포 시에는 tar/compose만 교체하고 **backend 폴더는 지우지 않기**
+   - `rm -rf ~/projects/alphapulse`처럼 루트를 통째로 삭제하면 `.env`/JSON이 함께 사라집니다.
+
+4. `docker compose up -d --no-build` 후 즉시 로그 확인
+   - `docker compose logs api --tail=100`
+   - `[Firestore] ... 비활성화` 경고가 없어야 정상
+
+요약: **설정은 "매번 재입력"이 아니라 "한 번 배치 후 영구 보관"**입니다.  
+문제가 반복되면 대부분 재배포 과정에서 `backend/.env` 또는 JSON 파일이 누락된 경우입니다.
+
 ### 11.4 Docker Desktop(Windows)에서도 동일한가?
 
 가능합니다. **tar 두 개 + `docker-compose.yml`을 같은 폴더에 두고** PowerShell에서:

@@ -51,5 +51,5 @@ services:
     # Firestore: `backend/.env` alone is not enough if GOOGLE_APPLICATION_CREDENTIALS points to a Mac path
     # or a file that is not inside the image. Put the JSON next to `.env` under `backend/`, uncomment below,
     # and set in `backend/.env`: GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase.json
-    # volumes:
-    #   - ./backend/your-service-account.json:/run/secrets/firebase.json:ro
+    volumes:
+      - ./backend/alphapulse-2083b-firebase-adminsdk-fbsvc-c4c94b808b.json:/run/secrets/firebase.json:ro
