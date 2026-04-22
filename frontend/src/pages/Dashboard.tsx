@@ -1,6 +1,14 @@
+import { onAuthStateChanged } from 'firebase/auth'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { apiUrl } from '../apiBase'
+import { auth } from '../firebase'
 import { usePredictionHistory } from '../usePredictionHistory'
+import {
+  fetchUserWatchlist,
+  persistUserWatchlist,
+  watchlistFingerprint,
+  type WatchlistRow,
+} from '../userWatchlistFirestore'
 import {
   Bar,
   BarChart,
@@ -107,13 +115,8 @@ type SymbolResponse = {
 /** 즐겨찾기 칩: 시장 정보 포함 (미국·한국 동시 표시용) */
 type FavoriteSymbolChip = SymbolItem & { wlMarket: 'us' | 'kr' }
 
-/** 로컬 즐겨찾기 (localStorage `alphapulse_watchlist_v1`) */
-type WatchlistEntry = {
-  symbol: string
-  market: 'us' | 'kr'
-  /** 표시용 이름 (미국: 영문, 한국: 한글 등) */
-  name: string
-}
+/** 로컬·Firestore 공통 즐겨찾기 행 (`WatchlistRow` 와 동일 형태) */
+type WatchlistEntry = WatchlistRow
 
 const WATCHLIST_STORAGE_KEY = 'alphapulse_watchlist_v1'
 
@@ -648,6 +651,63 @@ export default function Dashboard() {
     } catch {
       /* ignore quota */
     }
+  }, [watchlist])
+
+  /** Firestore 1회 로드·디바운스 저장 전까지 클라우드 반영 대기 */
+  const watchlistCloudHydratedRef = useRef(false)
+  const lastCloudPersistJsonRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    return onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        lastCloudPersistJsonRef.current = null
+        watchlistCloudHydratedRef.current = true
+        return
+      }
+      watchlistCloudHydratedRef.current = false
+      const uid = user.uid
+      try {
+        const cloud = await fetchUserWatchlist(uid)
+        if (cloud.length > 0) {
+          lastCloudPersistJsonRef.current = watchlistFingerprint(cloud)
+          setWatchlist(cloud)
+        } else {
+          const local = loadWatchlistFromStorage()
+          if (local.length > 0) {
+            setWatchlist(local)
+            await persistUserWatchlist(uid, local)
+            lastCloudPersistJsonRef.current = watchlistFingerprint(local)
+          } else {
+            lastCloudPersistJsonRef.current = watchlistFingerprint([])
+          }
+        }
+      } catch (err) {
+        console.error('즐겨찾기 클라우드 로드 실패', err)
+      } finally {
+        watchlistCloudHydratedRef.current = true
+      }
+    })
+  }, [])
+
+  /** 로그인 시에만 변경분을 디바운스 후 1회 쓰기(실시간 리스너 없음) */
+  useEffect(() => {
+    if (!watchlistCloudHydratedRef.current) return
+    const uid = auth.currentUser?.uid
+    if (!uid) return
+    const fp = watchlistFingerprint(watchlist)
+    if (lastCloudPersistJsonRef.current === fp) return
+    const snapshot = watchlist
+    const timer = window.setTimeout(() => {
+      if (auth.currentUser?.uid !== uid) return
+      persistUserWatchlist(uid, snapshot)
+        .then(() => {
+          lastCloudPersistJsonRef.current = fp
+        })
+        .catch((e) => {
+          console.error('즐겨찾기 클라우드 저장 실패', e)
+        })
+    }, 700)
+    return () => window.clearTimeout(timer)
   }, [watchlist])
 
   const symbolsUrl = useMemo(() => {
