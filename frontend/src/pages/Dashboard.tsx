@@ -87,6 +87,19 @@ function normalizeTickerForQuoteApi(sel: string, mkt: 'us' | 'kr'): string {
   return t
 }
 
+function formatUpdatedDateTime(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  return new Intl.DateTimeFormat('ko-KR', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).format(new Date(iso))
+}
+
 const CHART_YEAR_MIN = 2016
 
 function ymdInMarketTz(market: 'us' | 'kr', when: Date = new Date()): string {
@@ -718,7 +731,7 @@ export default function Dashboard() {
   const [favoritesOnly, setFavoritesOnly] = useState(true)
   const [watchlist, setWatchlist] = useState<WatchlistEntry[]>(() => loadWatchlistFromStorage())
   const [selectedSymbol, setSelectedSymbol] = useState('')
-  const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('day')
+  const [timeframe, setTimeframe] = useState<'year' | 'month' | 'day' | 'hour'>('hour')
   const [chartCalYear, setChartCalYear] = useState(() => new Date().getFullYear())
   const [chartCalMonth, setChartCalMonth] = useState(() => new Date().getMonth() + 1)
   const [chartCalDate, setChartCalDate] = useState(() => {
@@ -1013,6 +1026,12 @@ export default function Dashboard() {
     if (timeframe === 'month') return aggregateMonthlyCandles(dynamicCandles, chartCalYear, todayYmdMarket)
     return dynamicCandles
   }, [dynamicCandles, timeframe, chartCalYear, todayYmdMarket])
+  const chartUpdatedAtLabel = useMemo(() => {
+    const liveAsOf = liveQuote?.asOf
+    if (liveAsOf) return formatUpdatedDateTime(liveAsOf)
+    const last = dynamicCandles[dynamicCandles.length - 1]?.date
+    return formatUpdatedDateTime(last)
+  }, [liveQuote?.asOf, dynamicCandles])
   const {
     data: news,
     loading: newsLoading,
@@ -2073,6 +2092,7 @@ export default function Dashboard() {
                   tip="최근 가격-거래량 분포에서 거래가 많이 누적된 상단 구간입니다. 현재가가 이 값에 가까우면 매도 압력 가능성을 점검하세요."
                 />
               )}
+              <span className="ml-auto whitespace-nowrap text-slate-500">갱신: {chartUpdatedAtLabel}</span>
             </div>
           )}
           {stockError && (
