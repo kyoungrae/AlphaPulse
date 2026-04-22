@@ -803,6 +803,9 @@ const dailyJobLastRunDateByMarket: Record<Market, string | null> = { us: null, k
 const stockCache = new Map<string, CacheEntry<{ date: string; close: number }[]>>()
 const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
 const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
+/** 야후 quote 단건 폴링 완화(프론트 실시간 현황용) */
+const quoteLiveCache = new Map<string, { payload: Record<string, unknown>; cachedAt: number }>()
+const QUOTE_LIVE_CACHE_TTL_MS = 5000
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
 const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
 let kisTokenPromise: Promise<string> | null = null
@@ -2116,6 +2119,7 @@ app.get('/', (_req: Request, res: Response) => {
   res.json({
     name: 'AlphaPulse 백엔드',
     endpoints: [
+      '/api/quote/:ticker',
       '/api/stock/:ticker',
       '/api/fx/usd-krw',
       '/api/news',
@@ -2125,6 +2129,57 @@ app.get('/', (_req: Request, res: Response) => {
       '/health',
     ],
   })
+})
+
+app.get('/api/quote/:ticker', async (req: Request, res: Response) => {
+  const tickerRaw = normalizeSingle(req.params.ticker)?.trim()
+  if (!tickerRaw) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  const ticker = tickerRaw
+  const key = ticker.toUpperCase()
+  const now = Date.now()
+  const hit = quoteLiveCache.get(key)
+  if (hit && now - hit.cachedAt < QUOTE_LIVE_CACHE_TTL_MS) {
+    return res.json(hit.payload)
+  }
+  const num = (v: unknown): number | null =>
+    typeof v === 'number' && Number.isFinite(v) ? (v as number) : null
+  try {
+    const raw = await yahooFinance.quote(ticker)
+    const row = Array.isArray(raw) ? raw[0] : raw
+    if (!row || typeof row !== 'object') {
+      return res.status(404).json({ error: '시세를 찾을 수 없습니다.' })
+    }
+    const r = row as Record<string, unknown>
+    const payload = {
+      symbol: String(r.symbol ?? key),
+      shortName: typeof r.shortName === 'string' ? r.shortName : null,
+      longName: typeof r.longName === 'string' ? r.longName : null,
+      fullExchangeName: typeof r.fullExchangeName === 'string' ? r.fullExchangeName : null,
+      exchangeTimezoneName: typeof r.exchangeTimezoneName === 'string' ? r.exchangeTimezoneName : null,
+      currency: typeof r.currency === 'string' ? r.currency : null,
+      marketState: typeof r.marketState === 'string' ? r.marketState : null,
+      regularMarketPrice: num(r.regularMarketPrice),
+      regularMarketChange: num(r.regularMarketChange),
+      regularMarketChangePercent: num(r.regularMarketChangePercent),
+      regularMarketPreviousClose: num(r.regularMarketPreviousClose),
+      regularMarketOpen: num(r.regularMarketOpen),
+      regularMarketDayHigh: num(r.regularMarketDayHigh),
+      regularMarketDayLow: num(r.regularMarketDayLow),
+      regularMarketVolume: num(r.regularMarketVolume),
+      bid: num(r.bid),
+      ask: num(r.ask),
+      bidSize: num(r.bidSize),
+      askSize: num(r.askSize),
+      asOf: new Date().toISOString(),
+    }
+    quoteLiveCache.set(key, { payload, cachedAt: now })
+    res.json(payload)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: '실시간 시세를 가져오지 못했습니다.' })
+  }
 })
 
 app.get('/api/stock/:ticker', async (req: Request, res: Response) => {

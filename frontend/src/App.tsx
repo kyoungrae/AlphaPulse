@@ -16,7 +16,7 @@ function Sidebar() {
   const links = [
     { to: '/dashboard', label: '대시보드' },
     { to: '/macro', label: '글로벌 매크로' },
-    { to: '/stocks', label: '종목 예측' },
+    { to: '/stocks', label: '종목 실시간 현황' },
   ]
 
   return (
