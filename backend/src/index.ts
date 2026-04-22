@@ -979,6 +979,13 @@ function isKoreanSixDigitEquity(ticker: string): boolean {
   return /^\d{6}\.(KS|KQ)$/i.test(ticker)
 }
 
+/** 종목 검색용 한국 지수 — KIS 호가·체결 API 대신 Yahoo 시세 */
+const KOREA_YAHOO_INDEX_SYMBOLS = new Set(['^KS200', '^KS11'])
+
+function isKoreanYahooIndexTicker(ticker: string): boolean {
+  return KOREA_YAHOO_INDEX_SYMBOLS.has(ticker.toUpperCase())
+}
+
 const CHART_ANCHOR_YEAR_MIN = 2016
 
 function chartMarketTimezone(ticker: string): string {
@@ -1596,6 +1603,140 @@ async function buildKisLiveQuoteOverseas(tickerKey: string, symb: string): Promi
     }
   }
   return null
+}
+
+/** KOSPI·KOSPI 200 등 — `koreaSymbols`에 올라 있는 ^KS… 지수만 */
+async function buildYahooLiveQuoteKrIndex(tickerKey: string): Promise<Record<string, unknown>> {
+  const raw = await yahooFinance.quote(tickerKey)
+  const row = (Array.isArray(raw) ? raw[0] : raw) as {
+    symbol?: string
+    shortName?: string | null
+    longName?: string | null
+    fullExchangeName?: string | null
+    exchangeTimezoneName?: string | null
+    currency?: string | null
+    marketState?: string | null
+    regularMarketPrice?: number | null
+    regularMarketChange?: number | null
+    regularMarketChangePercent?: number | null
+    regularMarketPreviousClose?: number | null
+    regularMarketOpen?: number | null
+    regularMarketDayHigh?: number | null
+    regularMarketDayLow?: number | null
+    regularMarketVolume?: number | null
+  } | undefined
+  if (!row || row.regularMarketPrice == null || !Number.isFinite(Number(row.regularMarketPrice))) {
+    throw new Error(`Yahoo 지수 시세 없음: ${tickerKey}`)
+  }
+  return {
+    symbol: tickerKey,
+    shortName: row.shortName ?? row.longName ?? tickerKey,
+    longName: row.longName ?? row.shortName ?? tickerKey,
+    fullExchangeName: row.fullExchangeName ?? 'KRX',
+    exchangeTimezoneName: row.exchangeTimezoneName ?? 'Asia/Seoul',
+    currency: row.currency ?? 'KRW',
+    marketState: row.marketState ?? null,
+    regularMarketPrice: row.regularMarketPrice ?? null,
+    regularMarketChange: row.regularMarketChange ?? null,
+    regularMarketChangePercent: row.regularMarketChangePercent ?? null,
+    regularMarketPreviousClose: row.regularMarketPreviousClose ?? null,
+    regularMarketOpen: row.regularMarketOpen ?? null,
+    regularMarketDayHigh: row.regularMarketDayHigh ?? null,
+    regularMarketDayLow: row.regularMarketDayLow ?? null,
+    regularMarketVolume: row.regularMarketVolume ?? null,
+    bid: null,
+    ask: null,
+    bidSize: null,
+    askSize: null,
+    asOf: new Date().toISOString(),
+    dataSource: 'yahoo',
+  }
+}
+
+/** KIS 해외 시세 실패 시에만 사용 — 기존 KIS 조회 로직은 변경하지 않음 */
+async function buildYahooLiveQuoteOverseasFallback(tickerKey: string): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await yahooFinance.quote(tickerKey)
+    const row = (Array.isArray(raw) ? raw[0] : raw) as {
+      shortName?: string | null
+      longName?: string | null
+      fullExchangeName?: string | null
+      exchangeTimezoneName?: string | null
+      currency?: string | null
+      marketState?: string | null
+      regularMarketPrice?: number | null
+      regularMarketChange?: number | null
+      regularMarketChangePercent?: number | null
+      regularMarketPreviousClose?: number | null
+      regularMarketOpen?: number | null
+      regularMarketDayHigh?: number | null
+      regularMarketDayLow?: number | null
+      regularMarketVolume?: number | null
+      bid?: number | null
+      ask?: number | null
+      bidSize?: number | null
+      askSize?: number | null
+    } | undefined
+    if (!row || row.regularMarketPrice == null || !Number.isFinite(Number(row.regularMarketPrice))) return null
+    const n = (v: unknown): number | null => {
+      if (v == null) return null
+      const x = typeof v === 'number' ? v : Number(v)
+      return Number.isFinite(x) ? x : null
+    }
+    return {
+      symbol: tickerKey,
+      shortName: row.shortName ?? row.longName ?? tickerKey,
+      longName: row.longName ?? row.shortName ?? tickerKey,
+      fullExchangeName: row.fullExchangeName ?? null,
+      exchangeTimezoneName: row.exchangeTimezoneName ?? 'America/New_York',
+      currency: row.currency ?? 'USD',
+      marketState: row.marketState ?? null,
+      regularMarketPrice: row.regularMarketPrice ?? null,
+      regularMarketChange: row.regularMarketChange ?? null,
+      regularMarketChangePercent: row.regularMarketChangePercent ?? null,
+      regularMarketPreviousClose: row.regularMarketPreviousClose ?? null,
+      regularMarketOpen: row.regularMarketOpen ?? null,
+      regularMarketDayHigh: row.regularMarketDayHigh ?? null,
+      regularMarketDayLow: row.regularMarketDayLow ?? null,
+      regularMarketVolume: row.regularMarketVolume ?? null,
+      bid: n(row.bid),
+      ask: n(row.ask),
+      bidSize: n(row.bidSize),
+      askSize: n(row.askSize),
+      asOf: new Date().toISOString(),
+      dataSource: 'yahoo',
+    }
+  } catch (err) {
+    console.warn('[Yahoo] overseas quote fallback failed', tickerKey, err)
+    return null
+  }
+}
+
+/** 미국 티커 당일 1분봉 보조 — KIS REST 미제공 구간용 (기존 국내·KIS 분기는 그대로) */
+async function fetchYahooUsIntraday1mForLiveChart(
+  symb: string,
+  tickerForTz: string,
+): Promise<{ points: Array<{ t: string; c: number }>; sessionDate: string | null }> {
+  const period2 = new Date()
+  const period1 = new Date(period2.getTime() - 3 * 24 * 60 * 60 * 1000)
+  const chart = await yahooFinance.chart(symb, {
+    period1,
+    period2,
+    interval: '1m',
+  })
+  const rows =
+    chart.quotes
+      ?.filter((q) => q.date != null && q.close != null && Number.isFinite(Number(q.close)))
+      .map((q) => ({ date: q.date as Date, close: Number(q.close) }))
+      .sort((a, b) => a.date.getTime() - b.date.getTime()) ?? []
+  if (!rows.length) return { points: [], sessionDate: null }
+  const tz = chartMarketTimezone(tickerForTz)
+  let session = filterIntradayQuotesToLastSession(rows, tickerForTz)
+  const useRows = session.length > 0 ? session : rows
+  const points = useRows.map((r) => ({ t: r.date.toISOString(), c: r.close }))
+  const sessionDate =
+    points.length > 0 ? ymdInTimeZoneLabel(new Date(points[points.length - 1].t), tz) : null
+  return { points, sessionDate }
 }
 
 async function fetchYahooDailyCloses(ticker: string, period1: Date, period2: Date): Promise<Array<{ date: string; close: number }>> {
@@ -2579,6 +2720,28 @@ app.get('/api/quote/:ticker', async (req: Request, res: Response) => {
   if (hit && now - hit.cachedAt < QUOTE_LIVE_CACHE_TTL_MS) {
     return res.json(hit.payload)
   }
+  if (isKoreanYahooIndexTicker(ticker)) {
+    try {
+      const payload = await buildYahooLiveQuoteKrIndex(key)
+      quoteLiveCache.set(key, { payload, cachedAt: now })
+      return res.json(payload)
+    } catch (err) {
+      console.error('yahoo kr index quote', err)
+      return res.status(502).json({ error: '지수 시세를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.' })
+    }
+  }
+  /** KIS 미설정 시에도 미국 티커는 Yahoo 보조 시세만으로 응답 (국내·지수 경로는 기존과 동일) */
+  if (
+    (!KIS_APP_KEY || !KIS_APP_SECRET) &&
+    /^[A-Z0-9.-]{1,20}$/i.test(ticker) &&
+    !isKoreanTicker(ticker)
+  ) {
+    const yOnly = await buildYahooLiveQuoteOverseasFallback(key)
+    if (yOnly) {
+      quoteLiveCache.set(key, { payload: yOnly, cachedAt: now })
+      return res.json(yOnly)
+    }
+  }
   if (!KIS_APP_KEY || !KIS_APP_SECRET) {
     return res.status(503).json({
       error: '한국투자증권 실시간 시세를 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.',
@@ -2591,9 +2754,14 @@ app.get('/api/quote/:ticker', async (req: Request, res: Response) => {
       payload = await buildKisLiveQuoteDomestic(key, iscd)
     } else if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
       const symb = ticker.toUpperCase()
-      const built = await buildKisLiveQuoteOverseas(key, symb)
+      let built: Record<string, unknown> | null = await buildKisLiveQuoteOverseas(key, symb)
       if (!built) {
-        return res.status(404).json({ error: '해외 종목 시세를 한국투자증권에서 찾지 못했습니다.' })
+        built = await buildYahooLiveQuoteOverseasFallback(key)
+      }
+      if (!built) {
+        return res.status(404).json({
+          error: '해외 종목 시세를 한국투자증권·Yahoo Finance에서 찾지 못했습니다.',
+        })
       }
       payload = built
     } else {
@@ -2609,7 +2777,7 @@ app.get('/api/quote/:ticker', async (req: Request, res: Response) => {
   }
 })
 
-/** 당일 1분봉 — 국내: KIS 당일분봉 반복 조회 / 미국: REST 분봉 미제공으로 빈 배열 */
+/** 당일 1분봉 — 국내: KIS 당일분봉 반복 조회 / 미국 등 해외: Yahoo 1분봉 보조 */
 app.get('/api/quote/:ticker/intraday', async (req: Request, res: Response) => {
   const tickerRaw = normalizeSingle(req.params.ticker)?.trim()
   if (!tickerRaw) {
@@ -2622,12 +2790,56 @@ app.get('/api/quote/:ticker/intraday', async (req: Request, res: Response) => {
   if (hit && now - hit.cachedAt < INTRADAY_CHART_CACHE_TTL_MS) {
     return res.json(hit.payload)
   }
+  const tz = chartMarketTimezone(ticker)
+  if (isKoreanYahooIndexTicker(ticker)) {
+    const payload = {
+      symbol: key,
+      timezone: tz,
+      interval: '1m' as const,
+      sessionDate: null as string | null,
+      points: [] as Array<{ t: string; c: number }>,
+      asOf: new Date().toISOString(),
+      dataSource: 'yahoo',
+      note: 'KOSPI·KOSPI 200 등 지수의 당일 분봉은 이 API에서 제공되지 않습니다.',
+    }
+    intradayLiveCache.set(key, { payload, cachedAt: now })
+    return res.json(payload)
+  }
+  /** 해외 당일 1분봉은 KIS에 없음 — Yahoo만 사용 (KIS 키 없어도 동작) */
+  if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
+    let points: Array<{ t: string; c: number }> = []
+    let sessionDate: string | null = null
+    try {
+      const r = await fetchYahooUsIntraday1mForLiveChart(key, ticker)
+      points = r.points
+      sessionDate = r.sessionDate
+    } catch (err) {
+      console.warn('[Yahoo] us intraday chart failed', key, err)
+    }
+    const payload = {
+      symbol: key,
+      timezone: tz,
+      interval: '1m' as const,
+      sessionDate,
+      points,
+      asOf: new Date().toISOString(),
+      dataSource: 'yahoo' as const,
+      ...(points.length > 0
+        ? {
+            note: '미국 당일 분봉은 Yahoo Finance 데이터입니다. 한국투자증권·거래소와 시세·시간이 다를 수 있습니다.',
+          }
+        : {
+            note: '미국 등 해외 종목의 당일 분봉은 한국투자증권 REST로는 제공되지 않습니다. 국내 종목은 분봉이 표시됩니다.',
+          }),
+    }
+    intradayLiveCache.set(key, { payload, cachedAt: now })
+    return res.json(payload)
+  }
   if (!KIS_APP_KEY || !KIS_APP_SECRET) {
     return res.status(503).json({
       error: '한국투자증권 분봉을 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.',
     })
   }
-  const tz = chartMarketTimezone(ticker)
   try {
     if (isKoreanSixDigitEquity(ticker)) {
       const iscd = ticker.toUpperCase().split('.')[0]
@@ -2648,20 +2860,6 @@ app.get('/api/quote/:ticker/intraday', async (req: Request, res: Response) => {
         points,
         asOf: new Date().toISOString(),
         dataSource: 'kis',
-      }
-      intradayLiveCache.set(key, { payload, cachedAt: now })
-      return res.json(payload)
-    }
-    if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
-      const payload = {
-        symbol: key,
-        timezone: tz,
-        interval: '1m' as const,
-        sessionDate: null as string | null,
-        points: [] as Array<{ t: string; c: number }>,
-        asOf: new Date().toISOString(),
-        dataSource: 'kis',
-        note: '미국 등 해외 종목의 당일 분봉은 한국투자증권 REST로는 제공되지 않습니다. 국내 종목은 분봉이 표시됩니다.',
       }
       intradayLiveCache.set(key, { payload, cachedAt: now })
       return res.json(payload)
