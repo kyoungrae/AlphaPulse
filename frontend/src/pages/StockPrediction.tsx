@@ -1,5 +1,5 @@
 import { onAuthStateChanged } from 'firebase/auth'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Area,
   AreaChart,
@@ -22,6 +22,8 @@ import {
 const QUOTE_POLL_MS = 1000
 /** 당일 분봉 폴링 — KIS 분봉은 페이지 연속 호출이 있어 1초보다 2초 쪽이 안전 */
 const INTRADAY_POLL_MS = 2000
+/** 종목 검색 등 — 프록시/응답 지연 시 무한 로딩 방지 */
+const SYMBOLS_FETCH_TIMEOUT_MS = 25_000
 
 type SymbolItem = {
   symbol: string
@@ -102,40 +104,84 @@ function loadWatchlistFromStorage(): WatchlistEntry[] {
   }
 }
 
-function useFetch<T>(url: string) {
+function useFetch<T>(url: string, options?: { timeoutMs?: number }) {
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const fetchGenRef = useRef(0)
 
   useEffect(() => {
     if (!url.trim()) {
+      fetchGenRef.current += 1
       setData(null)
       setLoading(false)
       setError(null)
       return
     }
-    let mounted = true
+
+    const gen = ++fetchGenRef.current
+    const ac = new AbortController()
+    const timeoutMs = options?.timeoutMs ?? SYMBOLS_FETCH_TIMEOUT_MS
+    let timedOut = false
+    const timer =
+      timeoutMs > 0
+        ? window.setTimeout(() => {
+            timedOut = true
+            ac.abort()
+          }, timeoutMs)
+        : 0
     setLoading(true)
     setError(null)
-    fetch(url)
+
+    const clearTimer = () => {
+      if (timer) window.clearTimeout(timer)
+    }
+
+    fetch(url, { signal: ac.signal })
       .then(async (res) => {
+        const bodyText = await res.text()
         if (!res.ok) {
-          const body = await res.text()
-          throw new Error(`요청 실패: ${res.status} ${body}`)
+          throw new Error(`요청 실패: ${res.status} ${bodyText}`)
         }
-        return (await res.json()) as T
+        if (!bodyText.trim()) {
+          throw new Error('빈 응답입니다. 잠시 후 다시 시도해 주세요.')
+        }
+        let json: T
+        try {
+          json = JSON.parse(bodyText) as T
+        } catch (e) {
+          const ctype = res.headers.get('content-type') ?? ''
+          throw new Error(
+            ctype.includes('json')
+              ? `JSON 파싱 실패: ${(e as Error).message}`
+              : `JSON이 아닌 응답입니다(${ctype || 'no content-type'}): ${bodyText.slice(0, 200)}`,
+          )
+        }
+        if (fetchGenRef.current !== gen) return
+        setData(json)
       })
-      .then((json) => {
-        if (mounted) setData(json)
-      })
-      .catch((err: Error) => {
-        if (mounted) setError(err.message)
+      .catch((err: unknown) => {
+        if (fetchGenRef.current !== gen) return
+        const name = err && typeof err === 'object' && 'name' in err ? String((err as { name: string }).name) : ''
+        if (name === 'AbortError') {
+          if (timedOut) {
+            setError('요청 시간이 초과되었습니다. 백엔드(포트 4001) 실행·네트워크를 확인해 주세요.')
+          }
+          return
+        }
+        const msg = err instanceof Error ? err.message : String(err)
+        setError(msg)
       })
       .finally(() => {
-        if (mounted) setLoading(false)
+        clearTimer()
+        if (fetchGenRef.current === gen) {
+          setLoading(false)
+        }
       })
+
     return () => {
-      mounted = false
+      clearTimer()
+      ac.abort()
     }
   }, [url])
 
@@ -156,6 +202,19 @@ function formatVolume(n: number | null) {
   return n.toLocaleString('ko-KR')
 }
 
+function formatAsOfWithSeconds(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  return new Intl.DateTimeFormat('ko-KR', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).format(new Date(iso))
+}
+
 /** 시세 폴링 중 — 기준 시각 줄 앞에만 표시 */
 function QuoteRefreshSpinner() {
   return (
@@ -172,6 +231,65 @@ function QuoteRefreshSpinner() {
       <path d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
     </svg>
   )
+}
+
+/** API `symbol`과 선택 티커가 약간 달라도(6자리·접미사 등) 동일 종목으로 인정 */
+function livePayloadSymbolMatchesSelection(apiSym: string | undefined, wantRaw: string): boolean {
+  const w = wantRaw.trim().toUpperCase()
+  const a = apiSym?.trim().toUpperCase() ?? ''
+  if (!w || !a) return false
+  if (a === w) return true
+  const stripKr = (s: string) => s.replace(/\.(KS|KQ)$/i, '')
+  const wBase = stripKr(w)
+  const aBase = stripKr(a)
+  if (/^\d{6}$/.test(wBase) && wBase === aBase) return true
+  /** `^` 지수 티커 등 — `[A-Z0-9.-]`만 쓰면 `^`가 문자 클래스 밖의 앵커로 해석되어 ^KS200이 실패함 */
+  if (wBase === aBase && /^[A-Z0-9.\^-]+$/i.test(wBase)) return true
+  return false
+}
+
+/**
+ * 응답 symbol이 비었거나, 요청·응답 티커 표기(6자리·.KS 등)만 다를 때는 정상 응답으로 인정
+ */
+function symbolMatchesWantOrUnknown(
+  apiSym: string | undefined,
+  want: string,
+  mkt: 'us' | 'kr',
+): boolean {
+  const w = normalizeTickerForQuoteApi(want, mkt).toUpperCase()
+  if (!w) return false
+  const raw = apiSym?.trim() ?? ''
+  if (!raw) return true
+  const a = normalizeTickerForQuoteApi(raw, mkt).toUpperCase()
+  if (a === w) return true
+  return livePayloadSymbolMatchesSelection(raw, w)
+}
+
+function watchlistHasSelectionForDetail(
+  rows: WatchlistEntry[],
+  sel: string,
+  mkt: 'us' | 'kr',
+): boolean {
+  const s = sel.trim()
+  if (!s) return false
+  return rows.some((w) => w.market === mkt && livePayloadSymbolMatchesSelection(w.symbol, s))
+}
+
+function findWatchlistRowForSelected(
+  rows: WatchlistEntry[],
+  sel: string,
+  mkt: 'us' | 'kr',
+): WatchlistEntry | undefined {
+  const s = sel.trim()
+  if (!s) return undefined
+  return rows.find((w) => w.market === mkt && livePayloadSymbolMatchesSelection(w.symbol, s))
+}
+
+/** KIS 시세·분봉은 국내 6자리면 `.KS` 접미가 필요 — 즐겨찾기에 `005930`만 있어도 조회되게 */
+function normalizeTickerForQuoteApi(sel: string, mkt: 'us' | 'kr'): string {
+  const t = sel.trim().toUpperCase()
+  if (mkt === 'kr' && /^\d{6}$/.test(t)) return `${t}.KS`
+  return t
 }
 
 function mergeIntradayWithLiveQuote(
@@ -221,14 +339,27 @@ export default function StockPrediction() {
   const [intraday, setIntraday] = useState<IntradayResponse | null>(null)
   const [intradayLoading, setIntradayLoading] = useState(false)
   const [intradayError, setIntradayError] = useState<string | null>(null)
+  /** 첫 로드·폴링 시 숫자 옆 로딩 표시(레이아웃 고정은 min-h·고정 차트 슬롯으로 유지) */
+  const [quotePollBusy, setQuotePollBusy] = useState(false)
 
   const watchlistCloudHydratedRef = useRef(false)
   const lastCloudPersistJsonRef = useRef<string | null>(null)
+  /** 폴링 응답이 종목 전환 이후에 도착해도 잘못 반영되지 않게 최신 정규화 티커와 비교 */
+  const selectedRef = useRef('')
+  selectedRef.current = normalizeTickerForQuoteApi(selected, market).toUpperCase()
+  /** 종목 바꾼 직후 첫 요청만 로딩 표시 — 폴링마다 스피너가 깜빡이며 “안 불러와짐”처럼 보이는 것 방지 */
+  const quoteFirstLoadSpinRef = useRef(true)
+  const intradayFirstLoadSpinRef = useRef(true)
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search), 200)
     return () => clearTimeout(timer)
   }, [search])
+
+  /** 미국 S&P 목록 캐시를 서버에서 미리 채워 두어, 검색 모드 전환 시 첫 응답이 빨라지게 함 */
+  useEffect(() => {
+    void fetch(apiUrl('/api/symbols?market=us&q=&limit=200')).catch(() => {})
+  }, [])
 
   useEffect(() => {
     try {
@@ -297,7 +428,7 @@ export default function StockPrediction() {
       if (selected !== '') setSelected('')
       return
     }
-    const inList = watchlist.some((w) => w.symbol === selected && w.market === market)
+    const inList = watchlistHasSelectionForDetail(watchlist, selected, market)
     if (!inList) {
       const first = watchlist[0]
       setMarket(first.market)
@@ -348,67 +479,121 @@ export default function StockPrediction() {
     if (!selected.trim()) return false
     if (favoritesOnly) {
       if (watchlist.length === 0) return false
-      return watchlist.some((w) => w.symbol === selected && w.market === market)
+      return watchlistHasSelectionForDetail(watchlist, selected, market)
     }
     return true
   }, [favoritesOnly, watchlist, selected, market])
 
-  const fetchQuote = useCallback(async () => {
-    if (!selected.trim() || !detailSelectionReady) return
-    setQuoteLoading(true)
+  useEffect(() => {
+    quoteFirstLoadSpinRef.current = true
+    intradayFirstLoadSpinRef.current = true
+    setQuotePollBusy(false)
+    setQuoteLoading(false)
+    setIntradayLoading(false)
+    setQuote(null)
     setQuoteError(null)
-    try {
-      const res = await fetch(apiUrl(`/api/quote/${encodeURIComponent(selected)}`))
-      const text = await res.text()
-      if (!res.ok) {
-        throw new Error(text || `HTTP ${res.status}`)
-      }
-      setQuote(JSON.parse(text) as QuoteLive)
-    } catch (e) {
-      setQuote(null)
-      setQuoteError(e instanceof Error ? e.message : '시세 조회 실패')
-    } finally {
-      setQuoteLoading(false)
-    }
-  }, [selected, detailSelectionReady])
-
-  useEffect(() => {
-    if (!detailSelectionReady) return
-    void fetchQuote()
-    const id = window.setInterval(() => void fetchQuote(), QUOTE_POLL_MS)
-    return () => window.clearInterval(id)
-  }, [fetchQuote, detailSelectionReady])
-
-  const fetchIntraday = useCallback(async () => {
-    if (!selected.trim() || !detailSelectionReady) return
-    setIntradayLoading(true)
+    setIntraday(null)
     setIntradayError(null)
-    try {
-      const res = await fetch(apiUrl(`/api/quote/${encodeURIComponent(selected)}/intraday`))
-      const text = await res.text()
-      if (!res.ok) {
-        throw new Error(text || `HTTP ${res.status}`)
-      }
-      setIntraday(JSON.parse(text) as IntradayResponse)
-    } catch (e) {
-      setIntraday(null)
-      setIntradayError(e instanceof Error ? e.message : '분봉 조회 실패')
-    } finally {
-      setIntradayLoading(false)
-    }
-  }, [selected, detailSelectionReady])
+  }, [selected, market])
 
   useEffect(() => {
-    if (!detailSelectionReady) return
-    void fetchIntraday()
-    const id = window.setInterval(() => void fetchIntraday(), INTRADAY_POLL_MS)
-    return () => window.clearInterval(id)
-  }, [fetchIntraday, detailSelectionReady])
+    if (!detailSelectionReady || !selected.trim()) return
+    const tickerForApi = normalizeTickerForQuoteApi(selected, market)
+    const requestedKey = tickerForApi.toUpperCase()
+
+    let cancelled = false
+    let timerId: number | undefined
+    let inFlightController: AbortController | null = null
+
+    const pollQuote = async () => {
+      if (cancelled) return
+      const ac = new AbortController()
+      inFlightController = ac
+      const showSpin = quoteFirstLoadSpinRef.current
+      setQuotePollBusy(true)
+      if (showSpin) setQuoteLoading(true)
+      setQuoteError(null)
+      try {
+        const res = await fetch(apiUrl(`/api/quote/${encodeURIComponent(tickerForApi)}`), { signal: ac.signal })
+        const text = await res.text()
+        if (!res.ok) throw new Error(text || `HTTP ${res.status}`)
+        const data = JSON.parse(text) as QuoteLive
+        if (selectedRef.current !== requestedKey || !symbolMatchesWantOrUnknown(data.symbol, requestedKey, market)) return
+        setQuote(data)
+      } catch (e) {
+        if (cancelled || (e instanceof Error && e.name === 'AbortError')) return
+        if (selectedRef.current !== requestedKey) return
+        setQuote(null)
+        setQuoteError(e instanceof Error ? e.message : '시세 조회 실패')
+      } finally {
+        if (cancelled || selectedRef.current !== requestedKey) return
+        setQuotePollBusy(false)
+        setQuoteLoading(false)
+        if (showSpin) quoteFirstLoadSpinRef.current = false
+        timerId = window.setTimeout(() => {
+          void pollQuote()
+        }, QUOTE_POLL_MS)
+      }
+    }
+
+    void pollQuote()
+    return () => {
+      cancelled = true
+      if (timerId) window.clearTimeout(timerId)
+      inFlightController?.abort()
+    }
+  }, [selected, market, detailSelectionReady])
+
+  useEffect(() => {
+    if (!detailSelectionReady || !selected.trim()) return
+    const tickerForApi = normalizeTickerForQuoteApi(selected, market)
+    const requestedKey = tickerForApi.toUpperCase()
+
+    let cancelled = false
+    let timerId: number | undefined
+    let inFlightController: AbortController | null = null
+
+    const pollIntraday = async () => {
+      if (cancelled) return
+      const ac = new AbortController()
+      inFlightController = ac
+      const showSpin = intradayFirstLoadSpinRef.current
+      if (showSpin) setIntradayLoading(true)
+      setIntradayError(null)
+      try {
+        const res = await fetch(apiUrl(`/api/quote/${encodeURIComponent(tickerForApi)}/intraday`), { signal: ac.signal })
+        const text = await res.text()
+        if (!res.ok) throw new Error(text || `HTTP ${res.status}`)
+        const data = JSON.parse(text) as IntradayResponse
+        if (selectedRef.current !== requestedKey || !symbolMatchesWantOrUnknown(data.symbol, requestedKey, market)) return
+        setIntraday(data)
+      } catch (e) {
+        if (cancelled || (e instanceof Error && e.name === 'AbortError')) return
+        if (selectedRef.current !== requestedKey) return
+        setIntraday(null)
+        setIntradayError(e instanceof Error ? e.message : '분봉 조회 실패')
+      } finally {
+        if (cancelled || selectedRef.current !== requestedKey) return
+        setIntradayLoading(false)
+        if (showSpin) intradayFirstLoadSpinRef.current = false
+        timerId = window.setTimeout(() => {
+          void pollIntraday()
+        }, INTRADAY_POLL_MS)
+      }
+    }
+
+    void pollIntraday()
+    return () => {
+      cancelled = true
+      if (timerId) window.clearTimeout(timerId)
+      inFlightController?.abort()
+    }
+  }, [selected, market, detailSelectionReady])
 
   const selectedSymbolInfo = useMemo(() => {
     const fromApi = (symbols?.items ?? []).find((item) => item.symbol === selected)
     if (fromApi) return fromApi
-    const fromWl = watchlist.find((w) => w.symbol === selected && w.market === market)
+    const fromWl = findWatchlistRowForSelected(watchlist, selected, market)
     if (fromWl) {
       return {
         symbol: fromWl.symbol,
@@ -422,7 +607,7 @@ export default function StockPrediction() {
   const selectedDisplayName = selectedSymbolInfo?.nameKr ?? selectedSymbolInfo?.name ?? selected
 
   const selectedIsFavorite = useMemo(
-    () => watchlist.some((w) => w.symbol === selected && w.market === market),
+    () => watchlistHasSelectionForDetail(watchlist, selected, market),
     [watchlist, selected, market],
   )
 
@@ -446,9 +631,15 @@ export default function StockPrediction() {
   const chgPct = quote?.regularMarketChangePercent
 
   const chartRows = useMemo(() => {
+    const want = normalizeTickerForQuoteApi(selected, market).toUpperCase()
+    if (!want) return []
+    if (intraday && !symbolMatchesWantOrUnknown(intraday.symbol, want, market)) return []
     const base = intraday?.points ?? []
-    return mergeIntradayWithLiveQuote(base, quote?.regularMarketPrice, quote?.asOf)
-  }, [intraday?.points, quote?.regularMarketPrice, quote?.asOf])
+    const liveOk = quote && symbolMatchesWantOrUnknown(quote.symbol, want, market)
+    const livePrice = liveOk ? quote.regularMarketPrice : undefined
+    const liveAsOf = liveOk ? quote.asOf : undefined
+    return mergeIntradayWithLiveQuote(base, livePrice, liveAsOf)
+  }, [intraday, quote, selected, market])
 
   const chartDomain = useMemo(() => {
     const vals = chartRows.map((r) => r.c).filter((n) => Number.isFinite(n))
@@ -460,6 +651,14 @@ export default function StockPrediction() {
   }, [chartRows])
 
   const chartStroke = chgPct != null && Number.isFinite(chgPct) && chgPct < 0 ? '#fb7185' : '#38bdf8'
+
+  const chartInstanceId = useMemo(
+    () => `${market}_${selected.replace(/[^a-zA-Z0-9]/g, '_') || 'sym'}`,
+    [market, selected],
+  )
+
+  const showQuotePriceSkeleton =
+    detailSelectionReady && !quote && !quoteError && (quoteLoading || quotePollBusy)
 
   return (
     <div className="space-y-4 text-slate-100">
@@ -481,6 +680,7 @@ export default function StockPrediction() {
                 setMarket('us')
                 setFavoritesOnly(false)
                 setSelected('AAPL')
+                setDebouncedSearch(search)
               }}
               className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
                 market === 'us' && !favoritesOnly ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-800'
@@ -494,6 +694,7 @@ export default function StockPrediction() {
                 setMarket('kr')
                 setFavoritesOnly(false)
                 setSelected('005930.KS')
+                setDebouncedSearch(search)
               }}
               className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
                 market === 'kr' && !favoritesOnly ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-800'
@@ -537,7 +738,9 @@ export default function StockPrediction() {
         >
           {displaySymbolItems.map((item, chipIdx) => {
             const rowMarket = 'wlMarket' in item ? item.wlMarket : market
-            const inWatchlist = watchlist.some((w) => w.symbol === item.symbol && w.market === rowMarket)
+            const inWatchlist = watchlist.some(
+              (w) => w.market === rowMarket && livePayloadSymbolMatchesSelection(w.symbol, item.symbol),
+            )
             return (
               <button
                 key={
@@ -595,21 +798,26 @@ export default function StockPrediction() {
       </div>
 
       <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg">
-        <div className="mb-4 flex flex-wrap items-start justify-between gap-2">
+        <div className="mb-4 flex min-h-[5.5rem] flex-nowrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <h3 className="text-lg font-semibold text-white">
+            <h3 className="text-lg font-semibold leading-snug text-white">
               {detailSelectionReady ? selectedDisplayName : '종목을 선택해 주세요'}
             </h3>
-            <p className="text-xs text-slate-500">
+            <p className="mt-0.5 text-xs leading-snug text-slate-500">
               {detailSelectionReady
                 ? selected
                 : favoritesOnly && watchlist.length === 0
                   ? '즐겨찾기에 종목을 추가하거나 위 칩에서 선택하세요.'
                   : '즐겨찾기 칩을 눌러 종목을 고르세요.'}
             </p>
-            {quote?.shortName && detailSelectionReady && (
-              <p className="mt-0.5 text-xs text-slate-400">{quote.shortName}</p>
-            )}
+            <p
+              className={`mt-1 min-h-[2.25rem] text-xs leading-snug text-slate-400 ${
+                !detailSelectionReady || !quote?.shortName ? 'invisible' : ''
+              }`}
+              aria-hidden={!quote?.shortName}
+            >
+              {detailSelectionReady ? quote?.shortName ?? '\u00a0' : '\u00a0'}
+            </p>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-2">
             <button
@@ -625,27 +833,35 @@ export default function StockPrediction() {
             >
               {selectedIsFavorite ? '★ 즐겨찾기 해제' : '☆ 즐겨찾기 추가'}
             </button>
-            <div className="text-right text-xs text-slate-500">
-              {detailSelectionReady && (quote?.asOf || quoteLoading) && (
+            <div className="flex min-h-[2.75rem] flex-col items-end justify-end text-right text-xs text-slate-500">
+              {detailSelectionReady ? (
                 <p
-                  className="mt-1 flex items-center justify-end gap-1.5 tabular-nums text-slate-500"
-                  {...(quoteLoading ? { role: 'status', 'aria-live': 'polite' as const } : {})}
+                  className="mt-1 flex min-h-[1.25rem] items-center justify-end gap-1.5 tabular-nums"
+                  {...(quotePollBusy && !quote?.asOf ? { role: 'status', 'aria-live': 'polite' as const } : {})}
                 >
-                  {quoteLoading && <QuoteRefreshSpinner />}
-                  {quote?.asOf ? (
-                    <span>기준: {new Date(quote.asOf).toLocaleString('ko-KR')}</span>
-                  ) : (
-                    <span>시세 불러오는 중</span>
-                  )}
+                  {quotePollBusy && !quote?.asOf && <QuoteRefreshSpinner />}
+                  <span className={!quote?.asOf && !quotePollBusy ? 'invisible' : ''}>
+                    {quote?.asOf
+                      ? `기준: ${formatAsOfWithSeconds(quote.asOf)}`
+                      : quotePollBusy
+                        ? '시세 불러오는 중'
+                        : '\u00a0'}
+                  </span>
+                </p>
+              ) : (
+                <p className="mt-1 min-h-[1.25rem]" aria-hidden>
+                  {'\u00a0'}
                 </p>
               )}
             </div>
           </div>
         </div>
 
-        {detailSelectionReady && quoteError && (
-          <p className="mb-3 text-sm text-rose-400">{quoteError}</p>
-        )}
+        <div className="min-h-[1.5rem]">
+          {detailSelectionReady && quoteError && (
+            <p className="mb-3 text-sm leading-snug text-rose-400">{quoteError}</p>
+          )}
+        </div>
 
         {!detailSelectionReady && (
           <p className="mb-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2 text-sm text-slate-400">
@@ -653,92 +869,159 @@ export default function StockPrediction() {
           </p>
         )}
 
-        {detailSelectionReady && !quote && !quoteError && quoteLoading && (
-          <div className="h-32 animate-pulse rounded-xl bg-slate-800/60" aria-hidden />
-        )}
-
-        {detailSelectionReady && quote && (
-          <div className="grid gap-4 lg:grid-cols-2">
-            <div className="rounded-xl border border-rose-900/40 bg-rose-950/20 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-rose-300">매도 호가 (Ask)</p>
-              <p className="mt-2 text-2xl font-bold tabular-nums text-white">
-                {formatPrice(quote.ask, market)}
-              </p>
-              <p className="mt-1 text-xs text-slate-400">
-                물량: {quote.askSize != null ? quote.askSize.toLocaleString('ko-KR') : '—'}
-              </p>
+        {detailSelectionReady && (
+          <div className="mt-0 space-y-4">
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="rounded-xl border border-rose-900/40 bg-rose-950/20 p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-rose-300">매도 호가 (Ask)</p>
+                <p className="mt-2 min-h-[2rem] text-2xl font-bold tabular-nums text-white">
+                  {quote ? (
+                    formatPrice(quote.ask, market)
+                  ) : showQuotePriceSkeleton ? (
+                    <span
+                      className="inline-block h-8 w-[7rem] max-w-full animate-pulse rounded-md bg-slate-700/70 align-middle"
+                      aria-hidden
+                    />
+                  ) : (
+                    '—'
+                  )}
+                </p>
+                <p className="mt-1 text-xs text-slate-400">
+                  물량:{' '}
+                  {quote?.askSize != null ? quote.askSize.toLocaleString('ko-KR') : showQuotePriceSkeleton ? '…' : '—'}
+                </p>
+              </div>
+              <div className="rounded-xl border border-emerald-900/40 bg-emerald-950/20 p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-emerald-300">매수 호가 (Bid)</p>
+                <p className="mt-2 min-h-[2rem] text-2xl font-bold tabular-nums text-white">
+                  {quote ? (
+                    formatPrice(quote.bid, market)
+                  ) : showQuotePriceSkeleton ? (
+                    <span
+                      className="inline-block h-8 w-[7rem] max-w-full animate-pulse rounded-md bg-slate-700/70 align-middle"
+                      aria-hidden
+                    />
+                  ) : (
+                    '—'
+                  )}
+                </p>
+                <p className="mt-1 text-xs text-slate-400">
+                  물량:{' '}
+                  {quote?.bidSize != null ? quote.bidSize.toLocaleString('ko-KR') : showQuotePriceSkeleton ? '…' : '—'}
+                </p>
+              </div>
             </div>
-            <div className="rounded-xl border border-emerald-900/40 bg-emerald-950/20 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-emerald-300">매수 호가 (Bid)</p>
-              <p className="mt-2 text-2xl font-bold tabular-nums text-white">
-                {formatPrice(quote.bid, market)}
-              </p>
-              <p className="mt-1 text-xs text-slate-400">
-                물량: {quote.bidSize != null ? quote.bidSize.toLocaleString('ko-KR') : '—'}
-              </p>
+
+            <div className="grid gap-3 rounded-xl border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-300 md:grid-cols-2">
+              <div>
+                <p className="text-xs text-slate-500">현재가 (정규장)</p>
+                <p className="mt-1 min-h-[1.75rem] text-xl font-semibold tabular-nums text-white">
+                  {quote ? (
+                    formatPrice(quote.regularMarketPrice, market)
+                  ) : showQuotePriceSkeleton ? (
+                    <span
+                      className="inline-block h-7 w-[8.5rem] max-w-full animate-pulse rounded-md bg-slate-700/70 align-middle"
+                      aria-hidden
+                    />
+                  ) : (
+                    '—'
+                  )}
+                </p>
+                <p className="mt-1 min-h-[2.5rem] text-xs leading-snug">
+                  {quote && chgPct != null && Number.isFinite(chgPct) ? (
+                    <span className={chgPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {chgPct >= 0 ? '+' : ''}
+                      {chgPct.toFixed(2)}%
+                    </span>
+                  ) : (
+                    <span className="text-slate-500">변동률 —</span>
+                  )}
+                  {quote && quote.regularMarketChange != null && Number.isFinite(quote.regularMarketChange) ? (
+                    <span className="ml-2 block text-slate-400 sm:inline">
+                      (
+                      {quote.regularMarketChange >= 0 ? '+' : ''}
+                      {market === 'kr'
+                        ? `${Math.round(quote.regularMarketChange).toLocaleString('ko-KR')}원`
+                        : `$${quote.regularMarketChange.toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
+                      )
+                    </span>
+                  ) : (
+                    <span className="invisible ml-2 block text-slate-400 sm:inline">(0)</span>
+                  )}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">스프레드 (Ask − Bid)</p>
+                <p className="mt-1 min-h-[1.75rem] text-xl font-semibold tabular-nums text-white">
+                  {quote && spread != null && Number.isFinite(spread)
+                    ? formatPrice(spread, market)
+                    : showQuotePriceSkeleton
+                      ? (
+                          <span
+                            className="inline-block h-7 w-[6.5rem] max-w-full animate-pulse rounded-md bg-slate-700/70 align-middle"
+                            aria-hidden
+                          />
+                        )
+                      : '—'}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">시가 · 고가 · 저가</p>
+                <p className="mt-1 min-h-[1.25rem] tabular-nums">
+                  {quote ? (
+                    <>
+                      {formatPrice(quote.regularMarketOpen, market)} ·{' '}
+                      {formatPrice(quote.regularMarketDayHigh, market)} ·{' '}
+                      {formatPrice(quote.regularMarketDayLow, market)}
+                    </>
+                  ) : showQuotePriceSkeleton ? (
+                    <span
+                      className="inline-block h-4 w-full max-w-[14rem] animate-pulse rounded-md bg-slate-700/70 align-middle"
+                      aria-hidden
+                    />
+                  ) : (
+                    '—'
+                  )}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">거래량 · 장 상태</p>
+                <p className="mt-1 min-h-[1.25rem]">
+                  {quote ? (
+                    <>
+                      {formatVolume(quote.regularMarketVolume)} · {marketStateLabel(quote.marketState)}
+                    </>
+                  ) : showQuotePriceSkeleton ? (
+                    <span
+                      className="inline-block h-4 w-[10rem] max-w-full animate-pulse rounded-md bg-slate-700/70 align-middle"
+                      aria-hidden
+                    />
+                  ) : (
+                    '—'
+                  )}
+                </p>
+                <p className="mt-0.5 min-h-[2rem] text-[11px] leading-snug text-slate-500">
+                  {quote?.fullExchangeName || quote?.exchangeTimezoneName ? (
+                    <>
+                      {quote.fullExchangeName ?? ''}
+                      {quote.exchangeTimezoneName ? ` · ${quote.exchangeTimezoneName}` : ''}
+                    </>
+                  ) : (
+                    <span className="invisible">—</span>
+                  )}
+                </p>
+              </div>
             </div>
           </div>
         )}
 
-        {detailSelectionReady && quote && (
-          <div className="mt-4 grid gap-3 rounded-xl border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-300 md:grid-cols-2">
-            <div>
-              <p className="text-xs text-slate-500">현재가 (정규장)</p>
-              <p className="mt-1 text-xl font-semibold tabular-nums text-white">
-                {formatPrice(quote.regularMarketPrice, market)}
-              </p>
-              <p className="mt-1 text-xs">
-                {chgPct != null && Number.isFinite(chgPct) ? (
-                  <span className={chgPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                    {chgPct >= 0 ? '+' : ''}
-                    {chgPct.toFixed(2)}%
-                  </span>
-                ) : (
-                  <span className="text-slate-500">변동률 —</span>
-                )}
-                {quote.regularMarketChange != null && Number.isFinite(quote.regularMarketChange) && (
-                  <span className="ml-2 text-slate-400">
-                    (
-                    {quote.regularMarketChange >= 0 ? '+' : ''}
-                    {market === 'kr'
-                      ? `${Math.round(quote.regularMarketChange).toLocaleString('ko-KR')}원`
-                      : `$${quote.regularMarketChange.toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
-                    )
-                  </span>
-                )}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-slate-500">스프레드 (Ask − Bid)</p>
-              <p className="mt-1 text-xl font-semibold tabular-nums text-white">
-                {spread != null && Number.isFinite(spread) ? formatPrice(spread, market) : '—'}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-slate-500">시가 · 고가 · 저가</p>
-              <p className="mt-1 tabular-nums">
-                {formatPrice(quote.regularMarketOpen, market)} · {formatPrice(quote.regularMarketDayHigh, market)} ·{' '}
-                {formatPrice(quote.regularMarketDayLow, market)}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-slate-500">거래량 · 장 상태</p>
-              <p className="mt-1">
-                {formatVolume(quote.regularMarketVolume)} · {marketStateLabel(quote.marketState)}
-              </p>
-              <p className="mt-0.5 text-[11px] text-slate-500">
-                {quote.fullExchangeName ?? ''}
-                {quote.exchangeTimezoneName ? ` · ${quote.exchangeTimezoneName}` : ''}
-              </p>
-            </div>
-          </div>
-        )}
-
-        {detailSelectionReady && quote && quote.bid == null && quote.ask == null && (
-          <p className="mt-3 text-xs text-amber-200/90">
-            이 종목은 호가 단위 데이터가 제공되지 않습니다. 현재가·거래량만 참고하세요.
-          </p>
-        )}
+        <div className="mt-3 min-h-[2.75rem]">
+          {detailSelectionReady && quote && quote.bid == null && quote.ask == null && (
+            <p className="text-xs leading-snug text-amber-200/90">
+              이 종목은 호가 단위 데이터가 제공되지 않습니다. 현재가·거래량만 참고하세요.
+            </p>
+          )}
+        </div>
 
         <div className="mt-6 border-t border-slate-800 pt-4">
           {!detailSelectionReady ? (
@@ -747,31 +1030,51 @@ export default function StockPrediction() {
             </p>
           ) : (
             <>
-              <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
-                <div>
+              <div className="mb-2 flex min-h-[3.25rem] flex-nowrap items-end justify-between gap-3">
+                <div className="min-w-0 flex-1">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">당일 분봉 (1분)</p>
-                  {intraday?.sessionDate && (
-                    <p className="mt-0.5 text-[11px] text-slate-500">
-                      세션 기준일 {intraday.sessionDate}
-                      {intraday.timezone ? ` · ${intraday.timezone}` : ''}
-                    </p>
-                  )}
+                  <p className="mt-0.5 min-h-[2.25rem] text-[11px] leading-snug text-slate-500">
+                    {intraday?.sessionDate ? (
+                      <>
+                        세션 기준일 {intraday.sessionDate}
+                        {intraday.timezone ? ` · ${intraday.timezone}` : ''}
+                      </>
+                    ) : (
+                      <span className="invisible">세션 기준일 —</span>
+                    )}
+                  </p>
+                  <p className="mt-0.5 text-[11px] leading-snug text-slate-500">
+                    <span className="text-sky-400">파랑</span> 상승/보합 · <span className="text-rose-400">빨강</span> 하락
+                  </p>
                 </div>
-                {intradayLoading && <span className="text-[11px] text-slate-500">차트 갱신 중…</span>}
+                <div className="w-auto shrink-0 text-right text-[11px] text-slate-500">
+                  <span className="block min-h-[1.125rem] whitespace-nowrap">
+                    {detailSelectionReady && (quote?.asOf || intraday?.asOf) ? (
+                      <span>기준: {formatAsOfWithSeconds(quote?.asOf ?? intraday?.asOf)}</span>
+                    ) : (
+                      <span className="invisible">차트</span>
+                    )}
+                  </span>
+                </div>
               </div>
-              {intradayError && <p className="mb-2 text-sm text-rose-400">{intradayError}</p>}
+              <div className="min-h-[1.5rem]">
+                {intradayError && <p className="mb-2 text-sm leading-snug text-rose-400">{intradayError}</p>}
+              </div>
+              <div className="relative h-64 w-full shrink-0 overflow-hidden rounded-lg border border-slate-800/40 bg-slate-950/30">
               {!intradayLoading && !intradayError && chartRows.length === 0 && (
-                <p className="py-8 text-center text-sm text-slate-500">
-                  {intraday?.note ??
-                    '표시할 분봉이 없습니다. 장 마감 후이거나 데이터 제공이 제한된 종목일 수 있습니다.'}
-                </p>
+                <div className="absolute inset-0 flex items-center justify-center px-2 py-6">
+                  <p className="text-center text-sm leading-relaxed text-slate-500">
+                    {intraday?.note ??
+                      '표시할 분봉이 없습니다. 장 마감 후이거나 데이터 제공이 제한된 종목일 수 있습니다.'}
+                  </p>
+                </div>
               )}
               {chartRows.length > 0 && (
-                <div className="h-64 w-full">
+                <div className="absolute inset-0 h-full w-full">
                   <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={chartRows} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <AreaChart key={chartInstanceId} data={chartRows} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
                       <defs>
-                        <linearGradient id="livePriceFill" x1="0" y1="0" x2="0" y2="1">
+                        <linearGradient id={`livePriceFill-${chartInstanceId}`} x1="0" y1="0" x2="0" y2="1">
                           <stop offset="0%" stopColor={chartStroke} stopOpacity={0.35} />
                           <stop offset="100%" stopColor={chartStroke} stopOpacity={0} />
                         </linearGradient>
@@ -829,7 +1132,7 @@ export default function StockPrediction() {
                         dataKey="c"
                         stroke={chartStroke}
                         strokeWidth={1.5}
-                        fill="url(#livePriceFill)"
+                        fill={`url(#livePriceFill-${chartInstanceId})`}
                         isAnimationActive={false}
                         dot={false}
                         activeDot={{ r: 3, fill: chartStroke }}
@@ -839,8 +1142,11 @@ export default function StockPrediction() {
                 </div>
               )}
               {intradayLoading && chartRows.length === 0 && !intradayError && (
-                <div className="h-64 animate-pulse rounded-xl bg-slate-800/50" aria-hidden />
+                <div className="absolute inset-0 flex items-center justify-center" aria-hidden>
+                  <div className="h-[calc(100%-1rem)] w-[calc(100%-1rem)] max-w-lg animate-pulse rounded-xl bg-slate-800/40" />
+                </div>
               )}
+              </div>
             </>
           )}
         </div>

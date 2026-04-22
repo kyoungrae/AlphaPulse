@@ -798,6 +798,8 @@ const sectorMap = [
 ]
 
 let cachedSp500: { data: SymbolItem[]; expiresAt: number } | null = null
+/** S&P500 CSV 네트워크 갱신 — 동시에 하나만 실행 */
+let sp500RefreshPromise: Promise<void> | null = null
 let firestoreDb: FirebaseFirestore.Firestore | null = null
 let firestoreDisabledReason: string | null = null
 const dailyJobRunningByMarket: Record<Market, boolean> = { us: false, kr: false }
@@ -811,8 +813,11 @@ const quoteLiveCache = new Map<string, { payload: Record<string, unknown>; cache
 const QUOTE_LIVE_CACHE_TTL_MS = Math.max(0, Number(process.env.QUOTE_LIVE_CACHE_TTL_MS ?? 800))
 /** 분봉 차트(실시간 현황 페이지) — 야후 호출 부하 완화 */
 const intradayLiveCache = new Map<string, { payload: Record<string, unknown>; cachedAt: number }>()
-/** 당일 분봉 API 캐시 — 프론트 1~2초 폴링 시 너무 길면 차트가 안 바뀌는 문제 방지 */
-const INTRADAY_CHART_CACHE_TTL_MS = Math.max(0, Number(process.env.INTRADAY_CHART_CACHE_TTL_MS ?? 1600))
+/** 동시 다발적인 동일 종목 요청 병합(Deduplication) */
+const quoteInFlight = new Map<string, Promise<Record<string, unknown>>>()
+const intradayInFlight = new Map<string, Promise<Record<string, unknown>>>()
+/** 당일 분봉 API 캐시 — 실시간 현재가 보정이 있으므로 분봉 원본은 여유 있게 캐시 */
+const INTRADAY_CHART_CACHE_TTL_MS = Math.max(0, Number(process.env.INTRADAY_CHART_CACHE_TTL_MS ?? 10_000))
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
 const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
 const KIS_TOKEN_REDIS_KEY = 'kis:oauth:token'
@@ -1511,8 +1516,10 @@ function pickOverseasNum(o: Record<string, unknown>, keys: string[]): number | n
 }
 
 async function buildKisLiveQuoteDomestic(tickerKey: string, iscd: string): Promise<Record<string, unknown>> {
-  const o = await fetchKisDomesticInquirePriceOutput(iscd)
-  const ask1 = await fetchKisDomesticAskingOutput1(iscd)
+  const [o, ask1] = await Promise.all([
+    fetchKisDomesticInquirePriceOutput(iscd),
+    fetchKisDomesticAskingOutput1(iscd),
+  ])
   const name =
     typeof o.hts_kor_isnm === 'string'
       ? o.hts_kor_isnm
@@ -1786,7 +1793,7 @@ function normalizeTickerForNews(ticker: string) {
 
 async function resolveNewsEntityTerms(ticker: string, market: Market) {
   const normalizedTicker = normalizeTickerForNews(ticker)
-  const source = market === 'kr' ? koreaSymbols : await getSp500Symbols()
+  const source = market === 'kr' ? koreaSymbols : getUsSymbolsSnapshot()
   const found = source.find((item) => item.symbol.toUpperCase() === ticker.toUpperCase())
   const nameTerms = [found?.nameKr, found?.name]
     .filter((v): v is string => Boolean(v && v.trim().length > 0))
@@ -2057,11 +2064,14 @@ function symbolItemMatchesQuery(item: SymbolItem, queryRaw: string): boolean {
   return false
 }
 
-async function getSp500Symbols(): Promise<SymbolItem[]> {
+/** 미국 종목 API용 — 네트워크 대기 없이 즉시 반환(캐시·만료 캐시·fallback) */
+function getUsSymbolsSnapshot(): SymbolItem[] {
+  if (cachedSp500?.data?.length) return cachedSp500.data
+  return fallbackSymbols
+}
+
+async function downloadSp500CsvIntoCache(): Promise<void> {
   const now = Date.now()
-  if (cachedSp500 && cachedSp500.expiresAt > now) {
-    return cachedSp500.data
-  }
   try {
     const response = await fetch(S_AND_P_500_CSV_URL)
     if (!response.ok) {
@@ -2080,11 +2090,38 @@ async function getSp500Symbols(): Promise<SymbolItem[]> {
       .filter((item) => item.symbol.length > 0)
     const unique = Array.from(new Map(parsed.map((item) => [item.symbol, item])).values())
     cachedSp500 = { data: unique, expiresAt: now + SP500_CACHE_TTL_MS }
-    return unique
   } catch (err) {
     console.error('S&P500 목록 로딩 실패. fallback 목록 사용', err)
-    return fallbackSymbols
   }
+}
+
+function startOrJoinSp500Refresh(): Promise<void> {
+  if (sp500RefreshPromise) return sp500RefreshPromise
+  sp500RefreshPromise = (async () => {
+    try {
+      await downloadSp500CsvIntoCache()
+    } finally {
+      sp500RefreshPromise = null
+    }
+  })()
+  return sp500RefreshPromise
+}
+
+/** TTL 만료 시 백그라운드로 CSV 재수집 — 응답은 스냅샷으로 즉시 */
+function scheduleSp500BackgroundRefresh(): void {
+  const now = Date.now()
+  if (cachedSp500 && cachedSp500.expiresAt > now) return
+  void startOrJoinSp500Refresh().catch((e) => console.error('S&P500 background refresh', e))
+}
+
+/** 배치·뉴스 등 전체 목록이 필요할 때만 네트워크 완료까지 대기 */
+async function getSp500Symbols(): Promise<SymbolItem[]> {
+  const now = Date.now()
+  if (cachedSp500 && cachedSp500.expiresAt > now) {
+    return cachedSp500.data
+  }
+  await startOrJoinSp500Refresh()
+  return cachedSp500?.data?.length ? cachedSp500.data : fallbackSymbols
 }
 
 function getFirestore() {
@@ -2720,34 +2757,38 @@ app.get('/api/quote/:ticker', async (req: Request, res: Response) => {
   if (hit && now - hit.cachedAt < QUOTE_LIVE_CACHE_TTL_MS) {
     return res.json(hit.payload)
   }
-  if (isKoreanYahooIndexTicker(ticker)) {
+  const inFlight = quoteInFlight.get(key)
+  if (inFlight) {
     try {
-      const payload = await buildYahooLiveQuoteKrIndex(key)
-      quoteLiveCache.set(key, { payload, cachedAt: now })
-      return res.json(payload)
-    } catch (err) {
-      console.error('yahoo kr index quote', err)
-      return res.status(502).json({ error: '지수 시세를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.' })
+      return res.json(await inFlight)
+    } catch {
+      // fall through and retry once as a fresh request
     }
   }
-  /** KIS 미설정 시에도 미국 티커는 Yahoo 보조 시세만으로 응답 (국내·지수 경로는 기존과 동일) */
-  if (
-    (!KIS_APP_KEY || !KIS_APP_SECRET) &&
-    /^[A-Z0-9.-]{1,20}$/i.test(ticker) &&
-    !isKoreanTicker(ticker)
-  ) {
-    const yOnly = await buildYahooLiveQuoteOverseasFallback(key)
-    if (yOnly) {
-      quoteLiveCache.set(key, { payload: yOnly, cachedAt: now })
-      return res.json(yOnly)
+
+  const loadPromise: Promise<Record<string, unknown>> = (async () => {
+    if (isKoreanYahooIndexTicker(ticker)) {
+      try {
+        const payload = await buildYahooLiveQuoteKrIndex(key)
+        quoteLiveCache.set(key, { payload, cachedAt: Date.now() })
+        return payload
+      } catch (err) {
+        console.error('yahoo kr index quote', err)
+        throw { status: 502, message: '지수 시세를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.' }
+      }
     }
-  }
-  if (!KIS_APP_KEY || !KIS_APP_SECRET) {
-    return res.status(503).json({
-      error: '한국투자증권 실시간 시세를 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.',
-    })
-  }
-  try {
+
+    if ((!KIS_APP_KEY || !KIS_APP_SECRET) && /^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
+      const yOnly = await buildYahooLiveQuoteOverseasFallback(key)
+      if (yOnly) {
+        quoteLiveCache.set(key, { payload: yOnly, cachedAt: Date.now() })
+        return yOnly
+      }
+    }
+    if (!KIS_APP_KEY || !KIS_APP_SECRET) {
+      throw { status: 503, message: '한국투자증권 실시간 시세를 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.' }
+    }
+
     let payload: Record<string, unknown>
     if (isKoreanSixDigitEquity(ticker)) {
       const iscd = ticker.toUpperCase().split('.')[0]
@@ -2755,25 +2796,33 @@ app.get('/api/quote/:ticker', async (req: Request, res: Response) => {
     } else if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
       const symb = ticker.toUpperCase()
       let built: Record<string, unknown> | null = await buildKisLiveQuoteOverseas(key, symb)
+      if (!built) built = await buildYahooLiveQuoteOverseasFallback(key)
       if (!built) {
-        built = await buildYahooLiveQuoteOverseasFallback(key)
-      }
-      if (!built) {
-        return res.status(404).json({
-          error: '해외 종목 시세를 한국투자증권·Yahoo Finance에서 찾지 못했습니다.',
-        })
+        throw { status: 404, message: '해외 종목 시세를 한국투자증권·Yahoo Finance에서 찾지 못했습니다.' }
       }
       payload = built
     } else {
-      return res.status(400).json({
-        error: '한국투자증권 시세는 국내 6자리·코스피/코스닥(예: 005930.KS) 또는 미국 티커(예: AAPL)만 지원합니다.',
-      })
+      throw {
+        status: 400,
+        message: '한국투자증권 시세는 국내 6자리·코스피/코스닥(예: 005930.KS) 또는 미국 티커(예: AAPL)만 지원합니다.',
+      }
     }
-    quoteLiveCache.set(key, { payload, cachedAt: now })
-    res.json(payload)
+    quoteLiveCache.set(key, { payload, cachedAt: Date.now() })
+    return payload
+  })()
+  quoteInFlight.set(key, loadPromise)
+  try {
+    return res.json(await loadPromise)
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: '실시간 시세를 가져오지 못했습니다.' })
+    const status = typeof err === 'object' && err && 'status' in err ? Number((err as { status?: number }).status) : 500
+    const message =
+      typeof err === 'object' && err && 'message' in err
+        ? String((err as { message?: string }).message)
+        : '실시간 시세를 가져오지 못했습니다.'
+    return res.status(status || 500).json({ error: message })
+  } finally {
+    quoteInFlight.delete(key)
   }
 })
 
@@ -2790,68 +2839,41 @@ app.get('/api/quote/:ticker/intraday', async (req: Request, res: Response) => {
   if (hit && now - hit.cachedAt < INTRADAY_CHART_CACHE_TTL_MS) {
     return res.json(hit.payload)
   }
-  const tz = chartMarketTimezone(ticker)
-  if (isKoreanYahooIndexTicker(ticker)) {
-    const payload = {
-      symbol: key,
-      timezone: tz,
-      interval: '1m' as const,
-      sessionDate: null as string | null,
-      points: [] as Array<{ t: string; c: number }>,
-      asOf: new Date().toISOString(),
-      dataSource: 'yahoo',
-      note: 'KOSPI·KOSPI 200 등 지수의 당일 분봉은 이 API에서 제공되지 않습니다.',
-    }
-    intradayLiveCache.set(key, { payload, cachedAt: now })
-    return res.json(payload)
-  }
-  /** 해외 당일 1분봉은 KIS에 없음 — Yahoo만 사용 (KIS 키 없어도 동작) */
-  if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
-    let points: Array<{ t: string; c: number }> = []
-    let sessionDate: string | null = null
+  const inFlight = intradayInFlight.get(key)
+  if (inFlight) {
     try {
-      const r = await fetchYahooUsIntraday1mForLiveChart(key, ticker)
-      points = r.points
-      sessionDate = r.sessionDate
-    } catch (err) {
-      console.warn('[Yahoo] us intraday chart failed', key, err)
+      return res.json(await inFlight)
+    } catch {
+      // fall through and retry once as a fresh request
     }
-    const payload = {
-      symbol: key,
-      timezone: tz,
-      interval: '1m' as const,
-      sessionDate,
-      points,
-      asOf: new Date().toISOString(),
-      dataSource: 'yahoo' as const,
-      ...(points.length > 0
-        ? {
-            note: '미국 당일 분봉은 Yahoo Finance 데이터입니다. 한국투자증권·거래소와 시세·시간이 다를 수 있습니다.',
-          }
-        : {
-            note: '미국 등 해외 종목의 당일 분봉은 한국투자증권 REST로는 제공되지 않습니다. 국내 종목은 분봉이 표시됩니다.',
-          }),
+  }
+
+  const loadPromise: Promise<Record<string, unknown>> = (async () => {
+    const tz = chartMarketTimezone(ticker)
+    if (isKoreanYahooIndexTicker(ticker)) {
+      const payload = {
+        symbol: key,
+        timezone: tz,
+        interval: '1m' as const,
+        sessionDate: null as string | null,
+        points: [] as Array<{ t: string; c: number }>,
+        asOf: new Date().toISOString(),
+        dataSource: 'yahoo',
+        note: 'KOSPI·KOSPI 200 등 지수의 당일 분봉은 이 API에서 제공되지 않습니다.',
+      }
+      intradayLiveCache.set(key, { payload, cachedAt: Date.now() })
+      return payload
     }
-    intradayLiveCache.set(key, { payload, cachedAt: now })
-    return res.json(payload)
-  }
-  if (!KIS_APP_KEY || !KIS_APP_SECRET) {
-    return res.status(503).json({
-      error: '한국투자증권 분봉을 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.',
-    })
-  }
-  try {
-    if (isKoreanSixDigitEquity(ticker)) {
-      const iscd = ticker.toUpperCase().split('.')[0]
-      const { points: rawPoints, sessionDate: rawSession } = await fetchKisDomesticIntradayPoints(iscd)
-      const withDates = rawPoints.map((p) => ({ date: new Date(p.t), close: p.c }))
-      const session = filterIntradayQuotesToLastSession(withDates, ticker)
-      const points = session.map((row) => ({
-        t: row.date.toISOString(),
-        c: row.close,
-      }))
-      const sessionDate =
-        points.length > 0 ? ymdInTimeZoneLabel(new Date(points[points.length - 1].t), tz) : rawSession
+    if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
+      let points: Array<{ t: string; c: number }> = []
+      let sessionDate: string | null = null
+      try {
+        const r = await fetchYahooUsIntraday1mForLiveChart(key, ticker)
+        points = r.points
+        sessionDate = r.sessionDate
+      } catch (err) {
+        console.warn('[Yahoo] us intraday chart failed', key, err)
+      }
       const payload = {
         symbol: key,
         timezone: tz,
@@ -2859,17 +2881,55 @@ app.get('/api/quote/:ticker/intraday', async (req: Request, res: Response) => {
         sessionDate,
         points,
         asOf: new Date().toISOString(),
-        dataSource: 'kis',
+        dataSource: 'yahoo' as const,
+        ...(points.length > 0
+          ? {
+              note: '미국 당일 분봉은 Yahoo Finance 데이터입니다. 한국투자증권·거래소와 시세·시간이 다를 수 있습니다.',
+            }
+          : {
+              note: '미국 등 해외 종목의 당일 분봉은 한국투자증권 REST로는 제공되지 않습니다. 국내 종목은 분봉이 표시됩니다.',
+            }),
       }
-      intradayLiveCache.set(key, { payload, cachedAt: now })
-      return res.json(payload)
+      intradayLiveCache.set(key, { payload, cachedAt: Date.now() })
+      return payload
     }
-    return res.status(400).json({
-      error: '분봉은 국내 6자리·코스피/코스닥(예: 005930.KS)만 지원합니다.',
-    })
+    if (!KIS_APP_KEY || !KIS_APP_SECRET) {
+      throw { status: 503, message: '한국투자증권 분봉을 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.' }
+    }
+    if (!isKoreanSixDigitEquity(ticker)) {
+      throw { status: 400, message: '분봉은 국내 6자리·코스피/코스닥(예: 005930.KS)만 지원합니다.' }
+    }
+    const iscd = ticker.toUpperCase().split('.')[0]
+    const { points: rawPoints, sessionDate: rawSession } = await fetchKisDomesticIntradayPoints(iscd)
+    const withDates = rawPoints.map((p) => ({ date: new Date(p.t), close: p.c }))
+    const session = filterIntradayQuotesToLastSession(withDates, ticker)
+    const points = session.map((row) => ({ t: row.date.toISOString(), c: row.close }))
+    const sessionDate = points.length > 0 ? ymdInTimeZoneLabel(new Date(points[points.length - 1].t), tz) : rawSession
+    const payload = {
+      symbol: key,
+      timezone: tz,
+      interval: '1m' as const,
+      sessionDate,
+      points,
+      asOf: new Date().toISOString(),
+      dataSource: 'kis',
+    }
+    intradayLiveCache.set(key, { payload, cachedAt: Date.now() })
+    return payload
+  })()
+  intradayInFlight.set(key, loadPromise)
+  try {
+    return res.json(await loadPromise)
   } catch (err) {
     console.error('intraday chart', err)
-    res.status(500).json({ error: '분봉 차트 데이터를 가져오지 못했습니다.' })
+    const status = typeof err === 'object' && err && 'status' in err ? Number((err as { status?: number }).status) : 500
+    const message =
+      typeof err === 'object' && err && 'message' in err
+        ? String((err as { message?: string }).message)
+        : '분봉 차트 데이터를 가져오지 못했습니다.'
+    return res.status(status || 500).json({ error: message })
+  } finally {
+    intradayInFlight.delete(key)
   }
 })
 
@@ -3254,7 +3314,8 @@ app.get('/api/symbols/sp500', async (req: Request, res: Response) => {
     const query = (req.query.q as string | undefined)?.trim() ?? ''
     const limitRaw = Number(req.query.limit ?? 40)
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 40
-    const symbols = await getSp500Symbols()
+    scheduleSp500BackgroundRefresh()
+    const symbols = getUsSymbolsSnapshot()
     const filtered = symbols.filter((item) => symbolItemMatchesQuery(item, query))
     return res.json({ total: filtered.length, items: filtered.slice(0, limit) })
   } catch (err) {
@@ -3270,7 +3331,10 @@ app.get('/api/symbols', async (req: Request, res: Response) => {
     const limitRaw = Number(req.query.limit ?? 40)
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 40
 
-    const source = market === 'kr' ? koreaSymbols : await getSp500Symbols()
+    if (market !== 'kr') {
+      scheduleSp500BackgroundRefresh()
+    }
+    const source = market === 'kr' ? koreaSymbols : getUsSymbolsSnapshot()
     const filtered = source.filter((item) => symbolItemMatchesQuery(item, query))
 
     return res.json({
@@ -3685,6 +3749,7 @@ app.listen(port, () => {
     `[일일 마감 배치] 한국·미국 각각 '해당 시장 정규장 마감 이후'에만 Firestore 반영, 시장별 하루 1회(job_meta). 조건 검사 주기 ${DAILY_CLOSE_SCHEDULER_MS / 1000}s (환경변수 DAILY_CLOSE_SCHEDULER_MS 로 변경 가능)`,
   )
   setImmediate(() => {
+    scheduleSp500BackgroundRefresh()
     void runStartupDailyCloseCatchUp()
   })
   setInterval(() => {
