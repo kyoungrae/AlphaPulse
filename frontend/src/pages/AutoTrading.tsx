@@ -68,6 +68,7 @@ export default function AutoTrading() {
     { symbol: '114800.KS', label: 'KODEX 인버스 (114800.KS)' },
   ]
   const [isActive, setIsActive] = useState(false)
+  const [isDryRun, setIsDryRun] = useState(true)
   const [aiTicker, setAiTicker] = useState('^KS200')
   const [upSymbol, setUpSymbol] = useState('122630.KS')
   const [downSymbol, setDownSymbol] = useState('252710.KS')
@@ -114,6 +115,7 @@ export default function AutoTrading() {
         const statusData = (await statusRes.json()) as {
           config?: {
             isActive?: boolean
+            isDryRun?: boolean
             aiTicker?: string
             upSymbol?: string
             downSymbol?: string
@@ -136,6 +138,7 @@ export default function AutoTrading() {
           error: null,
         })
         setIsActive(Boolean(statusData.config?.isActive))
+        setIsDryRun(statusData.config?.isDryRun !== false)
         setAiTicker(statusData.config?.aiTicker ?? '^KS200')
         setUpSymbol(normalizeSymbol(statusData.config?.upSymbol ?? '122630.KS'))
         setDownSymbol(normalizeSymbol(statusData.config?.downSymbol ?? '252710.KS'))
@@ -282,6 +285,7 @@ export default function AutoTrading() {
   const updateConfig = async (
     patch?: Partial<{
       isActive: boolean
+      isDryRun: boolean
       aiTicker: string
       upSymbol: string
       downSymbol: string
@@ -294,6 +298,7 @@ export default function AutoTrading() {
     try {
       const payload = {
         isActive,
+        isDryRun,
         aiTicker,
         upSymbol,
         downSymbol,
@@ -323,6 +328,13 @@ export default function AutoTrading() {
     const nextState = !isActive
     setIsActive(nextState)
     void updateConfig({ isActive: nextState })
+  }
+
+  const handleToggleDryRun = () => {
+    const nextDryRun = !isDryRun
+    if (!nextDryRun && !window.confirm('주의: LIVE 모드에서는 실제 계좌에 주문이 실행됩니다. 계속하시겠습니까?')) return
+    setIsDryRun(nextDryRun)
+    void updateConfig({ isDryRun: nextDryRun })
   }
 
   const handleThresholdChange = (e: ChangeEvent<HTMLInputElement>) => {
@@ -394,6 +406,23 @@ export default function AutoTrading() {
           {/* 메인 스위치 카드 */}
           <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-800 bg-slate-900/80 p-5 text-center shadow-lg">
             <p className="mb-4 text-sm font-semibold text-slate-300">자동 매매 시스템 상태</p>
+            <p className={`mb-2 text-[10px] font-bold uppercase tracking-wider ${isDryRun ? 'text-slate-400' : 'text-rose-400'}`}>
+              {isDryRun ? 'DRY_RUN 모드' : 'LIVE 모드'}
+            </p>
+            <button
+              type="button"
+              onClick={handleToggleDryRun}
+              className={`relative mb-4 inline-flex h-9 w-20 items-center rounded-full transition-all duration-300 ${
+                isDryRun ? 'bg-slate-700' : 'bg-rose-600 shadow-[0_0_15px_rgba(225,29,72,0.4)]'
+              }`}
+              title={isDryRun ? '모의 매매 모드' : '실전 매매 모드'}
+            >
+              <span
+                className={`inline-block h-7 w-7 rounded-full bg-white transition-transform duration-300 ${
+                  isDryRun ? 'translate-x-1' : 'translate-x-12'
+                }`}
+              />
+            </button>
             <button
               onClick={handleToggleActive}
               className={`relative inline-flex h-12 w-24 items-center rounded-full transition-colors duration-300 focus:outline-none ${
@@ -411,7 +440,11 @@ export default function AutoTrading() {
               {isActive ? '운영 중 (ON)' : '중지됨 (OFF)'}
             </p>
             <p className="mt-2 text-xs text-slate-400">
-              {isActive ? '매일 아침 9시 장 시작 시 AI 시그널에 따라 주문이 실행됩니다.' : '현재 자동으로 매매가 실행되지 않습니다.'}
+              {isActive
+                ? isDryRun
+                  ? '현재 DRY_RUN 모드입니다. 주문은 전송되지 않고 로그만 기록됩니다.'
+                  : '현재 LIVE 모드입니다. 실제 주문이 실행됩니다.'
+                : '현재 자동으로 매매가 실행되지 않습니다.'}
             </p>
             <button
               type="button"

@@ -64,7 +64,7 @@ const KIS_RETRY_BASE_MS = Math.max(100, Number(process.env.KIS_RETRY_BASE_MS ?? 
 const KIS_DATA_MIN_INTERVAL_MS = Math.max(120, Number(process.env.KIS_DATA_MIN_INTERVAL_MS ?? 220))
 const AUTO_TRADING_ENABLED = process.env.AUTO_TRADING_ENABLED === 'true'
 /** 안전장치: 기본 true(실주문 차단). 실주문은 명시적으로 false 설정 필요 */
-const AUTO_TRADING_DRY_RUN = process.env.AUTO_TRADING_DRY_RUN !== 'false'
+const AUTO_TRADING_DRY_RUN_DEFAULT = process.env.AUTO_TRADING_DRY_RUN !== 'false'
 const AUTO_TRADING_CHECK_MS = Math.max(15_000, Number(process.env.AUTO_TRADING_CHECK_MS ?? 60_000))
 const AUTO_TRADING_RUN_HOUR_KST = Math.max(0, Math.min(23, Number(process.env.AUTO_TRADING_RUN_HOUR_KST ?? 9)))
 const AUTO_TRADING_RUN_MINUTE_KST = Math.max(0, Math.min(59, Number(process.env.AUTO_TRADING_RUN_MINUTE_KST ?? 1)))
@@ -861,6 +861,7 @@ type AutoTradeLog = {
 }
 type AutoTradingConfig = {
   isActive: boolean
+  isDryRun: boolean
   aiTicker: string
   upSymbol: string
   downSymbol: string
@@ -871,6 +872,7 @@ type AutoTradingConfig = {
 
 let autoTradingConfig: AutoTradingConfig = {
   isActive: false,
+  isDryRun: AUTO_TRADING_DRY_RUN_DEFAULT,
   aiTicker: '^KS200',
   upSymbol: '122630.KS',
   downSymbol: '252710.KS',
@@ -892,6 +894,7 @@ async function loadAutoTradingConfig(): Promise<void> {
     autoTradingConfig = {
       ...autoTradingConfig,
       ...data,
+      isDryRun: data.isDryRun == null ? autoTradingConfig.isDryRun : Boolean(data.isDryRun),
       threshold: Math.max(50, Math.min(99, Number(data.threshold ?? autoTradingConfig.threshold))),
       tradeAmount: Math.max(1, Number(data.tradeAmount ?? autoTradingConfig.tradeAmount)),
     }
@@ -1397,7 +1400,7 @@ function nowKstYmdHm(): { ymd: string; hour: number; minute: number; iso: string
 
 async function executeAutoTrading(clockDate: string, force = false): Promise<void> {
   if (!autoTradingConfig.isActive && !force) return
-  const isDryRun = AUTO_TRADING_DRY_RUN
+  const isDryRun = autoTradingConfig.isDryRun !== false
   const aiTicker = autoTradingConfig.aiTicker.trim()
   const upSymbol = autoTradingConfig.upSymbol.trim().toUpperCase()
   const downSymbol = autoTradingConfig.downSymbol.trim().toUpperCase()
@@ -4114,7 +4117,7 @@ app.get('/api/trading/status', async (_req: Request, res: Response) => {
     const balance = await fetchKisBalance()
     return res.json({
       config: autoTradingConfig,
-      dryRun: AUTO_TRADING_DRY_RUN,
+      dryRun: autoTradingConfig.isDryRun !== false,
       enabled: AUTO_TRADING_ENABLED,
       balance,
       logs: autoTradeLogs.slice(0, 50),
@@ -4135,6 +4138,7 @@ app.post('/api/trading/config', async (req: Request, res: Response) => {
     autoTradingConfig = {
       ...autoTradingConfig,
       ...body,
+      isDryRun: body.isDryRun == null ? autoTradingConfig.isDryRun : Boolean(body.isDryRun),
       threshold: Math.max(50, Math.min(99, Number(body.threshold ?? autoTradingConfig.threshold))),
       tradeAmount: Math.max(1, Number(body.tradeAmount ?? autoTradingConfig.tradeAmount)),
     }
@@ -4142,7 +4146,7 @@ app.post('/api/trading/config', async (req: Request, res: Response) => {
     if (db) {
       await db.collection('system_config').doc('auto_trading').set(autoTradingConfig, { merge: true })
     }
-    return res.json({ ok: true, config: autoTradingConfig, dryRun: AUTO_TRADING_DRY_RUN, enabled: AUTO_TRADING_ENABLED })
+    return res.json({ ok: true, config: autoTradingConfig, dryRun: autoTradingConfig.isDryRun !== false, enabled: AUTO_TRADING_ENABLED })
   } catch (err) {
     console.error('[Trading] config save', err)
     return res.status(500).json({ error: '설정 저장에 실패했습니다.' })
