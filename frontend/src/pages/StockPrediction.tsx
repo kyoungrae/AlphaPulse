@@ -1,5 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
 import { apiUrl } from '../apiBase'
+
+/** 호가·현재가 폴링 주기(ms). 백엔드 `QUOTE_LIVE_CACHE_TTL_MS`(기본 0.8s)보다 길게 두는 것을 권장 */
+const QUOTE_POLL_MS = 1000
+const INTRADAY_POLL_MS = 20_000
 
 type SymbolItem = {
   symbol: string
@@ -11,6 +24,16 @@ type SymbolResponse = {
   market?: 'us' | 'kr'
   total?: number
   items: SymbolItem[]
+}
+
+type IntradayResponse = {
+  symbol: string
+  timezone: string
+  interval: string
+  sessionDate: string | null
+  points: { t: string; c: number }[]
+  asOf: string
+  note?: string
 }
 
 type QuoteLive = {
@@ -84,6 +107,26 @@ function formatVolume(n: number | null) {
   return n.toLocaleString('ko-KR')
 }
 
+function mergeIntradayWithLiveQuote(
+  points: { t: string; c: number }[],
+  livePrice: number | null | undefined,
+  liveAsOf: string | null | undefined,
+): { t: string; c: number }[] {
+  if (!points.length) return []
+  if (livePrice == null || !Number.isFinite(livePrice) || !liveAsOf) return [...points]
+  const out = points.map((p) => ({ ...p }))
+  const last = out[out.length - 1]
+  const lastMs = new Date(last.t).getTime()
+  const qMs = new Date(liveAsOf).getTime()
+  if (!Number.isFinite(lastMs) || !Number.isFinite(qMs)) return [...points]
+  if (qMs > lastMs) {
+    out.push({ t: liveAsOf, c: livePrice })
+  } else {
+    out[out.length - 1] = { t: last.t, c: livePrice }
+  }
+  return out
+}
+
 function marketStateLabel(state: string | null) {
   if (!state) return '—'
   const map: Record<string, string> = {
@@ -105,6 +148,9 @@ export default function StockPrediction() {
   const [quote, setQuote] = useState<QuoteLive | null>(null)
   const [quoteLoading, setQuoteLoading] = useState(false)
   const [quoteError, setQuoteError] = useState<string | null>(null)
+  const [intraday, setIntraday] = useState<IntradayResponse | null>(null)
+  const [intradayLoading, setIntradayLoading] = useState(false)
+  const [intradayError, setIntradayError] = useState<string | null>(null)
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search), 200)
@@ -145,9 +191,34 @@ export default function StockPrediction() {
 
   useEffect(() => {
     void fetchQuote()
-    const id = window.setInterval(() => void fetchQuote(), 10_000)
+    const id = window.setInterval(() => void fetchQuote(), QUOTE_POLL_MS)
     return () => window.clearInterval(id)
   }, [fetchQuote])
+
+  const fetchIntraday = useCallback(async () => {
+    if (!selected.trim()) return
+    setIntradayLoading(true)
+    setIntradayError(null)
+    try {
+      const res = await fetch(apiUrl(`/api/quote/${encodeURIComponent(selected)}/intraday`))
+      const text = await res.text()
+      if (!res.ok) {
+        throw new Error(text || `HTTP ${res.status}`)
+      }
+      setIntraday(JSON.parse(text) as IntradayResponse)
+    } catch (e) {
+      setIntraday(null)
+      setIntradayError(e instanceof Error ? e.message : '분봉 조회 실패')
+    } finally {
+      setIntradayLoading(false)
+    }
+  }, [selected])
+
+  useEffect(() => {
+    void fetchIntraday()
+    const id = window.setInterval(() => void fetchIntraday(), INTRADAY_POLL_MS)
+    return () => window.clearInterval(id)
+  }, [fetchIntraday])
 
   const selectedSymbolInfo = useMemo(
     () => (symbols?.items ?? []).find((item) => item.symbol === selected),
@@ -162,12 +233,29 @@ export default function StockPrediction() {
 
   const chgPct = quote?.regularMarketChangePercent
 
+  const chartRows = useMemo(() => {
+    const base = intraday?.points ?? []
+    return mergeIntradayWithLiveQuote(base, quote?.regularMarketPrice, quote?.asOf)
+  }, [intraday?.points, quote?.regularMarketPrice, quote?.asOf])
+
+  const chartDomain = useMemo(() => {
+    const vals = chartRows.map((r) => r.c).filter((n) => Number.isFinite(n))
+    if (!vals.length) return undefined
+    const lo = Math.min(...vals)
+    const hi = Math.max(...vals)
+    const pad = hi > lo ? (hi - lo) * 0.06 : Math.abs(hi) * 0.001 || 0.01
+    return [lo - pad, hi + pad] as [number, number]
+  }, [chartRows])
+
+  const chartStroke = chgPct != null && Number.isFinite(chgPct) && chgPct < 0 ? '#fb7185' : '#38bdf8'
+
   return (
     <div className="space-y-4 text-slate-100">
       <div>
         <h2 className="text-2xl font-bold">종목 실시간 현황</h2>
         <p className="text-sm text-slate-400">
-          종목을 고르면 최우선 매도·매수 호가와 현재가 등이 약 10초 간격으로 갱신됩니다.
+          종목을 고르면 호가·현재가는 약 1초마다, 분봉 차트는 약 20초마다 갱신됩니다. 현재가가 반영되면서 곡선 끝이
+          함께 움직입니다.
         </p>
       </div>
 
@@ -325,10 +413,108 @@ export default function StockPrediction() {
             이 종목은 호가 단위 데이터가 제공되지 않습니다. 현재가·거래량만 참고하세요.
           </p>
         )}
+
+        <div className="mt-6 border-t border-slate-800 pt-4">
+          <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">당일 분봉 (1분)</p>
+              {intraday?.sessionDate && (
+                <p className="mt-0.5 text-[11px] text-slate-500">
+                  세션 기준일 {intraday.sessionDate}
+                  {intraday.timezone ? ` · ${intraday.timezone}` : ''}
+                </p>
+              )}
+            </div>
+            {intradayLoading && <span className="text-[11px] text-slate-500">차트 갱신 중…</span>}
+          </div>
+          {intradayError && <p className="mb-2 text-sm text-rose-400">{intradayError}</p>}
+          {!intradayLoading && !intradayError && chartRows.length === 0 && (
+            <p className="py-8 text-center text-sm text-slate-500">
+              {intraday?.note ??
+                '표시할 분봉이 없습니다. 장 마감 후이거나 데이터 제공이 제한된 종목일 수 있습니다.'}
+            </p>
+          )}
+          {chartRows.length > 0 && (
+            <div className="h-64 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartRows} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="livePriceFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={chartStroke} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={chartStroke} stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                  <XAxis
+                    dataKey="t"
+                    tick={{ fill: '#64748b', fontSize: 10 }}
+                    tickMargin={6}
+                    minTickGap={28}
+                    tickFormatter={(v) =>
+                      new Intl.DateTimeFormat('ko-KR', {
+                        timeZone: intraday?.timezone ?? undefined,
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        hourCycle: 'h23',
+                      }).format(new Date(String(v)))
+                    }
+                  />
+                  <YAxis
+                    domain={chartDomain}
+                    width={market === 'kr' ? 52 : 56}
+                    tick={{ fill: '#64748b', fontSize: 10 }}
+                    tickFormatter={(v) =>
+                      market === 'kr'
+                        ? `${Math.round(Number(v)).toLocaleString('ko-KR')}`
+                        : `$${Number(v).toFixed(2)}`
+                    }
+                  />
+                  <Tooltip
+                    content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null
+                      const row = payload[0].payload as { t: string; c: number }
+                      const tLabel = new Intl.DateTimeFormat('ko-KR', {
+                        timeZone: intraday?.timezone ?? undefined,
+                        month: 'numeric',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hourCycle: 'h23',
+                      }).format(new Date(row.t))
+                      return (
+                        <div className="rounded-lg border border-slate-600 bg-slate-950/95 px-3 py-2 text-xs shadow-lg">
+                          <p className="text-slate-400">{tLabel}</p>
+                          <p className="mt-1 font-semibold tabular-nums text-white">
+                            {formatPrice(row.c, market)}
+                          </p>
+                        </div>
+                      )
+                    }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="c"
+                    stroke={chartStroke}
+                    strokeWidth={1.5}
+                    fill="url(#livePriceFill)"
+                    isAnimationActive={false}
+                    dot={false}
+                    activeDot={{ r: 3, fill: chartStroke }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+          {intradayLoading && chartRows.length === 0 && !intradayError && (
+            <div className="h-64 animate-pulse rounded-xl bg-slate-800/50" aria-hidden />
+          )}
+        </div>
       </div>
 
       <p className="text-[11px] leading-relaxed text-slate-500">
-        호가·체결 정보는 제3자(야후 파이낸스) 지연 시세이며, 증권사 실시간 주문창과 다를 수 있습니다. 투자 판단 및 주문은 반드시 본인 책임 하에 이용하시기 바랍니다.
+        호가·체결·분봉은 한국투자증권 Open API로 조회한 값이며, HTS·MTS 실시간 창과 시각·가격이 다를 수 있습니다. 투자
+        판단 및 주문은 반드시 본인 책임 하에 이용하시기 바랍니다.
       </p>
     </div>
   )

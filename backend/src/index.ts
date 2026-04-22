@@ -58,6 +58,8 @@ const KIS_URL_BASE = (process.env.KIS_URL_BASE || 'https://openapi.koreainvestme
 const KIS_TIMEOUT_MS = Math.max(2000, Number(process.env.KIS_TIMEOUT_MS ?? 10000))
 const KIS_RETRY_MAX_ATTEMPTS = Math.min(5, Math.max(1, Number(process.env.KIS_RETRY_MAX_ATTEMPTS ?? 3)))
 const KIS_RETRY_BASE_MS = Math.max(100, Number(process.env.KIS_RETRY_BASE_MS ?? 350))
+/** KIS 데이터 REST 호출 최소 간격(ms). 기본 220ms ~= 초당 4~5건 */
+const KIS_DATA_MIN_INTERVAL_MS = Math.max(120, Number(process.env.KIS_DATA_MIN_INTERVAL_MS ?? 220))
 
 app.use(cors())
 app.use(express.json())
@@ -805,10 +807,20 @@ const predictCache = new Map<string, CacheEntry<Record<string, unknown>>>()
 const fxCache = new Map<string, CacheEntry<{ rate: number; asOf: string }>>()
 /** 야후 quote 단건 폴링 완화(프론트 실시간 현황용) */
 const quoteLiveCache = new Map<string, { payload: Record<string, unknown>; cachedAt: number }>()
-const QUOTE_LIVE_CACHE_TTL_MS = 5000
+/** 실시간 시세 API 캐시 — KIS 부하 완화(프론트 1초 폴링 시 약간 짧게 두어 갱신 빈도 확보) */
+const QUOTE_LIVE_CACHE_TTL_MS = Math.max(0, Number(process.env.QUOTE_LIVE_CACHE_TTL_MS ?? 800))
+/** 분봉 차트(실시간 현황 페이지) — 야후 호출 부하 완화 */
+const intradayLiveCache = new Map<string, { payload: Record<string, unknown>; cachedAt: number }>()
+const INTRADAY_CHART_CACHE_TTL_MS = 20_000
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
 const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
+const KIS_TOKEN_REDIS_KEY = 'kis:oauth:token'
 let kisTokenPromise: Promise<string> | null = null
+/** KIS 토큰 발급 제한(예: EGW00133) 방지를 위한 로컬 쿨다운 */
+let kisTokenRetryNotBeforeMs = 0
+/** 데이터 API TPS 초과(EGW00201) 방지를 위한 전역 직렬화 게이트 */
+let kisDataRequestQueue: Promise<void> = Promise.resolve()
+let kisDataLastRequestAtMs = 0
 let sentimentApiBackoffUntil = 0
 const redisClient = redisUrl ? createClient({ url: redisUrl }) : null
 if (redisClient) {
@@ -1006,6 +1018,33 @@ function minutesSinceMidnightInTz(iso: string, tz: string): number {
   return h * 60 + m
 }
 
+/** 정규장 구간에서 가장 최근 봉이 속한 거래일만 남김(야후 말미 봉이 장전이면 빈 배열 방지) */
+function filterIntradayQuotesToLastSession(
+  sorted: Array<{ date: Date; close: number }>,
+  ticker: string,
+): Array<{ date: Date; close: number }> {
+  if (!sorted.length) return []
+  const tz = chartMarketTimezone(ticker)
+  const isKr = tz === 'Asia/Seoul'
+  const openMin = isKr ? 9 * 60 : 9 * 60 + 30
+  const closeMin = isKr ? 15 * 60 + 30 : 16 * 60
+  let sessionYmd: string | null = null
+  for (let i = sorted.length - 1; i >= 0; i -= 1) {
+    const row = sorted[i]
+    const mins = minutesSinceMidnightInTz(row.date.toISOString(), tz)
+    if (mins >= openMin && mins <= closeMin) {
+      sessionYmd = ymdInTimeZoneLabel(row.date, tz)
+      break
+    }
+  }
+  if (!sessionYmd) return []
+  return sorted.filter((row) => {
+    if (ymdInTimeZoneLabel(row.date, tz) !== sessionYmd) return false
+    const mins = minutesSinceMidnightInTz(row.date.toISOString(), tz)
+    return mins >= openMin && mins <= closeMin
+  })
+}
+
 function ymdToCompact(ymd: string): string {
   return ymd.replace(/-/g, '')
 }
@@ -1023,6 +1062,52 @@ function isKisRetryableErrorMessage(message: string): boolean {
   )
 }
 
+async function awaitKisDataRateSlot(): Promise<void> {
+  const prev = kisDataRequestQueue
+  let release!: () => void
+  kisDataRequestQueue = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await prev
+  try {
+    const now = Date.now()
+    const waitMs = kisDataLastRequestAtMs + KIS_DATA_MIN_INTERVAL_MS - now
+    if (waitMs > 0) await sleep(waitMs)
+    kisDataLastRequestAtMs = Date.now()
+  } finally {
+    release()
+  }
+}
+
+async function fetchKisDataWithRetry(url: string, init: RequestInit, label: string): Promise<globalThis.Response> {
+  let lastError: Error | null = null
+  for (let attempt = 1; attempt <= KIS_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await awaitKisDataRateSlot()
+      const response = await fetch(url, init)
+      if (response.ok) return response
+      const body = await response.text()
+      const retryable =
+        response.status === 429 || response.status === 500 || response.status === 503 || isKisRetryableErrorMessage(body)
+      if (!retryable || attempt >= KIS_RETRY_MAX_ATTEMPTS) {
+        throw new Error(`${label} HTTP ${response.status}: ${body}`)
+      }
+      const waitMs = KIS_RETRY_BASE_MS * 2 ** (attempt - 1)
+      await sleep(waitMs)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      lastError = err instanceof Error ? err : new Error(message)
+      const retryable = isKisRetryableErrorMessage(message)
+      if (!retryable || attempt >= KIS_RETRY_MAX_ATTEMPTS) {
+        throw lastError
+      }
+      const waitMs = KIS_RETRY_BASE_MS * 2 ** (attempt - 1)
+      await sleep(waitMs)
+    }
+  }
+  throw lastError ?? new Error(`${label} failed`)
+}
+
 async function getKisAccessToken(): Promise<string> {
   if (!KIS_APP_KEY || !KIS_APP_SECRET) {
     throw new Error('KIS_APP_KEY/KIS_APP_SECRET is not configured')
@@ -1030,6 +1115,22 @@ async function getKisAccessToken(): Promise<string> {
   const now = Date.now()
   if (kisTokenCache.token && now < kisTokenCache.expiresAtMs) {
     return kisTokenCache.token
+  }
+  const redisCached = await getRedisJson<{ token?: string; expiresAtMs?: number }>(KIS_TOKEN_REDIS_KEY)
+  if (
+    redisCached &&
+    typeof redisCached.token === 'string' &&
+    redisCached.token &&
+    typeof redisCached.expiresAtMs === 'number' &&
+    now < redisCached.expiresAtMs
+  ) {
+    kisTokenCache.token = redisCached.token
+    kisTokenCache.expiresAtMs = redisCached.expiresAtMs
+    return redisCached.token
+  }
+  if (now < kisTokenRetryNotBeforeMs) {
+    const waitSec = Math.ceil((kisTokenRetryNotBeforeMs - now) / 1000)
+    throw new Error(`KIS token cooldown in progress. retry after ${waitSec}s`)
   }
   if (kisTokenPromise) {
     return kisTokenPromise
@@ -1047,12 +1148,31 @@ async function getKisAccessToken(): Promise<string> {
         signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
       })
       if (!response.ok) {
-        throw new Error(`KIS token error: ${response.status} ${await response.text()}`)
+        const body = await response.text()
+        if (response.status === 403 && body.includes('EGW00133')) {
+          /** 안내 메시지 기준 1분당 1회 제한 + 안전 여유 */
+          kisTokenRetryNotBeforeMs = Date.now() + 65_000
+        }
+        throw new Error(`KIS token error: ${response.status} ${body}`)
       }
-      const json = (await response.json()) as { access_token?: string }
+      const json = (await response.json()) as { access_token?: string; expires_in?: number | string }
       if (!json.access_token) throw new Error('KIS token missing in response')
+      const expiresInSecRaw =
+        typeof json.expires_in === 'number'
+          ? json.expires_in
+          : typeof json.expires_in === 'string'
+            ? Number(json.expires_in)
+            : NaN
+      const expiresInSec = Number.isFinite(expiresInSecRaw) && expiresInSecRaw > 120 ? expiresInSecRaw : 24 * 60 * 60
+      /** 만료 직전 실패를 피하려고 60초 여유를 둠 */
       kisTokenCache.token = json.access_token
-      kisTokenCache.expiresAtMs = Date.now() + 1000 * 60 * 60 * 23
+      kisTokenCache.expiresAtMs = Date.now() + expiresInSec * 1000 - 60_000
+      await setRedisJson(
+        KIS_TOKEN_REDIS_KEY,
+        { token: kisTokenCache.token, expiresAtMs: kisTokenCache.expiresAtMs },
+        Math.max(60, Math.floor(expiresInSec - 60)),
+      )
+      kisTokenRetryNotBeforeMs = 0
       return json.access_token
     } finally {
       kisTokenPromise = null
@@ -1090,7 +1210,7 @@ async function fetchKisDailyClosesOnce(
         /** 0=수정주가(분할·배당 반영), 1=원주가 — 차트는 시계열 비교를 위해 수정주가 사용 */
         FID_ORG_ADJ_PRC: '0',
       })
-      const response = await fetch(
+      const response = await fetchKisDataWithRetry(
         `${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice?${params.toString()}`,
         {
           headers: {
@@ -1102,10 +1222,8 @@ async function fetchKisDailyClosesOnce(
           },
           signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
         },
+        'KIS daily-itemchartprice',
       )
-      if (!response.ok) {
-        throw new Error(`KIS price error: ${response.status} ${await response.text()}`)
-      }
       const payload = (await response.json()) as { rt_cd?: string; msg1?: string; output2?: Array<Record<string, string>> }
       if (payload.rt_cd !== '0' || !Array.isArray(payload.output2)) {
         throw new Error(`KIS price failed: ${payload.msg1 ?? 'unknown'}`)
@@ -1161,6 +1279,322 @@ async function fetchKisDailyCloses(ticker: string, fromYmd: string, toYmd: strin
     chunkStart = addCalendarDaysYmd(chunkEnd, 1)
   }
   return [...merged.values()].sort((a, b) => a.date.localeCompare(b.date))
+}
+
+function kisStrNum(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (typeof v !== 'string' || v.trim() === '') return null
+  const n = Number(v.replace(/,/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+
+function seoulHHMMSS(d: Date): string {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Seoul',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(d)
+  const h = parts.find((p) => p.type === 'hour')?.value ?? '00'
+  const m = parts.find((p) => p.type === 'minute')?.value ?? '00'
+  const s = parts.find((p) => p.type === 'second')?.value ?? '00'
+  return `${h}${m}${s}`
+}
+
+function hhmmssMinusOneMinute(hhmmss: string): string {
+  const pad = (n: number) => (n < 10 ? `0${n}` : String(n))
+  const h = Number(hhmmss.slice(0, 2))
+  const m = Number(hhmmss.slice(2, 4))
+  const s = Number(hhmmss.slice(4, 6))
+  if (![h, m, s].every((x) => Number.isFinite(x))) return '090000'
+  let total = h * 3600 + m * 60 + s - 60
+  if (total < 0) total = 0
+  const nh = Math.floor(total / 3600)
+  const nm = Math.floor((total % 3600) / 60)
+  const ns = total % 60
+  return `${pad(nh)}${pad(nm)}${pad(ns)}`
+}
+
+function krxMarketStateGuess(): string {
+  const { weekday, hour, minute } = getSeoulClock()
+  if (weekday === 'Sat' || weekday === 'Sun') return 'CLOSED'
+  const mins = hour * 60 + minute
+  if (mins >= 9 * 60 && mins <= 15 * 60 + 30) return 'REGULAR'
+  if (mins < 9 * 60) return 'PRE'
+  return 'POST'
+}
+
+function usMarketStateGuess(): string {
+  const { weekday, hour, minute } = getNewYorkClock()
+  if (weekday === 'Sat' || weekday === 'Sun') return 'CLOSED'
+  const mins = hour * 60 + minute
+  if (mins >= 9 * 60 + 30 && mins <= 16 * 60) return 'REGULAR'
+  if (mins < 9 * 60 + 30) return 'PRE'
+  return 'POST'
+}
+
+/** 국내주식 주식현재가 시세 output */
+async function fetchKisDomesticInquirePriceOutput(iscd: string): Promise<Record<string, unknown>> {
+  const token = await getKisAccessToken()
+  const params = new URLSearchParams({
+    FID_COND_MRKT_DIV_CODE: 'J',
+    FID_INPUT_ISCD: iscd,
+  })
+  const response = await fetchKisDataWithRetry(`${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-price?${params.toString()}`, {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      authorization: `Bearer ${token}`,
+      appkey: KIS_APP_KEY || '',
+      appsecret: KIS_APP_SECRET || '',
+      tr_id: 'FHKST01010100',
+      custtype: 'P',
+    },
+    signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+  }, 'KIS inquire-price')
+  const payload = (await response.json()) as { rt_cd?: string; msg1?: string; output?: Record<string, unknown> }
+  if (payload.rt_cd !== '0' || !payload.output || typeof payload.output !== 'object') {
+    throw new Error(`KIS inquire-price: ${payload.msg1 ?? 'unknown'}`)
+  }
+  return payload.output
+}
+
+/** 국내 호가(최우선 매도·매수) — 실패 시 null */
+async function fetchKisDomesticAskingOutput1(iscd: string): Promise<Record<string, unknown> | null> {
+  try {
+    const token = await getKisAccessToken()
+    const params = new URLSearchParams({
+      FID_COND_MRKT_DIV_CODE: 'J',
+      FID_INPUT_ISCD: iscd,
+    })
+    const response = await fetchKisDataWithRetry(
+      `${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn?${params.toString()}`,
+      {
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          authorization: `Bearer ${token}`,
+          appkey: KIS_APP_KEY || '',
+          appsecret: KIS_APP_SECRET || '',
+          tr_id: 'FHKST01010200',
+          custtype: 'P',
+        },
+        signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+      },
+      'KIS inquire-asking-price',
+    )
+    const payload = (await response.json()) as { rt_cd?: string; output1?: Record<string, unknown> }
+    if (payload.rt_cd !== '0' || !payload.output1 || typeof payload.output1 !== 'object') return null
+    return payload.output1
+  } catch (err) {
+    console.warn('[KIS] inquire-asking-price failed', err)
+    return null
+  }
+}
+
+function signedKisPrdyVrss(o: Record<string, unknown>): number | null {
+  const raw = kisStrNum(o.prdy_vrss)
+  if (raw == null) return null
+  const sign = String(o.prdy_vrss_sign ?? '').trim()
+  if (sign === '5' || sign === '4') return -Math.abs(raw)
+  if (sign === '2' || sign === '1') return Math.abs(raw)
+  return raw
+}
+
+async function fetchKisDomesticTimeItemchartpriceRows(
+  iscd: string,
+  fidInputHour1: string,
+): Promise<Array<Record<string, unknown>>> {
+  const token = await getKisAccessToken()
+  const params = new URLSearchParams({
+    FID_COND_MRKT_DIV_CODE: 'J',
+    FID_INPUT_ISCD: iscd,
+    FID_INPUT_HOUR_1: fidInputHour1,
+    FID_PW_DATA_INCU_YN: 'Y',
+    FID_ETC_CLS_CODE: '',
+  })
+  const response = await fetchKisDataWithRetry(
+    `${KIS_URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice?${params.toString()}`,
+    {
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        authorization: `Bearer ${token}`,
+        appkey: KIS_APP_KEY || '',
+        appsecret: KIS_APP_SECRET || '',
+        tr_id: 'FHKST03010200',
+        custtype: 'P',
+      },
+      signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+    },
+    'KIS inquire-time-itemchartprice',
+  )
+  const payload = (await response.json()) as { rt_cd?: string; msg1?: string; output2?: unknown }
+  if (payload.rt_cd !== '0' || !Array.isArray(payload.output2)) {
+    throw new Error(`KIS time-itemchartprice: ${payload.msg1 ?? 'unknown'}`)
+  }
+  return payload.output2.filter((r): r is Record<string, unknown> => r != null && typeof r === 'object')
+}
+
+/** 당일 분봉(최대 30건×반복) — KIS 당일분봉 API 규격 */
+async function fetchKisDomesticIntradayPoints(iscd: string): Promise<{ points: Array<{ t: string; c: number }>; sessionDate: string | null }> {
+  const merged = new Map<string, number>()
+  let hourCursor = seoulHHMMSS(new Date())
+  let prevEarliest: string | null = null
+  for (let page = 0; page < 48; page += 1) {
+    const rows = await fetchKisDomesticTimeItemchartpriceRows(iscd, hourCursor)
+    if (!rows.length) break
+    const times: string[] = []
+    for (const row of rows) {
+      const dateCompact = String(row.stck_bsop_date ?? '').replace(/\D/g, '')
+      const hhmmss = String(row.stck_cntg_hour ?? '')
+        .replace(/\D/g, '')
+        .padStart(6, '0')
+      if (dateCompact.length !== 8) continue
+      const close = kisStrNum(row.stck_prpr)
+      if (close == null) continue
+      const iso = `${dateCompact.slice(0, 4)}-${dateCompact.slice(4, 6)}-${dateCompact.slice(6, 8)}T${hhmmss.slice(0, 2)}:${hhmmss.slice(2, 4)}:${hhmmss.slice(4, 6)}+09:00`
+      merged.set(iso, close)
+      times.push(hhmmss)
+    }
+    if (!times.length) break
+    const earliest = times.reduce((a, b) => (a < b ? a : b))
+    if (earliest === prevEarliest) break
+    prevEarliest = earliest
+    const nextCursor = hhmmssMinusOneMinute(earliest)
+    if (nextCursor === hourCursor) break
+    hourCursor = nextCursor
+    if (earliest <= '090100') break
+    await sleep(Math.max(80, Math.floor(KIS_DATA_MIN_INTERVAL_MS / 2)))
+  }
+  const points = [...merged.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([t, c]) => ({ t, c }))
+  const sessionDate = points.length > 0 ? points[points.length - 1].t.slice(0, 10) : null
+  return { points, sessionDate }
+}
+
+async function fetchKisOverseasPriceOutput(
+  excd: string,
+  symb: string,
+): Promise<Record<string, unknown> | null> {
+  const token = await getKisAccessToken()
+  const params = new URLSearchParams({ AUTH: '', EXCD: excd, SYMB: symb })
+  const response = await fetchKisDataWithRetry(`${KIS_URL_BASE}/uapi/overseas-price/v1/quotations/price?${params.toString()}`, {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      authorization: `Bearer ${token}`,
+      appkey: KIS_APP_KEY || '',
+      appsecret: KIS_APP_SECRET || '',
+      tr_id: 'HHDFS00000300',
+      custtype: 'P',
+    },
+    signal: AbortSignal.timeout(KIS_TIMEOUT_MS),
+  }, 'KIS overseas-price')
+  const payload = (await response.json()) as { rt_cd?: string; output?: Record<string, unknown> }
+  if (payload.rt_cd !== '0' || !payload.output || typeof payload.output !== 'object') return null
+  return payload.output
+}
+
+function pickOverseasNum(o: Record<string, unknown>, keys: string[]): number | null {
+  for (const k of keys) {
+    const n = kisStrNum(o[k])
+    if (n != null) return n
+  }
+  return null
+}
+
+async function buildKisLiveQuoteDomestic(tickerKey: string, iscd: string): Promise<Record<string, unknown>> {
+  const o = await fetchKisDomesticInquirePriceOutput(iscd)
+  const ask1 = await fetchKisDomesticAskingOutput1(iscd)
+  const name =
+    typeof o.hts_kor_isnm === 'string'
+      ? o.hts_kor_isnm
+      : typeof o.bstp_kor_isnm === 'string'
+        ? o.bstp_kor_isnm
+        : null
+  let bid: number | null = null
+  let ask: number | null = null
+  let bidSize: number | null = null
+  let askSize: number | null = null
+  if (ask1) {
+    bid = kisStrNum(ask1.bidp1)
+    ask = kisStrNum(ask1.askp1)
+    bidSize = kisStrNum(ask1.bidp_rsqn1)
+    askSize = kisStrNum(ask1.askp_rsqn1)
+    if (bid === 0) bid = null
+    if (ask === 0) ask = null
+    if (bidSize === 0) bidSize = null
+    if (askSize === 0) askSize = null
+  }
+  return {
+    symbol: tickerKey,
+    shortName: name,
+    longName: name,
+    fullExchangeName: typeof o.rprs_mrkt_kor_name === 'string' ? o.rprs_mrkt_kor_name : 'KRX',
+    exchangeTimezoneName: 'Asia/Seoul',
+    currency: 'KRW',
+    marketState: krxMarketStateGuess(),
+    regularMarketPrice: kisStrNum(o.stck_prpr),
+    regularMarketChange: signedKisPrdyVrss(o),
+    regularMarketChangePercent: kisStrNum(o.prdy_ctrt),
+    regularMarketPreviousClose: kisStrNum(o.stck_sdpr),
+    regularMarketOpen: kisStrNum(o.stck_oprc),
+    regularMarketDayHigh: kisStrNum(o.stck_hgpr),
+    regularMarketDayLow: kisStrNum(o.stck_lwpr),
+    regularMarketVolume: kisStrNum(o.acml_vol),
+    bid,
+    ask,
+    bidSize,
+    askSize,
+    asOf: new Date().toISOString(),
+    dataSource: 'kis',
+  }
+}
+
+/** 미국 등 해외 상장(심볼만) — 거래소 코드 순으로 조회 */
+async function buildKisLiveQuoteOverseas(tickerKey: string, symb: string): Promise<Record<string, unknown> | null> {
+  const US_EX = ['NASD', 'NYSE', 'AMEX'] as const
+  for (const excd of US_EX) {
+    const o = await fetchKisOverseasPriceOutput(excd, symb)
+    if (!o) continue
+    const last = pickOverseasNum(o, ['last', 'ovrs_nmix_prpr', 'stck_prpr'])
+    if (last == null) continue
+    const base = pickOverseasNum(o, ['base', 'pddy_clpr_prpr', 'ovrs_nmix_prdy_clpr', 'prdy_clpr'])
+    const chg =
+      pickOverseasNum(o, ['diff', 'prdy_vrss', 'ovrs_nmix_prdy_vrss']) ?? (base != null ? last - base : null)
+    const chgPct = pickOverseasNum(o, ['tday_risefall_rate', 'prdy_ctrt', 'ovrs_exhg_chg_rt'])
+    const nm =
+      typeof o.ovrs_excg_name === 'string'
+        ? o.ovrs_excg_name
+        : typeof o.hts_kor_isnm === 'string'
+          ? o.hts_kor_isnm
+          : typeof o.stck_name === 'string'
+            ? o.stck_name
+            : null
+    return {
+      symbol: tickerKey,
+      shortName: nm,
+      longName: nm,
+      fullExchangeName: excd,
+      exchangeTimezoneName: 'America/New_York',
+      currency: 'USD',
+      marketState: usMarketStateGuess(),
+      regularMarketPrice: last,
+      regularMarketChange: chg,
+      regularMarketChangePercent: chgPct,
+      regularMarketPreviousClose: base,
+      regularMarketOpen: pickOverseasNum(o, ['open', 'ovrs_nmix_oprc']),
+      regularMarketDayHigh: pickOverseasNum(o, ['high', 'ovrs_nmix_hgpr']),
+      regularMarketDayLow: pickOverseasNum(o, ['low', 'ovrs_nmix_lwpr']),
+      regularMarketVolume: pickOverseasNum(o, ['tvol', 'acml_vol', 'cntg_vol']),
+      bid: pickOverseasNum(o, ['bidp', 'bid', 'ovrs_nmix_bidp']),
+      ask: pickOverseasNum(o, ['askp', 'ask', 'ovrs_nmix_askp']),
+      bidSize: pickOverseasNum(o, ['bidp_rsqn', 'bidp_rsqn1']),
+      askSize: pickOverseasNum(o, ['askp_rsqn', 'askp_rsqn1']),
+      asOf: new Date().toISOString(),
+      dataSource: 'kis',
+    }
+  }
+  return null
 }
 
 async function fetchYahooDailyCloses(ticker: string, period1: Date, period2: Date): Promise<Array<{ date: string; close: number }>> {
@@ -2120,6 +2554,7 @@ app.get('/', (_req: Request, res: Response) => {
     name: 'AlphaPulse 백엔드',
     endpoints: [
       '/api/quote/:ticker',
+      '/api/quote/:ticker/intraday',
       '/api/stock/:ticker',
       '/api/fx/usd-krw',
       '/api/news',
@@ -2143,42 +2578,99 @@ app.get('/api/quote/:ticker', async (req: Request, res: Response) => {
   if (hit && now - hit.cachedAt < QUOTE_LIVE_CACHE_TTL_MS) {
     return res.json(hit.payload)
   }
-  const num = (v: unknown): number | null =>
-    typeof v === 'number' && Number.isFinite(v) ? (v as number) : null
+  if (!KIS_APP_KEY || !KIS_APP_SECRET) {
+    return res.status(503).json({
+      error: '한국투자증권 실시간 시세를 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.',
+    })
+  }
   try {
-    const raw = await yahooFinance.quote(ticker)
-    const row = Array.isArray(raw) ? raw[0] : raw
-    if (!row || typeof row !== 'object') {
-      return res.status(404).json({ error: '시세를 찾을 수 없습니다.' })
-    }
-    const r = row as Record<string, unknown>
-    const payload = {
-      symbol: String(r.symbol ?? key),
-      shortName: typeof r.shortName === 'string' ? r.shortName : null,
-      longName: typeof r.longName === 'string' ? r.longName : null,
-      fullExchangeName: typeof r.fullExchangeName === 'string' ? r.fullExchangeName : null,
-      exchangeTimezoneName: typeof r.exchangeTimezoneName === 'string' ? r.exchangeTimezoneName : null,
-      currency: typeof r.currency === 'string' ? r.currency : null,
-      marketState: typeof r.marketState === 'string' ? r.marketState : null,
-      regularMarketPrice: num(r.regularMarketPrice),
-      regularMarketChange: num(r.regularMarketChange),
-      regularMarketChangePercent: num(r.regularMarketChangePercent),
-      regularMarketPreviousClose: num(r.regularMarketPreviousClose),
-      regularMarketOpen: num(r.regularMarketOpen),
-      regularMarketDayHigh: num(r.regularMarketDayHigh),
-      regularMarketDayLow: num(r.regularMarketDayLow),
-      regularMarketVolume: num(r.regularMarketVolume),
-      bid: num(r.bid),
-      ask: num(r.ask),
-      bidSize: num(r.bidSize),
-      askSize: num(r.askSize),
-      asOf: new Date().toISOString(),
+    let payload: Record<string, unknown>
+    if (isKoreanSixDigitEquity(ticker)) {
+      const iscd = ticker.toUpperCase().split('.')[0]
+      payload = await buildKisLiveQuoteDomestic(key, iscd)
+    } else if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
+      const symb = ticker.toUpperCase()
+      const built = await buildKisLiveQuoteOverseas(key, symb)
+      if (!built) {
+        return res.status(404).json({ error: '해외 종목 시세를 한국투자증권에서 찾지 못했습니다.' })
+      }
+      payload = built
+    } else {
+      return res.status(400).json({
+        error: '한국투자증권 시세는 국내 6자리·코스피/코스닥(예: 005930.KS) 또는 미국 티커(예: AAPL)만 지원합니다.',
+      })
     }
     quoteLiveCache.set(key, { payload, cachedAt: now })
     res.json(payload)
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: '실시간 시세를 가져오지 못했습니다.' })
+  }
+})
+
+/** 당일 1분봉 — 국내: KIS 당일분봉 반복 조회 / 미국: REST 분봉 미제공으로 빈 배열 */
+app.get('/api/quote/:ticker/intraday', async (req: Request, res: Response) => {
+  const tickerRaw = normalizeSingle(req.params.ticker)?.trim()
+  if (!tickerRaw) {
+    return res.status(400).json({ error: '티커(symbol) 값이 필요합니다.' })
+  }
+  const ticker = tickerRaw
+  const key = ticker.toUpperCase()
+  const now = Date.now()
+  const hit = intradayLiveCache.get(key)
+  if (hit && now - hit.cachedAt < INTRADAY_CHART_CACHE_TTL_MS) {
+    return res.json(hit.payload)
+  }
+  if (!KIS_APP_KEY || !KIS_APP_SECRET) {
+    return res.status(503).json({
+      error: '한국투자증권 분봉을 쓰려면 KIS_APP_KEY·KIS_APP_SECRET 환경 변수를 설정하세요.',
+    })
+  }
+  const tz = chartMarketTimezone(ticker)
+  try {
+    if (isKoreanSixDigitEquity(ticker)) {
+      const iscd = ticker.toUpperCase().split('.')[0]
+      const { points: rawPoints, sessionDate: rawSession } = await fetchKisDomesticIntradayPoints(iscd)
+      const withDates = rawPoints.map((p) => ({ date: new Date(p.t), close: p.c }))
+      const session = filterIntradayQuotesToLastSession(withDates, ticker)
+      const points = session.map((row) => ({
+        t: row.date.toISOString(),
+        c: row.close,
+      }))
+      const sessionDate =
+        points.length > 0 ? ymdInTimeZoneLabel(new Date(points[points.length - 1].t), tz) : rawSession
+      const payload = {
+        symbol: key,
+        timezone: tz,
+        interval: '1m' as const,
+        sessionDate,
+        points,
+        asOf: new Date().toISOString(),
+        dataSource: 'kis',
+      }
+      intradayLiveCache.set(key, { payload, cachedAt: now })
+      return res.json(payload)
+    }
+    if (/^[A-Z0-9.-]{1,20}$/i.test(ticker) && !isKoreanTicker(ticker)) {
+      const payload = {
+        symbol: key,
+        timezone: tz,
+        interval: '1m' as const,
+        sessionDate: null as string | null,
+        points: [] as Array<{ t: string; c: number }>,
+        asOf: new Date().toISOString(),
+        dataSource: 'kis',
+        note: '미국 등 해외 종목의 당일 분봉은 한국투자증권 REST로는 제공되지 않습니다. 국내 종목은 분봉이 표시됩니다.',
+      }
+      intradayLiveCache.set(key, { payload, cachedAt: now })
+      return res.json(payload)
+    }
+    return res.status(400).json({
+      error: '분봉은 국내 6자리·코스피/코스닥(예: 005930.KS)만 지원합니다.',
+    })
+  } catch (err) {
+    console.error('intraday chart', err)
+    res.status(500).json({ error: '분봉 차트 데이터를 가져오지 못했습니다.' })
   }
 })
 
