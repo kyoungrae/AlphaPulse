@@ -186,7 +186,7 @@ docker compose up -d --no-build
 
 ## 11. Blueprint Lab 스타일: 맥에서 개별 빌드 → tar 전송 → docker으로 교체
 
-다른 프로젝트에서 쓰던 것처럼 **`docker build`를 이미지마다 명시**하고, **tar로 저장한 뒤** 운영 PC로 옮긴 뒤, **`docker load` → `docker compose up -d --no-build`** 한 번으로 띄우는 방식을 권장합니다(아래 §11.3). 긴 `docker run` 두 줄을 수동으로 칠 필요가 없습니다.
+<!-- 다른 프로젝트에서 쓰던 것처럼 **`docker build`를 이미지마다 명시**하고, **tar로 저장한 뒤** 운영 PC로 옮긴 뒤, **`docker load` → `docker compose up -d --no-build`** 한 번으로 띄우는 방식을 권장합니다(아래 §11.3). 긴 `docker run` 두 줄을 수동으로 칠 필요가 없습니다.
 
 ### AlphaPulse와 Blueprint의 차이(한 줄)
 
@@ -195,14 +195,15 @@ docker compose up -d --no-build
 | `Dockerfile.frontend` + `server/Dockerfile` → 이미지 2개 | **프론트 빌드 결과가 API 이미지 안에 포함** (`Dockerfile` 멀티 스테이지). 별도 Nginx 프론트 이미지는 없음 |
 | 프론트 / 백엔드 | **api**(Node + 정적 UI) + **predict**(Python FastAPI) **이미지 2개** |
 
-즉, **“프론트 tar + 백엔드 tar”가 아니라 “predict tar + api tar”** 두 장이 됩니다.
+즉, **“프론트 tar + 백엔드 tar”가 아니라 “predict tar + api tar”** 두 장이 됩니다. -->
 
 ### 11.1 1단계: 로컬(Mac)에서 이미지 재빌드 및 추출
 
-저장소 루트에서 태그는 `docker-compose.yml`과 맞춥니다(`alphapulse/predict:local`, `alphapulse/api:local`).
+<!-- 저장소 루트에서 태그는 `docker-compose.yml`과 맞춥니다(`alphapulse/predict:local`, `alphapulse/api:local`). -->
 
 ```bash
-cd ~/Documents/coding/AlphaPulse   # 본인 경로로 변경
+# 본인 경로로 변경
+cd ~/Documents/coding/AlphaPulse   
 
 # predict (컨텍스트는 ai_model/)
 docker build --platform linux/amd64 -t alphapulse/predict:local -f ai_model/Dockerfile ./ai_model
@@ -216,19 +217,19 @@ docker save -o alphapulse-api.tar alphapulse/api:local
 
 ```
 
-한 파일로 묶고 싶으면:
+<!-- 한 파일로 묶고 싶으면: -->
 
-```bash
-# docker save -o alphapulse-images.tar alphapulse/predict:local alphapulse/api:local
+<!-- ```bash -->
+<!-- # docker save -o alphapulse-images.tar alphapulse/predict:local alphapulse/api:local -->
 
-```
+<!-- ``` -->
 
 ### 11.2 2단계: 운영 서버로 전송
 
-**이미지 tar 두 개**와 함께, 같은 폴더에서 Compose를 쓰려면 **`docker-compose.yml` 파일 하나**도 같이 복사하세요(저장소 루트에 있음, 용량 매우 작음).  
+<!-- **이미지 tar 두 개**와 함께, 같은 폴더에서 Compose를 쓰려면 **`docker-compose.yml` 파일 하나**도 같이 복사하세요(저장소 루트에 있음, 용량 매우 작음).  
 Firestore 등을 쓰려면 맥의 **`backend/.env`** 도 같은 구조로 두면 됩니다(`./backend/.env`).
 
-예시(포트·사용자·호스트·원격 경로는 환경에 맞게 바꿉니다).
+예시(포트·사용자·호스트·원격 경로는 환경에 맞게 바꿉니다). -->
 
 ```bash
 scp -P 22 alphapulse-predict.tar alphapulse-api.tar docker-compose.yml test@192.168.0.232:~/project/alphapulse/
@@ -238,12 +239,13 @@ scp -P 22 alphapulse-predict.tar alphapulse-api.tar docker-compose.yml test@192.
 
 ### 11.3 3단계: 서버(docker)에서 기존 컨테이너 교체
 
-**권장:** `docker-compose.yml`이 있는 디렉터리에서 **`docker load` 후 `docker compose up -d --no-build`** 만 실행합니다. 포트·`PREDICT_URL`·`env_file` 등은 YAML에 이미 정의되어 있습니다.
+<!-- **권장:** `docker-compose.yml`이 있는 디렉터리에서 **`docker load` 후 `docker compose up -d --no-build`** 만 실행합니다. 포트·`PREDICT_URL`·`env_file` 등은 YAML에 이미 정의되어 있습니다.
 
-예전에 **수동 `docker run`으로** `alphapulse-predict` / `alphapulse-api` 이름을 썼다면, 한 번 지운 뒤 Compose로 올립니다.
+예전에 **수동 `docker run`으로** `alphapulse-predict` / `alphapulse-api` 이름을 썼다면, 한 번 지운 뒤 Compose로 올립니다. -->
 
 ```bash
-cd ~/projects/alphapulse   # tar + docker-compose.yml 이 있는 폴더
+# tar + docker-compose.yml 이 있는 폴더
+cd ~/projects/alphapulse
 
 docker rm -f alphapulse-predict alphapulse-api
 
@@ -253,10 +255,10 @@ docker load -i alphapulse-api.tar
 docker compose up -d --no-build
 ```
 
-- `--no-build`: 방금 `load`한 이미지만 쓰고, Dockerfile로 다시 빌드하지 않습니다.
+<!-- - `--no-build`: 방금 `load`한 이미지만 쓰고, Dockerfile로 다시 빌드하지 않습니다.
 - **`backend/.env` 없이**도 기동할 수 있게 두었습니다(`env_file` optional). Firestore를 쓰려면 맥에서 복사한 `backend/.env`를 두면 자동 주입됩니다.
 - 서비스 이름은 Compose 기준 **`predict` / `api`** 입니다(예전 수동 이름 `alphapulse-*`와 다를 수 있음).
-
+ -->
 **대안(Compose 없이):** tar만 있는 PC에서는 예전처럼 긴 `docker run` 두 줄을 쓸 수 있지만, 유지보수가 불편하므로 **`docker-compose.yml`을 같이 두는 방식**을 권장합니다.
 
 ```bash
@@ -265,10 +267,10 @@ docker run -d --name alphapulse-predict --network alphapulse-network -p 8001:800
 docker run -d --name alphapulse-api --network alphapulse-network -p 4001:4001 -e NODE_ENV=production -e PORT=4001 -e PREDICT_URL=http://alphapulse-predict:8001 -e FRONTEND_DIST=/app/frontend/dist --restart unless-stopped alphapulse/api:local
 ```
 
-(위 `docker run`은 **사용자 정의 네트워크 `alphapulse-network`가 이미 있을 때**이며, Compose를 쓰면 네트워크 생성까지 포함되므로 일반적으로는 위 § 권장 절차만 쓰면 됩니다.)
+<!-- (위 `docker run`은 **사용자 정의 네트워크 `alphapulse-network`가 이미 있을 때**이며, Compose를 쓰면 네트워크 생성까지 포함되므로 일반적으로는 위 § 권장 절차만 쓰면 됩니다.)
 
 - **공인 IP·방화벽**에서는 TCP **4001** (필요 시 **8001**)을 열면 됩니다.
-- **Firebase JSON 파일 경로**를 `.env`에 쓰는 경우, 컨테이너 안 경로와 `docker-compose.yml`의 `volumes` 주석을 맞추세요(§5·§7).
+- **Firebase JSON 파일 경로**를 `.env`에 쓰는 경우, 컨테이너 안 경로와 `docker-compose.yml`의 `volumes` 주석을 맞추세요(§5·§7). -->
 
 ### 11.3.1 여전히 「Firestore 미설정」「예측 이력이 비어 있습니다」가 뜰 때
 
