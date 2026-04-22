@@ -811,7 +811,8 @@ const quoteLiveCache = new Map<string, { payload: Record<string, unknown>; cache
 const QUOTE_LIVE_CACHE_TTL_MS = Math.max(0, Number(process.env.QUOTE_LIVE_CACHE_TTL_MS ?? 800))
 /** 분봉 차트(실시간 현황 페이지) — 야후 호출 부하 완화 */
 const intradayLiveCache = new Map<string, { payload: Record<string, unknown>; cachedAt: number }>()
-const INTRADAY_CHART_CACHE_TTL_MS = 20_000
+/** 당일 분봉 API 캐시 — 프론트 1~2초 폴링 시 너무 길면 차트가 안 바뀌는 문제 방지 */
+const INTRADAY_CHART_CACHE_TTL_MS = Math.max(0, Number(process.env.INTRADAY_CHART_CACHE_TTL_MS ?? 1600))
 const backtestMemoryCache = new Map<string, CacheEntry<ReturnType<typeof runBacktest>>>()
 const kisTokenCache: { token: string | null; expiresAtMs: number } = { token: null, expiresAtMs: 0 }
 const KIS_TOKEN_REDIS_KEY = 'kis:oauth:token'

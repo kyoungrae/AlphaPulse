@@ -12,7 +12,8 @@ import { apiUrl } from '../apiBase'
 
 /** 호가·현재가 폴링 주기(ms). 백엔드 `QUOTE_LIVE_CACHE_TTL_MS`(기본 0.8s)보다 길게 두는 것을 권장 */
 const QUOTE_POLL_MS = 1000
-const INTRADAY_POLL_MS = 20_000
+/** 당일 분봉 폴링 — KIS 분봉은 페이지 연속 호출이 있어 1초보다 2초 쪽이 안전 */
+const INTRADAY_POLL_MS = 2000
 
 type SymbolItem = {
   symbol: string
@@ -272,7 +273,7 @@ export default function StockPrediction() {
       <div>
         <h2 className="text-2xl font-bold">종목 실시간 현황</h2>
         <p className="text-sm text-slate-400">
-          종목을 고르면 호가·현재가는 약 1초마다, 분봉 차트는 약 20초마다 갱신됩니다. 현재가가 반영되면서 곡선 끝이
+          종목을 고르면 호가·현재가는 약 1초마다, 당일 분봉 차트는 약 2초마다 갱신됩니다. 현재가가 반영되면서 곡선 끝이
           함께 움직입니다.
         </p>
       </div>
