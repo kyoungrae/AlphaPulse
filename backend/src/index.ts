@@ -186,6 +186,15 @@ const koreaSymbols: SymbolItem[] = [
   { symbol: '005930.KS', name: '삼성전자' },
   { symbol: '^KS200', name: 'KOSPI 200' },
   { symbol: '^KS11', name: 'KOSPI' },
+  { symbol: '226490.KS', name: 'KODEX 코스피' },
+  { symbol: '069500.KS', name: 'KODEX 200' },
+  { symbol: '102110.KS', name: 'TIGER 200' },
+  { symbol: '105190.KS', name: 'ACE 200' },
+  { symbol: '360750.KS', name: 'TIGER 미국S&P500' },
+  { symbol: '214980.KS', name: 'KODEX 미국S&P500선물인버스(H)' },
+  { symbol: '379800.KS', name: 'KODEX 미국S&P500TR' },
+  { symbol: '360200.KS', name: 'ACE 미국S&P500' },
+  { symbol: '133690.KS', name: 'TIGER 미국나스닥100' },
   { symbol: '114800.KS', name: 'KODEX 인버스' },
   { symbol: '252670.KS', name: 'KODEX 200선물인버스2X' },
   { symbol: '252710.KS', name: 'TIGER 200선물인버스2X' },
@@ -2389,6 +2398,23 @@ function symbolItemMatchesQuery(item: SymbolItem, queryRaw: string): boolean {
   return false
 }
 
+function isKoreanEtfSymbol(item: SymbolItem): boolean {
+  const text = `${item.name} ${item.nameKr ?? ''}`.toUpperCase()
+  return (
+    text.includes('ETF') ||
+    text.includes('KODEX') ||
+    text.includes('TIGER') ||
+    text.includes('ACE ') ||
+    text.includes('KOSEF') ||
+    text.includes('KBSTAR') ||
+    text.includes('ARIRANG') ||
+    text.includes('SOL ') ||
+    text.includes('TIMEFOLIO') ||
+    text.includes('HANARO') ||
+    text.includes('RISE ')
+  )
+}
+
 /** 미국 종목 API용 — 네트워크 대기 없이 즉시 반환(캐시·만료 캐시·fallback) */
 function getUsSymbolsSnapshot(): SymbolItem[] {
   if (cachedSp500?.data?.length) return cachedSp500.data
@@ -3649,6 +3675,20 @@ app.get('/api/symbols/sp500', async (req: Request, res: Response) => {
   }
 })
 
+app.get('/api/symbols/kr-etf', (req: Request, res: Response) => {
+  try {
+    const query = (normalizeSingle(req.query.q as string | string[] | undefined) ?? '').trim()
+    const limitRaw = Number(req.query.limit ?? 500)
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 2000) : 500
+    const source = Array.from(new Map(koreaSymbols.map((item) => [item.symbol, item])).values())
+    const filtered = source.filter((item) => isKoreanEtfSymbol(item) && symbolItemMatchesQuery(item, query))
+    return res.json({ market: 'kr', total: filtered.length, items: filtered.slice(0, limit) })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '국내 ETF 목록을 가져오지 못했습니다.' })
+  }
+})
+
 app.get('/api/symbols', async (req: Request, res: Response) => {
   try {
     const market = (normalizeSingle(req.query.market as string | string[] | undefined) ?? 'us').toLowerCase()
@@ -4071,6 +4111,10 @@ app.get('/api/trading/status', async (_req: Request, res: Response) => {
     console.error('[Trading] status', err)
     return res.status(500).json({ error: '계좌 정보를 가져오지 못했습니다.' })
   }
+})
+
+app.get('/api/trading/logs', (_req: Request, res: Response) => {
+  return res.json({ logs: autoTradeLogs.slice(0, 100) })
 })
 
 app.post('/api/trading/config', async (req: Request, res: Response) => {

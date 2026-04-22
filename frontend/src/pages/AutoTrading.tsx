@@ -1,5 +1,45 @@
-import { type ChangeEvent, useEffect, useState } from 'react'
+import { type ChangeEvent, useEffect, useMemo, useState } from 'react'
 import { apiUrl } from '../apiBase'
+
+type Market = 'us' | 'kr'
+type SymbolItem = { symbol: string; name: string; nameKr?: string }
+type SymbolResponse = { market: Market; total: number; items: SymbolItem[] }
+type WatchlistEntry = { symbol: string; market: Market; name?: string }
+type TradingAction = 'buy' | 'sell' | 'analyze' | 'buy_fail'
+type AutoTradeLog = {
+  id: number
+  time: string
+  action: TradingAction
+  symbol: string
+  name: string
+  qty: number
+  price: number
+  status: string
+}
+
+const WATCHLIST_STORAGE_KEY = 'alphapulse_watchlist_v1'
+
+function loadWatchlistFromStorage(): WatchlistEntry[] {
+  try {
+    const raw = localStorage.getItem(WATCHLIST_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((r): WatchlistEntry | null => {
+        const symbol = String(r?.symbol ?? '')
+          .trim()
+          .toUpperCase()
+        const market: Market = r?.market === 'kr' ? 'kr' : 'us'
+        const name = typeof r?.name === 'string' ? r.name : undefined
+        if (!symbol) return null
+        return { symbol, market, name }
+      })
+      .filter((v): v is WatchlistEntry => Boolean(v))
+  } catch {
+    return []
+  }
+}
 
 function formatAmountWithKoreanUnit(amount: number): string {
   const n = Math.max(0, Math.floor(amount))
@@ -14,15 +54,18 @@ function formatAmountWithKoreanUnit(amount: number): string {
   return `${parts.join(' ')}원`
 }
 
+function normalizeSymbol(value: string): string {
+  return value.trim().toUpperCase()
+}
+
 export default function AutoTrading() {
-  const tradableSymbolOptions = [
+  const fallbackTradableSymbolOptions = [
     { symbol: '122630.KS', label: 'KODEX 레버리지 (122630.KS)' },
     { symbol: '252710.KS', label: 'TIGER 200선물인버스2X (252710.KS)' },
-    { symbol: '360750.KS', label: 'TIGER 미국S&P500 (360750.KS)' },
-    { symbol: '214980.KS', label: 'KODEX 미국S&P500선물인버스(H) (214980.KS)' },
+    { symbol: '226490.KS', label: 'KODEX 코스피 (226490.KS)' },
     { symbol: '069500.KS', label: 'KODEX 200 (069500.KS)' },
+    { symbol: '105190.KS', label: 'ACE 200 (105190.KS)' },
     { symbol: '114800.KS', label: 'KODEX 인버스 (114800.KS)' },
-    { symbol: '005930.KS', label: '삼성전자 (005930.KS)' },
   ]
   const [isActive, setIsActive] = useState(false)
   const [aiTicker, setAiTicker] = useState('^KS200')
@@ -31,6 +74,16 @@ export default function AutoTrading() {
   const [symbolsLocked, setSymbolsLocked] = useState(true)
   const [threshold, setThreshold] = useState(60)
   const [tradeAmount, setTradeAmount] = useState(1_000_000)
+  const [tradableSymbolOptions, setTradableSymbolOptions] = useState(fallbackTradableSymbolOptions)
+  const [symbolPickerOpen, setSymbolPickerOpen] = useState(false)
+  const [symbolPickerTarget, setSymbolPickerTarget] = useState<'up' | 'down'>('up')
+  const [symbolPickerQuery, setSymbolPickerQuery] = useState('')
+  const [symbolPickerMarket, setSymbolPickerMarket] = useState<Market>('kr')
+  const [symbolPickerFavoritesOnly, setSymbolPickerFavoritesOnly] = useState(false)
+  const [symbolPickerItems, setSymbolPickerItems] = useState<SymbolItem[]>([])
+  const [symbolPickerLoading, setSymbolPickerLoading] = useState(false)
+  const [symbolPickerError, setSymbolPickerError] = useState<string | null>(null)
+  const [watchlist, setWatchlist] = useState<WatchlistEntry[]>(() => loadWatchlistFromStorage())
 
   const [accountInfo, setAccountInfo] = useState({
     totalAsset: 0,
@@ -51,52 +104,14 @@ export default function AutoTrading() {
   const aiTickerOptions = Object.entries(aiTickerNameMap).map(([value, label]) => ({ value, label }))
   const aiTickerLabel = aiTickerNameMap[aiTicker.trim().toUpperCase()] ?? '직접 입력 티커'
 
-  const currentSignal = {
-    date: '2026-04-22',
-    direction: 'Up',
-    probability: 73.2,
-    recommendedAction: 'KODEX 레버리지 매수',
-  }
-
-  const tradeLogs = [
-    {
-      id: 1,
-      time: '2026-04-21 09:01:12',
-      action: '매수',
-      symbol: '122630.KS',
-      name: 'KODEX 레버리지',
-      qty: 50,
-      price: 18_450,
-      status: '체결완료',
-    },
-    {
-      id: 2,
-      time: '2026-04-21 09:00:05',
-      action: '매도',
-      symbol: '252710.KS',
-      name: 'TIGER 200선물인버스2X',
-      qty: 210,
-      price: 2_130,
-      status: '체결완료',
-    },
-    {
-      id: 3,
-      time: '2026-04-20 15:25:00',
-      action: '분석',
-      symbol: 'KOSPI200',
-      name: 'AI 예측',
-      qty: 0,
-      price: 0,
-      status: '상승(68%) 예측',
-    },
-  ]
+  const [tradeLogs, setTradeLogs] = useState<AutoTradeLog[]>([])
 
   useEffect(() => {
     let isMounted = true
-    const fetchStatus = async () => {
+    const fetchAllData = async () => {
       try {
-        const res = await fetch(apiUrl('/api/trading/status'))
-        const data = (await res.json()) as {
+        const statusRes = await fetch(apiUrl('/api/trading/status'))
+        const statusData = (await statusRes.json()) as {
           config?: {
             isActive?: boolean
             aiTicker?: string
@@ -106,12 +121,13 @@ export default function AutoTrading() {
             threshold?: number
             tradeAmount?: number
           }
+          logs?: AutoTradeLog[]
           balance?: { cash?: number }
           error?: string
         }
-        if (!res.ok) throw new Error(data.error || '연결 실패')
+        if (!statusRes.ok) throw new Error(statusData.error || '연결 실패')
         if (!isMounted) return
-        const cash = Number(data.balance?.cash ?? 0)
+        const cash = Number(statusData.balance?.cash ?? 0)
         setAccountInfo({
           totalAsset: Number.isFinite(cash) ? cash : 0,
           cash: Number.isFinite(cash) ? cash : 0,
@@ -119,13 +135,21 @@ export default function AutoTrading() {
           loading: false,
           error: null,
         })
-        setIsActive(Boolean(data.config?.isActive))
-        setAiTicker(data.config?.aiTicker ?? '^KS200')
-        setUpSymbol(data.config?.upSymbol ?? '122630.KS')
-        setDownSymbol(data.config?.downSymbol ?? '252710.KS')
-        setSymbolsLocked(data.config?.symbolsLocked ?? true)
-        setThreshold(Math.max(50, Math.min(99, Number(data.config?.threshold ?? 60))))
-        setTradeAmount(Math.max(1, Number(data.config?.tradeAmount ?? 1_000_000)))
+        setIsActive(Boolean(statusData.config?.isActive))
+        setAiTicker(statusData.config?.aiTicker ?? '^KS200')
+        setUpSymbol(normalizeSymbol(statusData.config?.upSymbol ?? '122630.KS'))
+        setDownSymbol(normalizeSymbol(statusData.config?.downSymbol ?? '252710.KS'))
+        setSymbolsLocked(statusData.config?.symbolsLocked ?? true)
+        setThreshold(Math.max(50, Math.min(99, Number(statusData.config?.threshold ?? 60))))
+        setTradeAmount(Math.max(1, Number(statusData.config?.tradeAmount ?? 1_000_000)))
+        setTradeLogs(Array.isArray(statusData.logs) ? statusData.logs : [])
+
+        const logsRes = await fetch(apiUrl('/api/trading/logs'))
+        if (!isMounted) return
+        if (logsRes.ok) {
+          const logsData = (await logsRes.json()) as { logs?: AutoTradeLog[] }
+          setTradeLogs(Array.isArray(logsData.logs) ? logsData.logs : [])
+        }
       } catch (err) {
         if (!isMounted) return
         setAccountInfo((prev) => ({
@@ -136,11 +160,124 @@ export default function AutoTrading() {
         }))
       }
     }
-    void fetchStatus()
+    void fetchAllData()
+    const timer = window.setInterval(() => {
+      void fetchAllData()
+    }, 30_000)
     return () => {
       isMounted = false
+      window.clearInterval(timer)
     }
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const fetchEtfSymbols = async () => {
+      try {
+        const res = await fetch(apiUrl('/api/symbols/kr-etf?limit=2000'))
+        const data = (await res.json()) as {
+          items?: Array<{ symbol?: string; name?: string; nameKr?: string }>
+          error?: string
+        }
+        if (!res.ok) throw new Error(data.error || 'ETF 목록 조회 실패')
+        if (cancelled) return
+        const items = (data.items ?? [])
+          .map((item) => {
+            const symbol = String(item.symbol ?? '').trim().toUpperCase()
+            const name = String(item.nameKr ?? item.name ?? '').trim() || symbol
+            return { symbol, label: `${name} (${symbol})` }
+          })
+          .filter((item) => item.symbol.length > 0)
+        if (items.length > 0) {
+          const merged = Array.from(
+            new Map(
+              [...fallbackTradableSymbolOptions, ...items].map((opt) => [opt.symbol.toUpperCase(), opt] as const),
+            ).values(),
+          )
+          setTradableSymbolOptions(merged)
+        }
+      } catch {
+        // fallback 목록 사용
+      }
+    }
+    void fetchEtfSymbols()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!symbolPickerOpen) return
+    if (symbolPickerFavoritesOnly) return
+    const ac = new AbortController()
+    const q = symbolPickerQuery.trim()
+    const run = async () => {
+      setSymbolPickerLoading(true)
+      setSymbolPickerError(null)
+      try {
+        const res = await fetch(
+          apiUrl(`/api/symbols?market=${symbolPickerMarket}&q=${encodeURIComponent(q)}&limit=200`),
+          { signal: ac.signal },
+        )
+        const data = (await res.json()) as SymbolResponse & { error?: string }
+        if (!res.ok) throw new Error(data.error || '종목 목록 조회 실패')
+        setSymbolPickerItems(Array.isArray(data.items) ? data.items : [])
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return
+        setSymbolPickerItems([])
+        setSymbolPickerError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setSymbolPickerLoading(false)
+      }
+    }
+    void run()
+    return () => ac.abort()
+  }, [symbolPickerOpen, symbolPickerMarket, symbolPickerFavoritesOnly, symbolPickerQuery])
+
+  useEffect(() => {
+    if (!symbolPickerOpen) return
+    const reload = () => setWatchlist(loadWatchlistFromStorage())
+    reload()
+    window.addEventListener('storage', reload)
+    return () => window.removeEventListener('storage', reload)
+  }, [symbolPickerOpen])
+
+  const displayPickerItems = useMemo(() => {
+    const q = symbolPickerQuery.trim().toLowerCase()
+    if (symbolPickerFavoritesOnly) {
+      const rows = watchlist.filter((w) => {
+        if (!q) return true
+        return w.symbol.toLowerCase().includes(q) || (w.name ?? '').toLowerCase().includes(q)
+      })
+      return rows.map((w) => ({
+        symbol: w.symbol,
+        label: `${w.name ?? w.symbol} (${w.symbol})`,
+        market: w.market as Market,
+      }))
+    }
+    return symbolPickerItems.map((item) => ({
+      symbol: item.symbol,
+      label: `${item.nameKr ?? item.name} (${item.symbol})`,
+      market: symbolPickerMarket,
+    }))
+  }, [symbolPickerFavoritesOnly, watchlist, symbolPickerQuery, symbolPickerItems, symbolPickerMarket])
+
+  const symbolLabelMap = useMemo(() => {
+    const pairs: Array<[string, string]> = [
+      ...tradableSymbolOptions.map((opt): [string, string] => [opt.symbol, opt.label]),
+      ...displayPickerItems.map((i): [string, string] => [i.symbol, i.label]),
+    ]
+    return new Map<string, string>(pairs)
+  }, [tradableSymbolOptions, displayPickerItems])
+  const getSymbolDisplayLabel = (symbol: string): string => symbolLabelMap.get(normalizeSymbol(symbol)) ?? normalizeSymbol(symbol)
+  const getSymbolDisplayName = (symbol: string, fallbackName?: string): string => {
+    const label = getSymbolDisplayLabel(symbol)
+    const idx = label.lastIndexOf(' (')
+    if (idx > 0) return label.slice(0, idx)
+    return fallbackName?.trim() || normalizeSymbol(symbol)
+  }
+  const upSymbolLabel = getSymbolDisplayLabel(upSymbol)
+  const downSymbolLabel = getSymbolDisplayLabel(downSymbol)
 
   const updateConfig = async (
     patch?: Partial<{
@@ -210,6 +347,24 @@ export default function AutoTrading() {
       threshold,
       tradeAmount,
     })
+  }
+
+  const openSymbolPicker = (target: 'up' | 'down') => {
+    if (symbolsLocked) return
+    setSymbolPickerTarget(target)
+    setSymbolPickerQuery('')
+    setSymbolPickerMarket('kr')
+    setSymbolPickerFavoritesOnly(false)
+    setSymbolPickerOpen(true)
+  }
+
+  const handlePickSymbol = (symbol: string) => {
+    if (symbolPickerTarget === 'up') {
+      setUpSymbol(normalizeSymbol(symbol))
+    } else {
+      setDownSymbol(normalizeSymbol(symbol))
+    }
+    setSymbolPickerOpen(false)
   }
 
   const handleManualRun = async () => {
@@ -375,66 +530,52 @@ export default function AutoTrading() {
 
               <div className="space-y-1">
                 <label className="text-xs font-semibold text-emerald-400">상승 시 매수 (UP)</label>
-                <select
-                  value={upSymbol}
+                <button
+                  type="button"
                   disabled={symbolsLocked}
-                  onChange={(e) => {
-                    const val = e.target.value
-                    setUpSymbol(val)
-                  }}
-                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500 ${
-                    symbolsLocked ? 'cursor-not-allowed opacity-60' : ''
+                  onClick={() => openSymbolPicker('up')}
+                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-left text-sm text-slate-200 outline-none focus:border-blue-500 ${
+                    symbolsLocked ? 'cursor-not-allowed opacity-60' : 'hover:border-blue-500/60'
                   }`}
                 >
-                  {tradableSymbolOptions.map((opt) => (
-                    <option key={`up-${opt.symbol}`} value={opt.symbol}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
+                  {upSymbolLabel}
+                </button>
                 <label className="mt-2 block text-xs font-semibold text-rose-400">하락 시 매수 (DOWN)</label>
-                <select
-                  value={downSymbol}
+                <button
+                  type="button"
                   disabled={symbolsLocked}
-                  onChange={(e) => {
-                    const val = e.target.value
-                    setDownSymbol(val)
-                  }}
-                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-blue-500 ${
-                    symbolsLocked ? 'cursor-not-allowed opacity-60' : ''
+                  onClick={() => openSymbolPicker('down')}
+                  className={`w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-left text-sm text-slate-200 outline-none focus:border-blue-500 ${
+                    symbolsLocked ? 'cursor-not-allowed opacity-60' : 'hover:border-blue-500/60'
                   }`}
                 >
-                  {tradableSymbolOptions.map((opt) => (
-                    <option key={`down-${opt.symbol}`} value={opt.symbol}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
+                  {downSymbolLabel}
+                </button>
               </div>
             </div>
           </div>
 
           {/* 현재 시그널 요약 */}
-          <div className="flex items-center justify-between rounded-2xl border border-blue-900/30 bg-blue-950/20 p-5 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-blue-900/30 bg-blue-950/20 p-5 shadow-lg">
             <div>
-              <p className="text-xs font-semibold text-blue-300">내일 장 시작 시 실행 예정 시그널</p>
+              <p className="text-xs font-semibold text-blue-300">현재 설정 기준 자동매매 시그널</p>
               <p className="mt-1 text-sm text-slate-200">
-                {currentSignal.date} 기준 {aiTickerLabel} ({aiTicker}){' '}
+                {aiTickerLabel} ({aiTicker}){' '}
                 <span className="font-bold text-emerald-400">
-                  {currentSignal.direction === 'Up' ? '상승' : '하락'} 확률 {currentSignal.probability}%
+                  상승 시 {upSymbolLabel} / 하락 시 {downSymbolLabel}
                 </span>
               </p>
             </div>
-            <div className="text-right">
-              <span className="rounded-lg border border-blue-500/30 bg-blue-600/20 px-3 py-1.5 text-sm font-bold text-blue-300">
-                {currentSignal.recommendedAction}
+            <div className="shrink-0 text-right">
+              <span className="whitespace-nowrap rounded-lg border border-blue-500/30 bg-blue-600/20 px-3 py-1.5 text-sm font-bold text-blue-300">
+                진입 임계치 {threshold}%
               </span>
             </div>
           </div>
 
           {/* 실행 로그 테이블 */}
           <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg">
-            <h3 className="mb-4 text-sm font-semibold text-white">최근 실행 로그</h3>
+            <h3 className="mb-4 text-sm font-semibold text-white">최근 실행 로그 (실시간)</h3>
             <div className="overflow-x-auto">
               <table className="w-full whitespace-nowrap text-left text-xs text-slate-300">
                 <thead className="border-b border-slate-700 text-slate-500">
@@ -447,35 +588,174 @@ export default function AutoTrading() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {tradeLogs.map((log) => (
-                    <tr key={log.id} className="hover:bg-slate-800/40">
-                      <td className="py-2.5 pr-4 text-slate-400">{log.time}</td>
-                      <td className="py-2.5 pr-4">
-                        <span
-                          className={`font-semibold ${
-                            log.action === '매수' ? 'text-rose-400' : log.action === '매도' ? 'text-blue-400' : 'text-emerald-400'
-                          }`}
-                        >
-                          {log.action}
-                        </span>
-                      </td>
-                      <td className="py-2.5 pr-4">
-                        {log.name} <span className="text-[10px] text-slate-500">({log.symbol})</span>
-                      </td>
-                      <td className="py-2.5 pr-4 text-right tabular-nums">
-                        {log.price > 0 ? `${log.price.toLocaleString()}원 / ${log.qty}주` : '-'}
-                      </td>
-                      <td className="py-2.5 pl-4 text-right">
-                        <span className="rounded bg-slate-800 px-2 py-1 text-[10px] text-slate-300">{log.status}</span>
+                  {tradeLogs.length > 0 ? (
+                    tradeLogs.map((log) => {
+                      const actionLabel =
+                        log.action === 'buy' ? '매수' : log.action === 'sell' ? '매도' : log.action === 'buy_fail' ? '매수실패' : '분석'
+                      const actionClass =
+                        log.action === 'buy'
+                          ? 'text-emerald-400'
+                          : log.action === 'sell'
+                            ? 'text-rose-400'
+                            : log.action === 'buy_fail'
+                              ? 'text-amber-400'
+                              : 'text-blue-400'
+                      const statusClass = log.status.includes('DRY_RUN')
+                        ? 'border border-blue-500/20 bg-blue-500/10 text-blue-400'
+                        : log.status.includes('체결') || log.status.includes('완료')
+                          ? 'border border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
+                          : 'bg-slate-800 text-slate-300'
+                      return (
+                        <tr key={log.id} className="hover:bg-slate-800/40">
+                          <td className="py-2.5 pr-4 text-slate-400">{log.time}</td>
+                          <td className="py-2.5 pr-4">
+                            <span className={`font-semibold ${actionClass}`}>{actionLabel}</span>
+                          </td>
+                          <td className="py-2.5 pr-4">
+                            {getSymbolDisplayName(log.symbol, log.name)}{' '}
+                            <span className="text-[10px] text-slate-500">({normalizeSymbol(log.symbol)})</span>
+                          </td>
+                          <td className="py-2.5 pr-4 text-right tabular-nums">
+                            {log.qty > 0 ? `${log.qty}주 / ${log.price.toLocaleString()}원` : '-'}
+                          </td>
+                          <td className="py-2.5 pl-4 text-right">
+                            <span className={`rounded px-2 py-1 text-[10px] ${statusClass}`}>{log.status}</span>
+                          </td>
+                        </tr>
+                      )
+                    })
+                  ) : (
+                    <tr>
+                      <td colSpan={5} className="py-10 text-center text-slate-500">
+                        아직 실행된 내역이 없습니다. [수동 즉시 실행] 버튼을 눌러보세요.
                       </td>
                     </tr>
-                  ))}
+                  )}
                 </tbody>
               </table>
             </div>
           </div>
         </div>
       </div>
+
+      {symbolPickerOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 px-4"
+          onClick={() => setSymbolPickerOpen(false)}
+        >
+          <div
+            className="w-[66vw] max-w-3xl min-w-[520px] rounded-2xl border border-slate-800 bg-slate-900 p-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <label className="block text-xs uppercase tracking-[0.2em] text-blue-300">
+                종목 검색 · {symbolPickerTarget === 'up' ? '상승 시 매수' : '하락 시 매수'}
+              </label>
+              <div className="flex flex-wrap items-center gap-1 rounded-full bg-slate-950/80 p-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSymbolPickerMarket('us')
+                    setSymbolPickerFavoritesOnly(false)
+                  }}
+                  className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
+                    symbolPickerMarket === 'us' && !symbolPickerFavoritesOnly
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  미국
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSymbolPickerMarket('kr')
+                    setSymbolPickerFavoritesOnly(false)
+                  }}
+                  className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
+                    symbolPickerMarket === 'kr' && !symbolPickerFavoritesOnly
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  한국
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSymbolPickerFavoritesOnly((v) => !v)}
+                  className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
+                    symbolPickerFavoritesOnly ? 'bg-amber-500 text-slate-900' : 'text-amber-200/90 hover:bg-slate-800'
+                  }`}
+                >
+                  ★ 즐겨찾기
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSymbolPickerOpen(false)}
+                className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+              >
+                닫기
+              </button>
+            </div>
+            <input
+              autoFocus
+              value={symbolPickerQuery}
+              onChange={(e) => setSymbolPickerQuery(e.target.value)}
+              placeholder={
+                symbolPickerFavoritesOnly
+                  ? '즐겨찾기 검색 (티커/이름)'
+                  : symbolPickerMarket === 'kr'
+                    ? '종목코드 또는 기업명 입력 (예: 005930.KS, 삼성전자)'
+                    : '티커 또는 기업명 입력 (예: AAPL, Microsoft)'
+              }
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-blue-400"
+            />
+            <div className="mt-2 flex max-h-64 flex-wrap gap-2 overflow-y-auto pr-1">
+              {displayPickerItems.map((item, idx) => {
+                const selectedSymbol = symbolPickerTarget === 'up' ? upSymbol : downSymbol
+                const isSelected = selectedSymbol === item.symbol
+                const inWatchlist = watchlist.some((w) => w.symbol === item.symbol && w.market === item.market)
+                return (
+                  <button
+                    key={`${item.symbol}-${idx}`}
+                    type="button"
+                    onClick={() => handlePickSymbol(item.symbol)}
+                    className={`inline-flex max-w-full items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${
+                      isSelected ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                    }`}
+                    title={item.symbol}
+                  >
+                    {inWatchlist && (
+                      <span className="shrink-0 text-[10px] text-amber-300" aria-hidden>
+                        ★
+                      </span>
+                    )}
+                    {symbolPickerFavoritesOnly && (
+                      <span className="shrink-0 rounded bg-slate-700/90 px-1 py-0 text-[9px] font-medium text-slate-300">
+                        {item.market === 'us' ? '미국' : '한국'}
+                      </span>
+                    )}
+                    <span className="truncate">{item.label}</span>
+                  </button>
+                )
+              })}
+              {!symbolPickerFavoritesOnly && symbolPickerLoading && (
+                <span className="text-xs text-slate-500">목록 불러오는 중...</span>
+              )}
+              {!symbolPickerFavoritesOnly && symbolPickerError && (
+                <span className="text-xs text-rose-400">오류: {symbolPickerError}</span>
+              )}
+              {symbolPickerFavoritesOnly && watchlist.length === 0 && (
+                <span className="text-xs text-slate-500">대시보드에서 추가한 즐겨찾기가 없습니다.</span>
+              )}
+              {displayPickerItems.length === 0 && !symbolPickerLoading && !symbolPickerError && (
+                <span className="text-xs text-slate-500">검색 결과가 없습니다.</span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
