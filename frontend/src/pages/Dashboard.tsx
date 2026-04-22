@@ -983,8 +983,10 @@ export default function Dashboard() {
     if (!liveQuote || liveQuote.regularMarketPrice == null || !liveQuote.asOf) return
     setDynamicCandles((prev) => {
       if (prev.length === 0) return prev
+      const rawPrice = liveQuote.regularMarketPrice
+      if (rawPrice == null) return prev
 
-      const price = liveQuote.regularMarketPrice
+      const price = rawPrice
       const asOfDate = new Date(liveQuote.asOf)
       asOfDate.setSeconds(0, 0)
       const bucketIso = asOfDate.toISOString()
