@@ -107,6 +107,24 @@ function formatVolume(n: number | null) {
   return n.toLocaleString('ko-KR')
 }
 
+/** 시세 폴링 중 — 기준 시각 줄 앞에만 표시 */
+function QuoteRefreshSpinner() {
+  return (
+    <svg
+      className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-400"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+    </svg>
+  )
+}
+
 function mergeIntradayWithLiveQuote(
   points: { t: string; c: number }[],
   livePrice: number | null | undefined,
@@ -316,10 +334,17 @@ export default function StockPrediction() {
             {quote?.shortName && <p className="mt-0.5 text-xs text-slate-400">{quote.shortName}</p>}
           </div>
           <div className="text-right text-xs text-slate-500">
-            {quoteLoading && <span className="text-slate-400">갱신 중…</span>}
-            {quote?.asOf && (
-              <p className="mt-1 tabular-nums text-slate-500">
-                기준: {new Date(quote.asOf).toLocaleString('ko-KR')}
+            {(quote?.asOf || quoteLoading) && (
+              <p
+                className="mt-1 flex items-center justify-end gap-1.5 tabular-nums text-slate-500"
+                {...(quoteLoading ? { role: 'status', 'aria-live': 'polite' as const } : {})}
+              >
+                {quoteLoading && <QuoteRefreshSpinner />}
+                {quote?.asOf ? (
+                  <span>기준: {new Date(quote.asOf).toLocaleString('ko-KR')}</span>
+                ) : (
+                  <span>시세 불러오는 중</span>
+                )}
               </p>
             )}
           </div>
