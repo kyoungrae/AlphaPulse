@@ -20,7 +20,7 @@ function Sidebar() {
   ]
 
   return (
-    <aside className="flex h-full w-64 flex-col border-r border-slate-800 bg-slate-950/80 px-4 py-6 backdrop-blur">
+    <aside className="sticky top-0 flex h-screen w-64 shrink-0 flex-col border-r border-slate-800 bg-slate-950/80 px-4 py-6 backdrop-blur">
       <div className="mb-8 px-2">
         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-blue-300">
           AlphaPulse
