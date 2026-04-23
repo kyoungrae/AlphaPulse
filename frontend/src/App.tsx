@@ -9,6 +9,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'))
 const GlobalMacro = lazy(() => import('./pages/GlobalMacro'))
 const StockPrediction = lazy(() => import('./pages/StockPrediction'))
 const AutoTrading = lazy(() => import('./pages/AutoTrading'))
+const Portfolio = lazy(() => import('./pages/Portfolio'))
 const Login = lazy(() => import('./pages/Login'))
 
 export type AuthOutletContext = { user: User }
@@ -19,6 +20,7 @@ function Sidebar() {
     { to: '/macro', label: '글로벌 매크로' },
     { to: '/stocks', label: '종목 실시간 현황' },
     { to: '/trading', label: '자동 매매 설정' },
+    { to: '/portfolio', label: '잔고 현황' },
   ]
 
   return (
@@ -110,6 +112,7 @@ function App() {
           <Route path="macro" element={<GlobalMacro />} />
           <Route path="stocks" element={<StockPrediction />} />
           <Route path="trading" element={<AutoTrading />} />
+          <Route path="portfolio" element={<Portfolio />} />
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>
