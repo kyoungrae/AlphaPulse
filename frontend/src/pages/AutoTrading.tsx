@@ -126,26 +126,44 @@ export default function AutoTrading() {
           logs?: AutoTradeLog[]
           balance?: { cash?: number }
           error?: string
+          detail?: string
+          hint?: string
         }
-        if (!statusRes.ok) throw new Error(statusData.error || '연결 실패')
         if (!isMounted) return
-        const cash = Number(statusData.balance?.cash ?? 0)
-        setAccountInfo({
-          totalAsset: Number.isFinite(cash) ? cash : 0,
-          cash: Number.isFinite(cash) ? cash : 0,
-          connected: true,
-          loading: false,
-          error: null,
-        })
-        setIsActive(Boolean(statusData.config?.isActive))
-        setIsDryRun(statusData.config?.isDryRun !== false)
-        setAiTicker(statusData.config?.aiTicker ?? '^KS200')
-        setUpSymbol(normalizeSymbol(statusData.config?.upSymbol ?? '122630.KS'))
-        setDownSymbol(normalizeSymbol(statusData.config?.downSymbol ?? '252710.KS'))
-        setSymbolsLocked(statusData.config?.symbolsLocked ?? true)
-        setThreshold(Math.max(50, Math.min(99, Number(statusData.config?.threshold ?? 60))))
-        setTradeAmount(Math.max(1, Number(statusData.config?.tradeAmount ?? 1_000_000)))
-        setTradeLogs(Array.isArray(statusData.logs) ? statusData.logs : [])
+
+        if (statusData.config) {
+          setIsActive(Boolean(statusData.config.isActive))
+          setIsDryRun(statusData.config.isDryRun !== false)
+          setAiTicker(statusData.config.aiTicker ?? '^KS200')
+          setUpSymbol(normalizeSymbol(statusData.config.upSymbol ?? '122630.KS'))
+          setDownSymbol(normalizeSymbol(statusData.config.downSymbol ?? '252710.KS'))
+          setSymbolsLocked(statusData.config.symbolsLocked ?? true)
+          setThreshold(Math.max(50, Math.min(99, Number(statusData.config.threshold ?? 60))))
+          setTradeAmount(Math.max(1, Number(statusData.config.tradeAmount ?? 1_000_000)))
+        }
+        if (Array.isArray(statusData.logs)) {
+          setTradeLogs(statusData.logs)
+        }
+
+        if (statusRes.ok) {
+          const cash = Number(statusData.balance?.cash ?? 0)
+          setAccountInfo({
+            totalAsset: Number.isFinite(cash) ? cash : 0,
+            cash: Number.isFinite(cash) ? cash : 0,
+            connected: true,
+            loading: false,
+            error: null,
+          })
+        } else {
+          const parts = [statusData.error, statusData.detail, statusData.hint].filter(Boolean)
+          setAccountInfo({
+            totalAsset: 0,
+            cash: 0,
+            connected: false,
+            loading: false,
+            error: parts.length > 0 ? parts.join(' — ') : '연결 실패',
+          })
+        }
 
         const logsRes = await fetch(apiUrl('/api/trading/logs'))
         if (!isMounted) return

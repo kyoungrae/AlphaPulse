@@ -4114,6 +4114,28 @@ app.post('/api/jobs/daily-close/run', async (_req: Request, res: Response) => {
 
 app.get('/api/trading/status', async (_req: Request, res: Response) => {
   try {
+    if (!KIS_APP_KEY || !KIS_APP_SECRET) {
+      return res.status(503).json({
+        error: '계좌 정보를 가져오지 못했습니다.',
+        detail:
+          'KIS_APP_KEY / KIS_APP_SECRET 이 서버 환경에 없습니다. 배포 서버(또는 Docker)의 backend/.env 에 한국투자 Open API 키를 넣고 API 컨테이너를 재시작하세요.',
+        kisConfigured: false,
+        config: autoTradingConfig,
+        balance: { cash: 0, holdings: [] as Array<Record<string, unknown>> },
+        logs: autoTradeLogs.slice(0, 50),
+      })
+    }
+    if (!KIS_ACCOUNT_NUMBER.trim()) {
+      return res.status(503).json({
+        error: '계좌 정보를 가져오지 못했습니다.',
+        detail:
+          'KIS_ACCOUNT_NUMBER 가 비어 있습니다. 예: 12345678-01 형식으로 backend/.env 에 계좌번호를 설정하세요.',
+        kisConfigured: true,
+        config: autoTradingConfig,
+        balance: { cash: 0, holdings: [] as Array<Record<string, unknown>> },
+        logs: autoTradeLogs.slice(0, 50),
+      })
+    }
     const balance = await fetchKisBalance()
     return res.json({
       config: autoTradingConfig,
@@ -4124,7 +4146,17 @@ app.get('/api/trading/status', async (_req: Request, res: Response) => {
     })
   } catch (err) {
     console.error('[Trading] status', err)
-    return res.status(500).json({ error: '계좌 정보를 가져오지 못했습니다.' })
+    const raw = err instanceof Error ? err.message : String(err)
+    const detail = raw.length > 600 ? `${raw.slice(0, 600)}…` : raw
+    return res.status(500).json({
+      error: '계좌 정보를 가져오지 못했습니다.',
+      detail,
+      hint:
+        '모의투자 앱키면 KIS_URL_BASE 를 모의 도메인(openapivts…)으로, 실전이면 실전 URL로 맞추세요. 계좌번호·상품코드(예: -01)와 잔고조회 tr_id(모의 VTTC8434R / 실전 TTTC8434R) 불일치가 흔한 원인입니다.',
+      config: autoTradingConfig,
+      balance: { cash: 0, holdings: [] as Array<Record<string, unknown>> },
+      logs: autoTradeLogs.slice(0, 50),
+    })
   }
 })
 

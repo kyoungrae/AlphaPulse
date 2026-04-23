@@ -64,10 +64,17 @@ export default function Portfolio() {
       const statusData = (await statusRes.json()) as {
         balance?: { cash?: number; holdings?: HoldingRow[] }
         error?: string
+        detail?: string
+        hint?: string
       }
-      if (!statusRes.ok) throw new Error(statusData.error || '잔고 조회 실패')
       setCash(Number(statusData.balance?.cash ?? 0))
       setHoldings(Array.isArray(statusData.balance?.holdings) ? statusData.balance!.holdings! : [])
+      if (!statusRes.ok) {
+        const parts = [statusData.error, statusData.detail, statusData.hint].filter(Boolean)
+        setError(parts.length > 0 ? parts.join(' — ') : '잔고 조회 실패')
+      } else {
+        setError(null)
+      }
 
       const logsRes = await fetch(apiUrl('/api/trading/logs'))
       if (logsRes.ok) {
