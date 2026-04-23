@@ -404,15 +404,52 @@ export default function AutoTrading() {
         {/* 왼쪽 1단: 봇 상태 및 계좌 요약 */}
         <div className="space-y-6 lg:col-span-1">
           {/* 메인 스위치 카드 */}
-          <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-800 bg-slate-900/80 p-5 text-center shadow-lg">
-            <p className="mb-4 text-sm font-semibold text-slate-300">자동 매매 시스템 상태</p>
-            <p className={`mb-2 text-[10px] font-bold uppercase tracking-wider ${isDryRun ? 'text-slate-400' : 'text-rose-400'}`}>
-              {isDryRun ? 'DRY_RUN 모드' : 'LIVE 모드'}
+          <div className="flex w-full max-w-xs flex-col items-center justify-center rounded-2xl border border-slate-800 bg-slate-900/80 p-5 text-center shadow-lg">
+            <p className="mb-3 text-sm font-semibold text-slate-300">자동 매매 시스템 상태</p>
+            <p className="mb-4 max-w-[17rem] text-[10px] leading-snug text-slate-500">
+              <span className="text-slate-400">한 줄 요약:</span> 위는{' '}
+              <span className="text-slate-300">「봇이 정해진 시간에 스스로 돌지」</span>, 아래는{' '}
+              <span className="text-slate-300">「돌 때 증권사에 진짜 주문을 낼지」</span>입니다. 서로 다른 스위치예요.
+            </p>
+
+            {/* 스케줄 운영 ON/OFF — 토글 크기는 주문 모드와 동일 */}
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">스케줄 운영</p>
+            <p className={`mb-1 text-xs font-semibold ${isActive ? 'text-blue-400' : 'text-slate-500'}`}>
+              {isActive ? 'ON · 예약 실행' : 'OFF · 대기'}
+            </p>
+            <p className="mb-2 max-w-[17rem] text-[10px] leading-snug text-slate-500">
+              자동 봇 전원입니다. ON이면 서버가 정해진 시각(예: 장 시작 직후)에 매매 판단·주문 흐름을 <strong className="font-medium text-slate-400">자동으로</strong> 돌립니다.
+              OFF면 그 <strong className="font-medium text-slate-400">시간 예약 실행은 하지 않습니다</strong>. (아래「수동 즉시 실행」은 별개입니다.)
+            </p>
+            <button
+              type="button"
+              onClick={handleToggleActive}
+              className={`relative mb-5 inline-flex h-9 w-20 items-center rounded-full transition-all duration-300 focus:outline-none ${
+                isActive ? 'bg-blue-600' : 'bg-slate-700'
+              }`}
+              title={isActive ? '스케줄 운영 중' : '스케줄 운영 중지'}
+            >
+              <span
+                className={`inline-block h-7 w-7 rounded-full bg-white transition-transform duration-300 ${
+                  isActive ? 'translate-x-12' : 'translate-x-1'
+                }`}
+              />
+            </button>
+
+            {/* 주문 모드 DRY_RUN / LIVE */}
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">주문 모드 (모의 / 실전)</p>
+            <p className={`mb-1 text-xs font-semibold ${isDryRun ? 'text-slate-400' : 'text-rose-400'}`}>
+              {isDryRun ? 'DRY_RUN · 모의' : 'LIVE · 실주문'}
+            </p>
+            <p className="mb-2 max-w-[17rem] text-[10px] leading-snug text-slate-500">
+              봇이 <strong className="font-medium text-slate-400">한 번 실행될 때마다</strong> 적용됩니다(스케줄이든 수동이든).{' '}
+              <strong className="font-medium text-slate-400">DRY_RUN</strong>은 한국투자 API로 주문을 보내지 않고 화면·서버 로그만 남깁니다.{' '}
+              <strong className="font-medium text-rose-300/90">LIVE</strong>는 그대로 매수·매도 요청이 나가 실제 체결될 수 있습니다.
             </p>
             <button
               type="button"
               onClick={handleToggleDryRun}
-              className={`relative mb-4 inline-flex h-9 w-20 items-center rounded-full transition-all duration-300 ${
+              className={`relative mb-3 inline-flex h-9 w-20 items-center rounded-full transition-all duration-300 ${
                 isDryRun ? 'bg-slate-700' : 'bg-rose-600 shadow-[0_0_15px_rgba(225,29,72,0.4)]'
               }`}
               title={isDryRun ? '모의 매매 모드' : '실전 매매 모드'}
@@ -423,28 +460,13 @@ export default function AutoTrading() {
                 }`}
               />
             </button>
-            <button
-              onClick={handleToggleActive}
-              className={`relative inline-flex h-12 w-24 items-center rounded-full transition-colors duration-300 focus:outline-none ${
-                isActive ? 'bg-blue-600' : 'bg-slate-700'
-              }`}
-            >
-              <span
-                className={`inline-block h-10 w-10 rounded-full bg-white transition-transform duration-300 ${
-                  isActive ? 'translate-x-13' : 'translate-x-1'
-                }`}
-                style={{ transform: isActive ? 'translateX(3.2rem)' : 'translateX(0.25rem)' }}
-              />
-            </button>
-            <p className={`mt-4 text-xl font-bold ${isActive ? 'text-blue-400' : 'text-slate-500'}`}>
-              {isActive ? '운영 중 (ON)' : '중지됨 (OFF)'}
-            </p>
-            <p className="mt-2 text-xs text-slate-400">
+
+            <p className="text-xs text-slate-400">
               {isActive
                 ? isDryRun
-                  ? '현재 DRY_RUN 모드입니다. 주문은 전송되지 않고 로그만 기록됩니다.'
-                  : '현재 LIVE 모드입니다. 실제 주문이 실행됩니다.'
-                : '현재 자동으로 매매가 실행되지 않습니다.'}
+                  ? '지금 조합: 스케줄 ON + 모의 → 정해진 시간마다 판단은 하되 주문은 안 나감'
+                  : '지금 조합: 스케줄 ON + 실전 → 정해진 시간마다 판단 후 실제 주문 가능'
+                : '지금 조합: 스케줄 OFF → 예약 자동 실행 없음 · 수동 버튼은 여전히 누를 수 있음(그때도 주문 모드는 아래 설정 따름)'}
             </p>
             <button
               type="button"
