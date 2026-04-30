@@ -464,6 +464,12 @@ export default function AutoTrading() {
               <strong className="font-medium text-slate-400">DRY_RUN</strong>은 한국투자 API로 주문을 보내지 않고 화면·서버 로그만 남깁니다.{' '}
               <strong className="font-medium text-rose-300/90">LIVE</strong>는 그대로 매수·매도 요청이 나가 실제 체결될 수 있습니다.
             </p>
+            {!isDryRun && (
+              <p className="mb-2 max-w-[17rem] rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] leading-snug text-amber-200">
+                ⚠️ 실전 주문 경고: 장 시작 직후(특히 09:00~09:05) ETF 유동성이 얇을 때 시장가 주문은 슬리피지가 커질 수 있습니다. 실행 시간을
+                09:05 이후로 두고 주문/체결 로그를 꼭 확인하세요.
+              </p>
+            )}
             <button
               type="button"
               onClick={handleToggleDryRun}

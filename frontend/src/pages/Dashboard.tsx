@@ -317,6 +317,12 @@ type NewsFeatureResponse = {
 type StrategyMode = 'long_only' | 'long_short' | 'swing' | 'intraday'
 
 const FEATURE_INTERPRETER: Record<string, { label: string; logic: string }> = {
+  return_1d: { label: '1일 수익률', logic: '초단기 가격 모멘텀' },
+  return_3d: { label: '3일 수익률', logic: '단기 가격 모멘텀' },
+  high_low_spread: { label: '일일 고저폭', logic: '장중 변동성 및 매수/매도 공방 강도' },
+  close_to_sma20: { label: '20일선 이격도', logic: '단기 추세 중심선 대비 과열/침체' },
+  bb_width: { label: '볼린저밴드 폭', logic: '수렴/발산에 따른 변동성 분출 임박도' },
+  bb_position: { label: '볼린저밴드 내 위치', logic: '밴드 내 상대적 가격 수준' },
   oil_price: { label: '유가', logic: '에너지 비용 및 인플레이션 압력' },
   us10y_yield: { label: '미국채 10년물 금리', logic: '시장 할인율 및 자금 조달 비용' },
   vix_close: { label: 'VIX(공포지수)', logic: '시장 변동성 및 투자 심리 위축' },

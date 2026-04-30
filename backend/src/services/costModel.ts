@@ -9,12 +9,12 @@ export type CostConfig = {
 export const DEFAULT_COST_CONFIG: Record<Market, CostConfig> = {
   us: {
     commissionRate: 0.0005,
-    slippageBps: 5,
+    slippageBps: 10,
     taxRate: 0,
   },
   kr: {
     commissionRate: 0.00015,
-    slippageBps: 8,
+    slippageBps: 20,
     taxRate: 0.0018,
   },
 }

@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, cross_validate
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 try:
   from lightgbm import LGBMClassifier
@@ -56,20 +57,17 @@ load_dotenv()
 app = FastAPI(title="AlphaPulse 예측 서버", version="0.1.0")
 
 FEATURE_COLS: List[str] = [
-  "Open",
-  "High",
-  "Low",
-  "Close",
   "Volume",
-  "sma_5",
-  "sma_20",
+  "return_1d",
+  "return_3d",
+  "high_low_spread",
+  "close_to_sma20",
   "rsi_14",
   "macd",
   "macd_signal",
   "macd_hist",
-  "bb_bbm",
-  "bb_bbh",
-  "bb_bbl",
+  "bb_width",
+  "bb_position",
   "news_sentiment_score",
   "news_volume",
   "event_keyword_count",
@@ -143,7 +141,7 @@ def load_price_data(ticker: str, period_years: int = DATA_BASELINE_YEARS) -> pd.
       df = None
 
   if df is None:
-    df = yf.download(ticker, period=f"{period_years}y", interval="1d", auto_adjust=False)
+    df = yf.download(ticker, period=f"{period_years}y", interval="1d", auto_adjust=True)
     # Flatten multi-index columns if present (single ticker can still return multi-index)
     if isinstance(df.columns, pd.MultiIndex):
       # Select the second level (ticker) and rename to single-level columns
@@ -287,7 +285,7 @@ def load_macro_feature_data(period_years: int = DATA_BASELINE_YEARS) -> pd.DataF
   }
   merged: Optional[pd.DataFrame] = None
   for col, ticker in symbols.items():
-    df = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=False)
+    df = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=True)
     if isinstance(df.columns, pd.MultiIndex):
       df.columns = [c[0] for c in df.columns]
     if "Close" not in df.columns:
@@ -333,8 +331,11 @@ def add_features(df: pd.DataFrame, ticker: str, horizon: int = 1) -> pd.DataFram
   low = pd.to_numeric(df["Low"], errors="coerce")
   vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
 
-  df["sma_5"] = SMAIndicator(close, window=5).sma_indicator()
-  df["sma_20"] = SMAIndicator(close, window=20).sma_indicator()
+  sma_20 = SMAIndicator(close, window=20).sma_indicator()
+  df["close_to_sma20"] = ((close / sma_20) - 1).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+  df["return_1d"] = close.pct_change(1).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+  df["return_3d"] = close.pct_change(3).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+  df["high_low_spread"] = ((high - low) / close).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
   df["rsi_14"] = RSIIndicator(close, window=14).rsi()
 
   macd = MACD(close)
@@ -344,9 +345,12 @@ def add_features(df: pd.DataFrame, ticker: str, horizon: int = 1) -> pd.DataFram
 
   # Bollinger Bands (20, 2)
   bb = BollingerBands(close=close, window=20, window_dev=2)
-  df["bb_bbm"] = bb.bollinger_mavg()
-  df["bb_bbh"] = bb.bollinger_hband()
-  df["bb_bbl"] = bb.bollinger_lband()
+  bb_bbm = bb.bollinger_mavg()
+  bb_bbh = bb.bollinger_hband()
+  bb_bbl = bb.bollinger_lband()
+  bb_range = (bb_bbh - bb_bbl).replace(0, pd.NA)
+  df["bb_width"] = (bb_range / bb_bbm).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
+  df["bb_position"] = ((close - bb_bbl) / bb_range).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
 
   # ta.volatility.AverageTrueRange requires enough rows (window=14). For short/empty
   # series, fallback to 0 so the caller can handle insufficient-data cases gracefully.
@@ -362,7 +366,9 @@ def add_features(df: pd.DataFrame, ticker: str, horizon: int = 1) -> pd.DataFram
     obv_vals.diff(5) / vol.rolling(5).mean().replace(0, 1)
   ).replace([float("inf"), -float("inf")], 0.0).fillna(0.0)
 
-  df["target"] = (close.shift(-horizon) > close * 1.01).astype(int)
+  next_close = close.shift(-horizon)
+  next_open = pd.to_numeric(df["Open"], errors="coerce").shift(-horizon)
+  df["target"] = ((next_close / next_open) - 1 > 0.003).astype(int)
 
   news_df = load_news_feature_data(
     ticker=ticker,
@@ -466,11 +472,8 @@ def train_model(ticker: str = "AAPL", horizon: int = 1) -> ModelBundle:
   X = df_train[FEATURE_COLS]
   y = df_train["target"]
 
-  scaler = StandardScaler()
-  X_scaled = scaler.fit_transform(X)
-
   if LGBMClassifier is not None:
-    model = LGBMClassifier(
+    base_model = LGBMClassifier(
       n_estimators=500,
       learning_rate=0.03,
       max_depth=7,
@@ -479,34 +482,21 @@ def train_model(ticker: str = "AAPL", horizon: int = 1) -> ModelBundle:
       importance_type="gain",
     )
   else:
-    model = RandomForestClassifier(
+    base_model = RandomForestClassifier(
       n_estimators=300,
       max_depth=8,
       random_state=42,
       n_jobs=-1,
     )
-  model.fit(X_scaled, y)
 
   tscv = TimeSeriesSplit(n_splits=5)
-  if LGBMClassifier is not None:
-    cv_model = LGBMClassifier(
-      n_estimators=500,
-      learning_rate=0.03,
-      max_depth=7,
-      num_leaves=31,
-      random_state=42,
-      importance_type="gain",
-    )
-  else:
-    cv_model = RandomForestClassifier(
-      n_estimators=300,
-      max_depth=8,
-      random_state=42,
-      n_jobs=-1,
-    )
+  cv_pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("classifier", base_model),
+  ])
   cv_scores = cross_validate(
-    cv_model,
-    X_scaled,
+    cv_pipeline,
+    X,
     y,
     cv=tscv,
     scoring=("accuracy", "precision"),
@@ -515,6 +505,11 @@ def train_model(ticker: str = "AAPL", horizon: int = 1) -> ModelBundle:
   )
   cv_accuracy = float(cv_scores["test_accuracy"].mean())
   cv_precision = float(cv_scores["test_precision"].mean())
+
+  scaler = StandardScaler()
+  X_scaled = scaler.fit_transform(X)
+  model = base_model
+  model.fit(X_scaled, y)
 
   logger.info(
     "Model trained for %s horizon=%s (samples=%s, cv_acc=%.4f, cv_prec=%.4f)",

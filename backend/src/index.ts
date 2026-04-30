@@ -67,7 +67,7 @@ const AUTO_TRADING_ENABLED = process.env.AUTO_TRADING_ENABLED === 'true'
 const AUTO_TRADING_DRY_RUN_DEFAULT = process.env.AUTO_TRADING_DRY_RUN !== 'false'
 const AUTO_TRADING_CHECK_MS = Math.max(15_000, Number(process.env.AUTO_TRADING_CHECK_MS ?? 60_000))
 const AUTO_TRADING_RUN_HOUR_KST = Math.max(0, Math.min(23, Number(process.env.AUTO_TRADING_RUN_HOUR_KST ?? 9)))
-const AUTO_TRADING_RUN_MINUTE_KST = Math.max(0, Math.min(59, Number(process.env.AUTO_TRADING_RUN_MINUTE_KST ?? 1)))
+const AUTO_TRADING_RUN_MINUTE_KST = Math.max(0, Math.min(59, Number(process.env.AUTO_TRADING_RUN_MINUTE_KST ?? 6)))
 const IS_KIS_PAPER = /openapivts|vts/i.test(KIS_URL_BASE)
 
 app.use(cors())
@@ -1424,19 +1424,6 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
     let targetSymbol: string | null = null
     if (probUp >= threshold) targetSymbol = upSymbol
     else if (probDown >= threshold) targetSymbol = downSymbol
-    if (!targetSymbol) {
-      console.log(`[AutoTrade] 확률이 기준치(${threshold}%)를 넘지 않아 관망(Hold)합니다.`)
-      pushAutoTradeLog({
-        time: nowKstYmdHm().iso,
-        action: 'analyze',
-        symbol: aiTicker,
-        name: `AI 예측: 관망 (${probUp.toFixed(1)}%)`,
-        qty: 0,
-        price: 0,
-        status: `미달 (기준:${threshold}%)`,
-      })
-      return
-    }
 
     const { cash, holdings } = await fetchKisBalance()
     const nowIso = nowKstYmdHm().iso
@@ -1470,6 +1457,19 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
           await sleep(2000)
         }
       }
+    }
+    if (!targetSymbol) {
+      console.log(`[AutoTrade] 확률이 기준치(${threshold}%)를 넘지 않아 현금 보유 상태로 관망(Hold)합니다.`)
+      pushAutoTradeLog({
+        time: nowIso,
+        action: 'analyze',
+        symbol: aiTicker,
+        name: `AI 예측: 관망 (${probUp.toFixed(1)}%)`,
+        qty: 0,
+        price: 0,
+        status: `미달 (기준:${threshold}%, 현금 대피)`,
+      })
+      return
     }
 
     const alreadyHeld = holdings.find((h) => `${String(h.pdno ?? '').trim()}.KS` === targetSymbol)

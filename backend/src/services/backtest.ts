@@ -198,7 +198,11 @@ export function runBacktest(input: BacktestInput): BacktestResult {
     const today = candles[i]
     const next = candles[i + 1]
     const probabilityUp = byDateProb.get(today.date) ?? 0.5
-    const positionSize = probabilityUp > 0.8 || probabilityUp < 0.2 ? 1.0 : 0.6
+    const confidence = Math.abs(probabilityUp - 0.5) * 2
+    let positionSize = 0.2
+    if (confidence >= 0.6) positionSize = 1.0
+    else if (confidence >= 0.4) positionSize = 0.6
+    else if (confidence >= 0.2) positionSize = 0.3
     let action = signalFor(input.strategy, probabilityUp, currentSide, holdBars)
     latestSignal = { date: today.date, action, probabilityUp }
     const isExtremeVolatility = probabilityUp > 0.8 || probabilityUp < 0.2
