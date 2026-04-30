@@ -1374,9 +1374,21 @@ function getHoldingQty(holdings: Array<Record<string, unknown>>, ticker: string)
   return Number.isFinite(qty) ? qty : 0
 }
 
-function pushAutoTradeLog(log: Omit<AutoTradeLog, 'id'>): void {
-  autoTradeLogs.unshift({ id: autoTradeLogSeq++, ...log })
+async function pushAutoTradeLog(log: Omit<AutoTradeLog, 'id'>): Promise<void> {
+  const newLog = { id: autoTradeLogSeq++, ...log }
+  autoTradeLogs.unshift(newLog)
   if (autoTradeLogs.length > 300) autoTradeLogs.length = 300
+  const db = getFirestore()
+  if (!db) return
+  try {
+    await db.collection('trading_logs').add({
+      ...newLog,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+    console.log(`[DB 저장 완료] ${log.action} - ${log.symbol}`)
+  } catch (err) {
+    console.error('[DB 저장 실패] 로그를 기록하지 못했습니다:', err)
+  }
 }
 
 function nowKstYmdHm(): { ymd: string; hour: number; minute: number; iso: string } {
@@ -1434,7 +1446,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
       if (qty > 0 && heldSymbol !== targetSymbol && (heldSymbol === upSymbol || heldSymbol === downSymbol)) {
         console.log(`[AutoTrade] 반대 포지션 청산: ${heldSymbol} ${qty}주 시장가 매도`)
         if (isDryRun) {
-          pushAutoTradeLog({
+          await pushAutoTradeLog({
             time: nowIso,
             action: 'sell',
             symbol: heldSymbol,
@@ -1445,7 +1457,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
           })
         } else {
           const sellRes = await placeKisOrder('sell', heldSymbol, qty)
-          pushAutoTradeLog({
+          await pushAutoTradeLog({
             time: nowIso,
             action: 'sell',
             symbol: heldSymbol,
@@ -1460,7 +1472,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
     }
     if (!targetSymbol) {
       console.log(`[AutoTrade] 확률이 기준치(${threshold}%)를 넘지 않아 현금 보유 상태로 관망(Hold)합니다.`)
-      pushAutoTradeLog({
+      await pushAutoTradeLog({
         time: nowIso,
         action: 'analyze',
         symbol: aiTicker,
@@ -1489,7 +1501,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
     if (buyQty <= 0) {
       const reason = `잔고 부족 (현재가: ${currentPrice.toLocaleString()}원, 가용금액: ${investAmount.toLocaleString()}원)`
       console.log(`[AutoTrade] 매수 실패: ${reason}`)
-      pushAutoTradeLog({
+      await pushAutoTradeLog({
         time: nowIso,
         action: 'buy_fail',
         symbol: targetSymbol,
@@ -1502,7 +1514,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
     }
     console.log(`[AutoTrade] 신규 포지션 진입: ${targetSymbol} ${buyQty}주 시장가 매수 (예상단가: ${currentPrice})`)
     if (isDryRun) {
-      pushAutoTradeLog({
+      await pushAutoTradeLog({
         time: nowIso,
         action: 'buy',
         symbol: targetSymbol,
@@ -1513,7 +1525,7 @@ async function executeAutoTrading(clockDate: string, force = false): Promise<voi
       })
     } else {
       const buyRes = await placeKisOrder('buy', targetSymbol, buyQty)
-      pushAutoTradeLog({
+      await pushAutoTradeLog({
         time: nowIso,
         action: 'buy',
         symbol: targetSymbol,
