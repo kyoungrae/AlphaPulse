@@ -253,6 +253,9 @@ docker load -i alphapulse-predict.tar
 docker load -i alphapulse-api.tar
 
 docker compose up -d --no-build
+
+# 로그보기
+docker compose logs -f --tail=200
 ```
 
 <!-- - `--no-build`: 방금 `load`한 이미지만 쓰고, Dockerfile로 다시 빌드하지 않습니다.
